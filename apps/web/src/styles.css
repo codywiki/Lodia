@@ -1,0 +1,259 @@
+:root {
+  color: #111827;
+  background: #f5f7fb;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+button,
+textarea {
+  font: inherit;
+}
+
+.app-shell {
+  display: grid;
+  grid-template-columns: 240px 1fr;
+  min-height: 100vh;
+}
+
+.sidebar {
+  background: #101217;
+  color: #f8fafc;
+  padding: 24px 18px;
+}
+
+.brand {
+  font-size: 24px;
+  font-weight: 700;
+  margin-bottom: 28px;
+}
+
+nav {
+  display: grid;
+  gap: 8px;
+}
+
+nav button {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: 8px;
+  color: #cbd5e1;
+  cursor: pointer;
+  display: flex;
+  gap: 10px;
+  padding: 12px;
+  text-align: left;
+}
+
+nav button:hover,
+.nav-active {
+  background: #20242d;
+  color: #ffffff;
+}
+
+.workspace {
+  padding: 28px;
+}
+
+.topbar {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 24px;
+}
+
+.eyebrow {
+  color: #64748b;
+  font-size: 13px;
+  margin: 0 0 6px;
+}
+
+h1,
+h2,
+h3,
+p {
+  margin-top: 0;
+}
+
+h1 {
+  font-size: 32px;
+  margin-bottom: 0;
+}
+
+.status-pill {
+  border: 1px solid #cbd5e1;
+  border-radius: 999px;
+  color: #334155;
+  padding: 8px 12px;
+}
+
+.metric-grid,
+.module-grid {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.metric-card,
+.module-card,
+.panel {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+}
+
+.metric-card {
+  display: grid;
+  gap: 8px;
+  min-height: 120px;
+  padding: 18px;
+}
+
+.metric-card svg {
+  color: #006adc;
+}
+
+.metric-card span {
+  color: #64748b;
+}
+
+.metric-card strong {
+  font-size: 30px;
+}
+
+.split {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: 1.1fr 0.9fr;
+  margin: 14px 0;
+}
+
+.panel {
+  padding: 18px;
+}
+
+.panel-heading {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.panel-heading h2 {
+  font-size: 18px;
+  margin: 0;
+}
+
+textarea {
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  min-height: 230px;
+  padding: 14px;
+  resize: vertical;
+  width: 100%;
+}
+
+.primary-action {
+  background: #111827;
+  border: 0;
+  border-radius: 8px;
+  color: #ffffff;
+  cursor: pointer;
+  margin-top: 12px;
+  padding: 12px 16px;
+}
+
+.primary-action:disabled {
+  cursor: progress;
+  opacity: 0.7;
+}
+
+.result-stack {
+  display: grid;
+  gap: 10px;
+}
+
+.result-row {
+  align-items: center;
+  border-bottom: 1px solid #e2e8f0;
+  display: flex;
+  justify-content: space-between;
+  padding-bottom: 8px;
+}
+
+.result-row span {
+  color: #64748b;
+}
+
+.redacted-output {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  color: #334155;
+  line-height: 1.7;
+  max-height: 220px;
+  overflow: auto;
+  padding: 12px;
+  white-space: pre-wrap;
+}
+
+.empty-state {
+  color: #64748b;
+}
+
+.module-grid {
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+}
+
+.module-card {
+  min-height: 132px;
+  padding: 16px;
+}
+
+.module-card h3 {
+  font-size: 16px;
+  margin: 8px 0;
+}
+
+.module-card p {
+  color: #64748b;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.dot {
+  background: #cbd5e1;
+  border-radius: 999px;
+  display: block;
+  height: 10px;
+  width: 10px;
+}
+
+.dot.active {
+  background: #16a34a;
+}
+
+@media (max-width: 960px) {
+  .app-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .sidebar {
+    position: static;
+  }
+
+  .metric-grid,
+  .split,
+  .module-grid {
+    grid-template-columns: 1fr;
+  }
+}
