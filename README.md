@@ -122,6 +122,14 @@ API: http://localhost:8000/api/health
 Web: http://localhost:5173
 ```
 
+阿里云旁路部署：
+
+```bash
+SSH_TARGET=user@your-aliyun-host scripts/deploy-aliyun-safe.sh
+```
+
+默认只监听服务器 `127.0.0.1:18080`，不会占用 `80/443` 或修改现有反向代理。详细说明见 [`docs/deploy/ALIYUN_SAFE_DEPLOY.md`](./docs/deploy/ALIYUN_SAFE_DEPLOY.md)。
+
 官网预览：
 
 [https://codywiki.github.io/Lodia/](https://codywiki.github.io/Lodia/)

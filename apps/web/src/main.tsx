@@ -83,6 +83,8 @@ const modules = [
   ["Trust", "中国区合规、安全审计、风控", "active"],
 ];
 
+const apiUrl = (path: string) => path;
+
 function App() {
   const [text, setText] = useState(
     "请分析这个客服投诉案例，客户手机号 13800138000，邮箱 user@example.com，API key sk-abcdefghijklmnopqrstuvwxyz。要求输出处理步骤、验收结果和可复用规则。"
@@ -95,7 +97,7 @@ function App() {
   async function runPreview() {
     setLoading(true);
     try {
-      const response = await fetch("http://localhost:8000/api/pipeline/preview", {
+      const response = await fetch(apiUrl("/api/pipeline/preview"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -113,7 +115,7 @@ function App() {
   async function submitCase() {
     setLoading(true);
     try {
-      const response = await fetch("http://localhost:8000/api/submissions/text", {
+      const response = await fetch(apiUrl("/api/submissions/text"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -134,7 +136,7 @@ function App() {
     if (!caseItem) return;
     setLoading(true);
     try {
-      const response = await fetch(`http://localhost:8000/api/review/${caseItem.case_id}/approve`, {
+      const response = await fetch(apiUrl(`/api/review/${caseItem.case_id}/approve`), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ reviewer_id: "reviewer_demo", notes: "Phase 1 demo approval" }),
@@ -148,7 +150,7 @@ function App() {
   async function buildDataset() {
     setLoading(true);
     try {
-      const response = await fetch("http://localhost:8000/api/datasets", {
+      const response = await fetch(apiUrl("/api/datasets"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

@@ -1,0 +1,36 @@
+name: lodia-prod
+
+services:
+  api:
+    build:
+      context: ./apps/api
+    restart: unless-stopped
+    environment:
+      LODIA_ENV: production
+      LODIA_DATA_DIR: /data
+    volumes:
+      - ./storage/prod:/data
+    expose:
+      - "8000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3).read()",
+        ]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+  web:
+    build:
+      context: ./apps/web
+    restart: unless-stopped
+    ports:
+      - "${LODIA_BIND_HOST:-127.0.0.1}:${LODIA_WEB_PORT:-18080}:80"
+    depends_on:
+      api:
+        condition: service_healthy
