@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     paths:
-      - ".lodia-upload/READY"
+      - ".lodia-upload-v2/READY"
 
 permissions:
   contents: write
@@ -22,17 +22,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sha256sum .lodia-upload/lodia_docs_tar_gz_b64.part*
-          sha256sum -c <<'EOF'
-          de5cb99b1128eca119328954ad83dd646b5658c7bb6b3009510a35b84d4b390e  .lodia-upload/lodia_docs_tar_gz_b64.part000
-          22fef398b28aeb90a7270cabf251645ec3897584899b3c29ddb47f2e1ef65c38  .lodia-upload/lodia_docs_tar_gz_b64.part001
-          416d7fbdd04082cd8a45dd0a14f322683de8e73484561074f9ae431a0bcc9afb  .lodia-upload/lodia_docs_tar_gz_b64.part002
-          32a20084e95231ed39b31a4153642705f32f526bb8f5a2d9afbbecec06a6a40d  .lodia-upload/lodia_docs_tar_gz_b64.part003
-          2232d9024ce157e383f8a87b70a5aa9ac5d50851d2b9226222569722784e3924  .lodia-upload/lodia_docs_tar_gz_b64.part004
-          EOF
-          cat .lodia-upload/lodia_docs_tar_gz_b64.part* | tr -d '\n' | base64 -d > /tmp/lodia-docs.tar.gz
+          shopt -s nullglob
+          parts=(.lodia-upload-v2/lodia_docs_tar_gz_b64.part*)
+          if [ "${#parts[@]}" -ne 23 ]; then
+            echo "Expected 23 parts, found ${#parts[@]}"
+            exit 1
+          fi
+          cat "${parts[@]}" | tr -d '\n' | base64 -d > /tmp/lodia-docs.tar.gz
+          echo "ece8b2dcab3c22c2349f4ba0e7b94960ba6f47fee107ef898c2d6faaaf1fff27  /tmp/lodia-docs.tar.gz" | sha256sum -c -
           tar -xzf /tmp/lodia-docs.tar.gz
-          rm -rf .lodia-upload .github/workflows/reconstruct-docs.yml
+          rm -rf .lodia-upload .lodia-upload-v2 .github/workflows/reconstruct-docs.yml
 
       - name: Commit restored docs
         shell: bash
