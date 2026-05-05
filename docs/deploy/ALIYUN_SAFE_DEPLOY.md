@@ -1,14 +1,18 @@
-# Lodia 阿里云安全旁路部署
+# Lodia 阿里云轻量应用服务器安全旁路部署
 
-这套部署方式默认不修改服务器现有 Nginx、PM2、systemd、数据库或已有 Docker Compose 项目。
+这套部署方式适用于阿里云轻量应用服务器（SWAS）或普通 ECS，默认不修改服务器现有 Nginx、PM2、systemd、数据库或已有 Docker Compose 项目。
 
 ## 默认边界
 
 - 独立远端目录：`~/lodia`
 - 独立 Compose 项目名：`lodia_prod`
 - 默认只监听服务器本机：`127.0.0.1:18080`
-- 数据目录：`~/lodia/storage/prod`
+- Postgres 数据目录：`~/lodia/storage/prod/postgres`
+- 对象存储本地目录：`~/lodia/storage/prod/objects`
 - 不使用宿主机 `80/443/8000/5173/5432/6379`
+- 自动生成生产 `Admin/Reviewer/Contributor` Token，并写入远端 `~/lodia/.env.production`
+
+如果服务器上已有项目，先保持默认 `127.0.0.1:18080` 本机监听，通过 SSH 隧道验证；确认无冲突后再接入现有反向代理或开放公网高位端口。
 
 ## 部署
 
@@ -36,6 +40,8 @@ ssh -L 18080:127.0.0.1:18080 user@your-aliyun-host
 http://127.0.0.1:18080
 ```
 
+生产环境 API 默认启用 Auth/RBAC。打开控制台后，把 `~/lodia/.env.production` 中的 `LODIA_ADMIN_TOKEN` 填到页面右上角 `API Token` 输入框，再执行审核、生成数据集或查看审计日志。
+
 ## 公网访问
 
 确认阿里云安全组允许对应高位端口后，才使用公网绑定：
@@ -45,6 +51,20 @@ SSH_TARGET=user@your-aliyun-host LODIA_BIND_HOST=0.0.0.0 LODIA_WEB_PORT=18080 sc
 ```
 
 生产域名和 HTTPS 建议后续再接入现有反向代理，接入前先确认现有站点配置和证书自动续期方式。
+
+## OSS / S3 对象存储
+
+默认部署使用独立的本地对象存储目录，避免影响服务器现有服务。接入阿里云 OSS 或其他 S3-compatible 服务时，在 `.env.production` 中设置：
+
+```bash
+LODIA_OBJECT_STORAGE_BACKEND=s3
+LODIA_S3_BUCKET=your-bucket
+LODIA_S3_ENDPOINT_URL=https://oss-cn-zhangjiakou.aliyuncs.com
+LODIA_S3_REGION=cn-zhangjiakou
+LODIA_S3_PREFIX=lodia
+```
+
+AccessKey 不要写进仓库。优先使用服务器环境变量、RAM 角色或最小权限凭据。
 
 ## 回滚
 

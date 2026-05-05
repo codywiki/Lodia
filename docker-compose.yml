@@ -5,10 +5,28 @@ services:
     command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
     environment:
       LODIA_ENV: development
+      LODIA_OBJECT_STORAGE_BACKEND: local
+      LODIA_OBJECT_STORAGE_DIR: /data
     ports:
       - "8000:8000"
     volumes:
       - ./apps/api:/app
+      - ./storage/dev:/data
+
+  worker:
+    build:
+      context: ./apps/api
+    command: python worker.py
+    environment:
+      LODIA_ENV: development
+      LODIA_DATA_DIR: /data
+      LODIA_OBJECT_STORAGE_BACKEND: local
+      LODIA_OBJECT_STORAGE_DIR: /data
+    volumes:
+      - ./apps/api:/app
+      - ./storage/dev:/data
+    depends_on:
+      - api
 
   web:
     image: node:22-alpine

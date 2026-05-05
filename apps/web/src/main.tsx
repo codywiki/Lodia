@@ -67,6 +67,15 @@ type DatasetResult = {
   };
 };
 
+type AuditLog = {
+  id: string;
+  actor_id: string;
+  event_type: string;
+  entity_type: string;
+  entity_id: string;
+  created_at: string;
+};
+
 const metrics = [
   { label: "Raw 隔离", value: "100%", icon: LockKeyhole },
   { label: "自动处理", value: "92%", icon: Sparkles },
@@ -92,6 +101,8 @@ function App() {
   const [preview, setPreview] = useState<PreviewResponse | null>(null);
   const [caseItem, setCaseItem] = useState<CaseItem | null>(null);
   const [dataset, setDataset] = useState<DatasetResult | null>(null);
+  const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
+  const [apiToken, setApiToken] = useState("");
   const [loading, setLoading] = useState(false);
 
   async function runPreview() {
@@ -99,7 +110,7 @@ function App() {
     try {
       const response = await fetch(apiUrl("/api/pipeline/preview"), {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: requestHeaders(apiToken),
         body: JSON.stringify({
           owner_id: "demo_contributor",
           text,
@@ -117,7 +128,7 @@ function App() {
     try {
       const response = await fetch(apiUrl("/api/submissions/text"), {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: requestHeaders(apiToken),
         body: JSON.stringify({
           owner_id: "demo_contributor",
           text,
@@ -138,7 +149,7 @@ function App() {
     try {
       const response = await fetch(apiUrl(`/api/review/${caseItem.case_id}/approve`), {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: requestHeaders(apiToken),
         body: JSON.stringify({ reviewer_id: "reviewer_demo", notes: "Phase 1 demo approval" }),
       });
       setCaseItem(await response.json());
@@ -152,7 +163,7 @@ function App() {
     try {
       const response = await fetch(apiUrl("/api/datasets"), {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: requestHeaders(apiToken),
         body: JSON.stringify({
           name: "Demo Commercial Dataset",
           purpose: "commercial_dataset",
@@ -162,6 +173,19 @@ function App() {
         }),
       });
       setDataset(await response.json());
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function loadAuditLogs() {
+    setLoading(true);
+    try {
+      const response = await fetch(apiUrl("/api/audit/logs?limit=8"), {
+        headers: requestHeaders(apiToken, false),
+      });
+      const payload = await response.json();
+      setAuditLogs(payload.items || []);
     } finally {
       setLoading(false);
     }
@@ -185,7 +209,16 @@ function App() {
             <p className="eyebrow">Commercial Console</p>
             <h1>AI Case-to-Dataset 生产线</h1>
           </div>
-          <span className="status-pill">CN Independent</span>
+          <div className="top-actions">
+            <input
+              className="token-input"
+              type="password"
+              value={apiToken}
+              onChange={(event) => setApiToken(event.target.value)}
+              placeholder="API Token"
+            />
+            <span className="status-pill">CN Independent</span>
+          </div>
         </header>
 
         <section className="metric-grid">
@@ -220,6 +253,9 @@ function App() {
               </button>
               <button className="secondary-action" onClick={buildDataset} disabled={loading || !caseItem || caseItem.quality_gate.drl !== "DRL3"}>
                 生成数据集
+              </button>
+              <button className="secondary-action" onClick={loadAuditLogs} disabled={loading}>
+                审计日志
               </button>
             </div>
           </div>
@@ -320,9 +356,40 @@ function App() {
             </article>
           ))}
         </section>
+
+        <section className="panel audit-panel">
+          <div className="panel-heading">
+            <ShieldCheck size={18} />
+            <h2>审计后台</h2>
+          </div>
+          {auditLogs.length ? (
+            <div className="audit-list">
+              {auditLogs.map((item) => (
+                <div className="audit-row" key={item.id}>
+                  <span>{item.event_type}</span>
+                  <strong>{item.entity_type}:{item.entity_id}</strong>
+                  <small>{item.actor_id}</small>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="empty-state">生产环境使用 Admin Token 查看审计事件和关键状态变更。</p>
+          )}
+        </section>
       </section>
     </main>
   );
+}
+
+function requestHeaders(token: string, json = true) {
+  const headers: Record<string, string> = {};
+  if (json) {
+    headers["Content-Type"] = "application/json";
+  }
+  if (token.trim()) {
+    headers.Authorization = `Bearer ${token.trim()}`;
+  }
+  return headers;
 }
 
 function formatMoney(cents: number) {

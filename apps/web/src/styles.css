@@ -70,6 +70,19 @@ nav button:hover,
   margin-bottom: 24px;
 }
 
+.top-actions {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+}
+
+.token-input {
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  min-width: 220px;
+  padding: 10px 12px;
+}
+
 .eyebrow {
   color: #64748b;
   font-size: 13px;
@@ -248,6 +261,29 @@ textarea {
   line-height: 1.5;
 }
 
+.audit-panel {
+  margin-top: 14px;
+}
+
+.audit-list {
+  display: grid;
+  gap: 8px;
+}
+
+.audit-row {
+  align-items: center;
+  border-bottom: 1px solid #e2e8f0;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: 1fr 1.4fr 0.7fr;
+  padding-bottom: 8px;
+}
+
+.audit-row span,
+.audit-row small {
+  color: #64748b;
+}
+
 .dot {
   background: #cbd5e1;
   border-radius: 999px;
@@ -271,7 +307,19 @@ textarea {
 
   .metric-grid,
   .split,
-  .module-grid {
+  .module-grid,
+  .audit-row {
     grid-template-columns: 1fr;
+  }
+
+  .topbar,
+  .top-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .token-input {
+    min-width: 0;
+    width: 100%;
   }
 }

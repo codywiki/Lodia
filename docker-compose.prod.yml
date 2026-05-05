@@ -1,6 +1,21 @@
 name: lodia-prod
 
 services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: lodia
+      POSTGRES_USER: lodia
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      - ./storage/prod/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lodia -d lodia"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   api:
     build:
       context: ./apps/api
@@ -8,10 +23,26 @@ services:
     environment:
       LODIA_ENV: production
       LODIA_DATA_DIR: /data
+      POSTGRES_DSN: postgresql://lodia:${POSTGRES_PASSWORD}@postgres:5432/lodia
+      LODIA_ALLOWED_ORIGINS: ${LODIA_ALLOWED_ORIGINS:-http://localhost:18080}
+      LODIA_ASYNC_PROCESSING: ${LODIA_ASYNC_PROCESSING:-false}
+      LODIA_OBJECT_STORAGE_BACKEND: ${LODIA_OBJECT_STORAGE_BACKEND:-local}
+      LODIA_OBJECT_STORAGE_DIR: ${LODIA_OBJECT_STORAGE_DIR:-/objects}
+      LODIA_S3_BUCKET: ${LODIA_S3_BUCKET:-}
+      LODIA_S3_ENDPOINT_URL: ${LODIA_S3_ENDPOINT_URL:-}
+      LODIA_S3_REGION: ${LODIA_S3_REGION:-}
+      LODIA_S3_PREFIX: ${LODIA_S3_PREFIX:-lodia}
+      LODIA_ADMIN_TOKEN: ${LODIA_ADMIN_TOKEN:?LODIA_ADMIN_TOKEN is required}
+      LODIA_REVIEWER_TOKEN: ${LODIA_REVIEWER_TOKEN:?LODIA_REVIEWER_TOKEN is required}
+      LODIA_CONTRIBUTOR_TOKEN: ${LODIA_CONTRIBUTOR_TOKEN:?LODIA_CONTRIBUTOR_TOKEN is required}
     volumes:
       - ./storage/prod:/data
+      - ./storage/prod/objects:/objects
     expose:
       - "8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
     healthcheck:
       test:
         [
@@ -24,6 +55,29 @@ services:
       timeout: 5s
       start_period: 10s
       retries: 3
+
+  worker:
+    build:
+      context: ./apps/api
+    command: python worker.py
+    restart: unless-stopped
+    environment:
+      LODIA_ENV: production
+      LODIA_DATA_DIR: /data
+      POSTGRES_DSN: postgresql://lodia:${POSTGRES_PASSWORD}@postgres:5432/lodia
+      LODIA_OBJECT_STORAGE_BACKEND: ${LODIA_OBJECT_STORAGE_BACKEND:-local}
+      LODIA_OBJECT_STORAGE_DIR: ${LODIA_OBJECT_STORAGE_DIR:-/objects}
+      LODIA_S3_BUCKET: ${LODIA_S3_BUCKET:-}
+      LODIA_S3_ENDPOINT_URL: ${LODIA_S3_ENDPOINT_URL:-}
+      LODIA_S3_REGION: ${LODIA_S3_REGION:-}
+      LODIA_S3_PREFIX: ${LODIA_S3_PREFIX:-lodia}
+      LODIA_WORKER_QUEUE: ingestion
+    volumes:
+      - ./storage/prod:/data
+      - ./storage/prod/objects:/objects
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   web:
     build:
