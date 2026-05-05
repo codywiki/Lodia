@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hmac
 from dataclasses import dataclass
-from typing import Dict, Iterable, Optional, Set
+from typing import Callable, Dict, Iterable, Optional, Set
 
 from fastapi import Header, HTTPException, status
 
@@ -24,16 +24,18 @@ class AuthContext:
 class TokenPrincipal:
     subject_id: str
     roles: Set[str]
+    token_id: Optional[str] = None
 
 
 class AuthManager:
-    def __init__(self, settings: LodiaSettings):
+    def __init__(self, settings: LodiaSettings, token_resolver: Optional[Callable[[str], Optional[dict]]] = None):
         self.settings = settings
         self._tokens = _parse_token_specs(settings.auth_token_specs)
+        self._token_resolver = token_resolver
 
     @property
     def enabled(self) -> bool:
-        return bool(self._tokens)
+        return bool(self._tokens or (self.settings.is_production and self._token_resolver))
 
     def require(self, authorization: Optional[str], required_roles: Iterable[str]) -> AuthContext:
         if not self.enabled:
@@ -65,6 +67,14 @@ class AuthManager:
         for expected, principal in self._tokens.items():
             if hmac.compare_digest(token, expected):
                 return principal
+        if self._token_resolver:
+            resolved = self._token_resolver(token)
+            if resolved:
+                return TokenPrincipal(
+                    subject_id=resolved["subject_id"],
+                    roles=set(resolved["roles"]),
+                    token_id=resolved.get("token_id"),
+                )
         return None
 
 

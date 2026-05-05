@@ -4,4 +4,6 @@ pydantic==2.10.4
 python-multipart==0.0.20
 httpx==0.28.1
 psycopg[binary]==3.2.13
+psycopg_pool==3.2.6
 boto3==1.35.90
+redis==5.2.1
