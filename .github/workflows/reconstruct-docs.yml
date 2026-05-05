@@ -1,6 +1,7 @@
 name: Reconstruct docs
 
 on:
+  workflow_dispatch:
   push:
     paths:
       - ".lodia-upload/READY"
