@@ -39,6 +39,34 @@ type PreviewResponse = {
   };
 };
 
+type CaseItem = {
+  case_id: string;
+  status: string;
+  redacted_text: string;
+  annotation: {
+    quality_score: number;
+    domain: string;
+    task_type: string;
+  };
+  quality_gate: {
+    drl: string;
+    commercial_ready: boolean;
+    required_actions: string[];
+  };
+};
+
+type DatasetResult = {
+  id: string;
+  name: string;
+  status: string;
+  case_ids: string[];
+  payout?: {
+    contributor_pool_cents: number;
+    platform_share_cents: number;
+    allocations: Array<{ contributor_id: string; case_id: string; amount_cents: number }>;
+  };
+};
+
 const metrics = [
   { label: "Raw 隔离", value: "100%", icon: LockKeyhole },
   { label: "自动处理", value: "92%", icon: Sparkles },
@@ -60,6 +88,8 @@ function App() {
     "请分析这个客服投诉案例，客户手机号 13800138000，邮箱 user@example.com，API key sk-abcdefghijklmnopqrstuvwxyz。要求输出处理步骤、验收结果和可复用规则。"
   );
   const [preview, setPreview] = useState<PreviewResponse | null>(null);
+  const [caseItem, setCaseItem] = useState<CaseItem | null>(null);
+  const [dataset, setDataset] = useState<DatasetResult | null>(null);
   const [loading, setLoading] = useState(false);
 
   async function runPreview() {
@@ -75,6 +105,61 @@ function App() {
         }),
       });
       setPreview(await response.json());
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function submitCase() {
+    setLoading(true);
+    try {
+      const response = await fetch("http://localhost:8000/api/submissions/text", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          owner_id: "demo_contributor",
+          text,
+          allowed_uses: ["private_library", "candidate_pool", "commercial_dataset", "training"],
+        }),
+      });
+      const payload = await response.json();
+      setCaseItem(payload.case);
+      setDataset(null);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function approveCase() {
+    if (!caseItem) return;
+    setLoading(true);
+    try {
+      const response = await fetch(`http://localhost:8000/api/review/${caseItem.case_id}/approve`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reviewer_id: "reviewer_demo", notes: "Phase 1 demo approval" }),
+      });
+      setCaseItem(await response.json());
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function buildDataset() {
+    setLoading(true);
+    try {
+      const response = await fetch("http://localhost:8000/api/datasets", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: "Demo Commercial Dataset",
+          purpose: "commercial_dataset",
+          min_drl: "DRL3",
+          gross_revenue_cents: 100000,
+          direct_cost_cents: 20000,
+        }),
+      });
+      setDataset(await response.json());
     } finally {
       setLoading(false);
     }
@@ -121,9 +206,20 @@ function App() {
               <h2>处理链路预览</h2>
             </div>
             <textarea value={text} onChange={(event) => setText(event.target.value)} />
-            <button className="primary-action" onClick={runPreview} disabled={loading}>
-              {loading ? "处理中" : "运行自动脱敏与质量门禁"}
-            </button>
+            <div className="action-row">
+              <button className="primary-action" onClick={runPreview} disabled={loading}>
+                {loading ? "处理中" : "预览门禁"}
+              </button>
+              <button className="secondary-action" onClick={submitCase} disabled={loading}>
+                提交入库
+              </button>
+              <button className="secondary-action" onClick={approveCase} disabled={loading || !caseItem}>
+                审核通过
+              </button>
+              <button className="secondary-action" onClick={buildDataset} disabled={loading || !caseItem || caseItem.quality_gate.drl !== "DRL3"}>
+                生成数据集
+              </button>
+            </div>
           </div>
 
           <div className="panel result-panel">
@@ -153,6 +249,66 @@ function App() {
           </div>
         </section>
 
+        <section className="split lower-split">
+          <div className="panel">
+            <div className="panel-heading">
+              <BadgeCheck size={18} />
+              <h2>Case 资产</h2>
+            </div>
+            {caseItem ? (
+              <div className="result-stack">
+                <div className="result-row">
+                  <span>CaseID</span>
+                  <strong>{caseItem.case_id}</strong>
+                </div>
+                <div className="result-row">
+                  <span>状态</span>
+                  <strong>{caseItem.status}</strong>
+                </div>
+                <div className="result-row">
+                  <span>DRL</span>
+                  <strong>{caseItem.quality_gate.drl}</strong>
+                </div>
+                <div className="result-row">
+                  <span>质量分</span>
+                  <strong>{caseItem.annotation.quality_score.toFixed(2)}</strong>
+                </div>
+              </div>
+            ) : (
+              <p className="empty-state">提交入库后，这里会显示脱敏后的 Case 资产状态。</p>
+            )}
+          </div>
+
+          <div className="panel">
+            <div className="panel-heading">
+              <Scale size={18} />
+              <h2>数据集与分账</h2>
+            </div>
+            {dataset ? (
+              <div className="result-stack">
+                <div className="result-row">
+                  <span>数据集</span>
+                  <strong>{dataset.name}</strong>
+                </div>
+                <div className="result-row">
+                  <span>Case 数</span>
+                  <strong>{dataset.case_ids.length}</strong>
+                </div>
+                <div className="result-row">
+                  <span>贡献者池</span>
+                  <strong>{formatMoney(dataset.payout?.contributor_pool_cents || 0)}</strong>
+                </div>
+                <div className="result-row">
+                  <span>平台留存</span>
+                  <strong>{formatMoney(dataset.payout?.platform_share_cents || 0)}</strong>
+                </div>
+              </div>
+            ) : (
+              <p className="empty-state">审核到 DRL3 后即可生成数据集，并产生 UsageEvent 与 PayoutEvent。</p>
+            )}
+          </div>
+        </section>
+
         <section className="module-grid">
           {modules.map(([name, description, state]) => (
             <article className="module-card" key={name}>
@@ -165,6 +321,10 @@ function App() {
       </section>
     </main>
   );
+}
+
+function formatMoney(cents: number) {
+  return `¥${(cents / 100).toFixed(2)}`;
 }
 
 createRoot(document.getElementById("root")!).render(<App />);
