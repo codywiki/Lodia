@@ -162,17 +162,31 @@ textarea {
   width: 100%;
 }
 
-.primary-action {
+.action-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.primary-action,
+.secondary-action {
   background: #111827;
   border: 0;
   border-radius: 8px;
   color: #ffffff;
   cursor: pointer;
-  margin-top: 12px;
   padding: 12px 16px;
 }
 
-.primary-action:disabled {
+.secondary-action {
+  background: #ffffff;
+  border: 1px solid #cbd5e1;
+  color: #111827;
+}
+
+.primary-action:disabled,
+.secondary-action:disabled {
   cursor: progress;
   opacity: 0.7;
 }
@@ -212,6 +226,10 @@ textarea {
 
 .module-grid {
   grid-template-columns: repeat(6, minmax(0, 1fr));
+}
+
+.lower-split {
+  grid-template-columns: 1fr 1fr;
 }
 
 .module-card {
