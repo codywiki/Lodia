@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Lodia 把 AI 对话、任务记录和案例变成可复用、可授权、可持续变现的数据资产。"
+    />
+    <title>Lodia - AI 数据资产矿脉平台</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="site-header" data-header>
+      <nav class="nav" aria-label="主导航">
+        <a class="brand" href="#top" aria-label="Lodia 首页">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <span>Lodia</span>
+        </a>
+        <div class="nav-links">
+          <a href="#earn">个人收益</a>
+          <a href="#privacy">隐私保护</a>
+          <a href="#enterprise">企业数据</a>
+        </div>
+        <a class="nav-cta" href="#contact">联系合作</a>
+      </nav>
+    </header>
+
+    <main id="top">
+      <section class="hero section" aria-labelledby="hero-title">
+        <div class="hero-copy">
+          <h1 id="hero-title">Lodia</h1>
+          <p class="hero-line">把 AI 工作记录变成可复用、可变现的数据资产。</p>
+          <p class="hero-sub">
+            转发或上传你的 AI 对话、任务记录和案例。Lodia 自动脱敏、去重、标注和审核。优质 Case 被采纳、授权或使用后，你可以获得收益。
+          </p>
+          <div class="hero-actions">
+            <a class="button button-primary" href="#earn">开始了解</a>
+            <a class="button button-quiet" href="#enterprise">企业合作</a>
+          </div>
+        </div>
+
+        <figure class="hero-visual" aria-label="Lodia 产品界面预览">
+          <img src="./assets/lodia-dashboard.svg" alt="Lodia 控制台展示 Case 收益、脱敏、审核和企业数据集出厂状态" />
+        </figure>
+      </section>
+
+      <section class="consumer-strip" aria-label="个人收益摘要">
+        <div>
+          <strong>一键收集</strong>
+          <span>邮箱、上传、插件、API</span>
+        </div>
+        <div>
+          <strong>自动处理</strong>
+          <span>脱敏、去重、结构化、标注</span>
+        </div>
+        <div>
+          <strong>持续收益</strong>
+          <span>采纳、调用、评测、训练授权</span>
+        </div>
+      </section>
+
+      <section class="section steps" id="earn" aria-labelledby="earn-title">
+        <div class="section-heading">
+          <h2 id="earn-title">你的每一次好问题，都可能成为资产。</h2>
+          <p>
+            Lodia 面向 AI 重度用户、开发者、顾问、运营、客服、销售和行业专家。你不需要手工整理数据，只需要把有价值的 AI 工作记录交给 Lodia。
+          </p>
+        </div>
+
+        <div class="step-grid">
+          <article class="step">
+            <span class="step-number">1</span>
+            <h3>转发或上传</h3>
+            <p>把 ChatGPT、Kimi、Claude、Codex、Cursor 等对话和任务记录转发到你的 Lodia Inbox。</p>
+          </article>
+          <article class="step">
+            <span class="step-number">2</span>
+            <h3>自动处理</h3>
+            <p>系统先隔离原始数据，再完成脱敏、残留扫描、去重、结构化和质量评分。</p>
+          </article>
+          <article class="step">
+            <span class="step-number">3</span>
+            <h3>采纳后收益</h3>
+            <p>Case 被加入数据集、被评测使用、被 RAG/API 调用或被训练任务纳入后，进入收益账本。</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="section ledger-section" aria-labelledby="ledger-title">
+        <div class="ledger-copy">
+          <h2 id="ledger-title">收益透明。用途清楚。</h2>
+          <p>
+            每条 Case 都绑定 CaseID、授权范围、数据集版本和 UsageEvent。你能看到它是否被收录、被调用、被用于评测或训练纳入。
+          </p>
+          <a class="inline-link" href="#contact">申请成为早期贡献者</a>
+        </div>
+        <div class="ledger-card" aria-label="收益账本示例">
+          <div class="ledger-top">
+            <span>本月 Case 资产</span>
+            <strong>¥486.80</strong>
+          </div>
+          <div class="ledger-row">
+            <span>被收录数据集</span>
+            <strong>18 条</strong>
+          </div>
+          <div class="ledger-row">
+            <span>评测使用</span>
+            <strong>63 次</strong>
+          </div>
+          <div class="ledger-row">
+            <span>API/RAG 调用</span>
+            <strong>214 次</strong>
+          </div>
+          <div class="ledger-row muted">
+            <span>收益以实际采纳、授权和使用记录为准</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="section privacy" id="privacy" aria-labelledby="privacy-title">
+        <div class="privacy-visual" aria-hidden="true">
+          <div class="shield">
+            <span></span>
+          </div>
+        </div>
+        <div class="privacy-copy">
+          <h2 id="privacy-title">先保护，再变现。</h2>
+          <p>
+            Lodia 中国区默认独立运营，生产数据、日志、模型调用和备份留存在中国大陆。原始数据进入隔离区，脱敏后才进入标注和审核链路。
+          </p>
+          <ul class="check-list">
+            <li>原始数据 Raw Quarantine 隔离处理</li>
+            <li>敏感个人信息和重要数据候选默认不进市场</li>
+            <li>授权、撤回、导出和收益记录可审计</li>
+          </ul>
+        </div>
+      </section>
+
+      <section class="section enterprise" id="enterprise" aria-labelledby="enterprise-title">
+        <div class="section-heading">
+          <h2 id="enterprise-title">企业获得更真实的可训练数据。</h2>
+          <p>
+            Lodia 帮企业把员工 AI 使用过程沉淀为私有案例库、评测集、培训集和高质量训练数据候选池。
+          </p>
+        </div>
+        <div class="enterprise-layout">
+          <div class="enterprise-panel">
+            <h3>高质量数据出厂</h3>
+            <p>每个可交付数据集都经过 DRL 分级、Quality Gate、Data Contract 和 Quality Report。</p>
+            <div class="pipeline">
+              <span>脱敏</span>
+              <span>去重</span>
+              <span>审核</span>
+              <span>出厂</span>
+            </div>
+          </div>
+          <div class="enterprise-panel dark">
+            <h3>企业私有优先</h3>
+            <p>企业数据默认不进入公开市场，可配置专属租户、私有敏感词库、审核队列和数据保留周期。</p>
+            <a class="button button-light" href="#contact">联系企业合作</a>
+          </div>
+        </div>
+      </section>
+
+      <section class="section contact" id="contact" aria-labelledby="contact-title">
+        <div>
+          <h2 id="contact-title">准备让 Case 开始产生价值？</h2>
+          <p>个人早期贡献者、企业数据合作和私有化部署咨询，都可以先留下联系方式。</p>
+        </div>
+        <form class="contact-form" data-contact-form>
+          <label>
+            <span>称呼</span>
+            <input name="name" autocomplete="name" placeholder="你的名字" required />
+          </label>
+          <label>
+            <span>联系方式</span>
+            <input name="contact" autocomplete="email" placeholder="邮箱或微信" required />
+          </label>
+          <label>
+            <span>合作类型</span>
+            <select name="type">
+              <option>个人贡献者</option>
+              <option>企业数据合作</option>
+              <option>私有化部署</option>
+            </select>
+          </label>
+          <button class="button button-primary" type="submit">提交意向</button>
+          <p class="form-note" data-form-note>也可以邮件联系：contact@lodia.cn</p>
+        </form>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <span>Lodia</span>
+      <span>AI Case-to-Dataset Platform</span>
+      <span>中国区独立运营设计稿</span>
+    </footer>
+
+    <script src="./script.js"></script>
+  </body>
+</html>
