@@ -1,0 +1,41 @@
+services:
+  api:
+    build:
+      context: ./apps/api
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    environment:
+      LODIA_ENV: development
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./apps/api:/app
+
+  web:
+    image: node:22-alpine
+    working_dir: /app
+    command: sh -c "npm install && npm run dev"
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./apps/web:/app
+    depends_on:
+      - api
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: lodia
+      POSTGRES_USER: lodia
+      POSTGRES_PASSWORD: lodia_dev_only
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+volumes:
+  postgres-data:
