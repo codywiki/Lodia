@@ -2,6 +2,7 @@ import React, { useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   BadgeCheck,
+  Activity,
   Database,
   FileCheck2,
   Layers3,
@@ -76,6 +77,29 @@ type AuditLog = {
   created_at: string;
 };
 
+type ReviewQueueItem = CaseItem;
+
+type MetricsSnapshot = {
+  cases: Record<string, number>;
+  jobs: Record<string, number>;
+  users: Record<string, number>;
+  datasets: number;
+  pending_payout_cents: number;
+  audit_events: number;
+};
+
+type DataContract = {
+  id: string;
+  dataset_id: string;
+  status: string;
+  contract: {
+    version: string;
+    purpose: string;
+    min_drl: string;
+    case_count: number;
+  };
+};
+
 const metrics = [
   { label: "Raw 隔离", value: "100%", icon: LockKeyhole },
   { label: "自动处理", value: "92%", icon: Sparkles },
@@ -102,7 +126,12 @@ function App() {
   const [caseItem, setCaseItem] = useState<CaseItem | null>(null);
   const [dataset, setDataset] = useState<DatasetResult | null>(null);
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
+  const [reviewQueue, setReviewQueue] = useState<ReviewQueueItem[]>([]);
+  const [metricsSnapshot, setMetricsSnapshot] = useState<MetricsSnapshot | null>(null);
+  const [dataContract, setDataContract] = useState<DataContract | null>(null);
   const [apiToken, setApiToken] = useState("");
+  const [loginEmail, setLoginEmail] = useState("contributor@lodia.local");
+  const [loginPassword, setLoginPassword] = useState("");
   const [loading, setLoading] = useState(false);
 
   async function runPreview() {
@@ -191,6 +220,77 @@ function App() {
     }
   }
 
+  async function login() {
+    setLoading(true);
+    try {
+      const response = await fetch(apiUrl("/api/auth/login"), {
+        method: "POST",
+        headers: requestHeaders("", true),
+        body: JSON.stringify({ email: loginEmail, password: loginPassword }),
+      });
+      const payload = await response.json();
+      if (payload.token) {
+        setApiToken(payload.token);
+      }
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function loadReviewQueue() {
+    setLoading(true);
+    try {
+      const response = await fetch(apiUrl("/api/review/queue?limit=6"), {
+        headers: requestHeaders(apiToken, false),
+      });
+      const payload = await response.json();
+      setReviewQueue(payload.items || []);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function rejectCurrentCase() {
+    if (!caseItem) return;
+    setLoading(true);
+    try {
+      const response = await fetch(apiUrl(`/api/review/${caseItem.case_id}/reject`), {
+        method: "POST",
+        headers: requestHeaders(apiToken),
+        body: JSON.stringify({ reason: "Reviewer rejected from console" }),
+      });
+      setCaseItem(await response.json());
+      await loadReviewQueue();
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function loadMetrics() {
+    setLoading(true);
+    try {
+      const response = await fetch(apiUrl("/api/admin/metrics"), {
+        headers: requestHeaders(apiToken, false),
+      });
+      setMetricsSnapshot(await response.json());
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function loadDataContract() {
+    if (!dataset) return;
+    setLoading(true);
+    try {
+      const response = await fetch(apiUrl(`/api/datasets/${dataset.id}/contract`), {
+        headers: requestHeaders(apiToken, false),
+      });
+      setDataContract(await response.json());
+    } finally {
+      setLoading(false);
+    }
+  }
+
   return (
     <main className="app-shell">
       <aside className="sidebar">
@@ -217,6 +317,22 @@ function App() {
               onChange={(event) => setApiToken(event.target.value)}
               placeholder="API Token"
             />
+            <input
+              className="token-input"
+              value={loginEmail}
+              onChange={(event) => setLoginEmail(event.target.value)}
+              placeholder="Email"
+            />
+            <input
+              className="token-input"
+              type="password"
+              value={loginPassword}
+              onChange={(event) => setLoginPassword(event.target.value)}
+              placeholder="Password"
+            />
+            <button className="secondary-action compact-action" onClick={login} disabled={loading || !loginPassword}>
+              登录
+            </button>
             <span className="status-pill">CN Independent</span>
           </div>
         </header>
@@ -251,11 +367,20 @@ function App() {
               <button className="secondary-action" onClick={approveCase} disabled={loading || !caseItem}>
                 审核通过
               </button>
+              <button className="secondary-action" onClick={rejectCurrentCase} disabled={loading || !caseItem}>
+                驳回
+              </button>
               <button className="secondary-action" onClick={buildDataset} disabled={loading || !caseItem || caseItem.quality_gate.drl !== "DRL3"}>
                 生成数据集
               </button>
+              <button className="secondary-action" onClick={loadReviewQueue} disabled={loading}>
+                审核队列
+              </button>
               <button className="secondary-action" onClick={loadAuditLogs} disabled={loading}>
                 审计日志
+              </button>
+              <button className="secondary-action" onClick={loadMetrics} disabled={loading}>
+                指标
               </button>
             </div>
           </div>
@@ -340,11 +465,86 @@ function App() {
                   <span>平台留存</span>
                   <strong>{formatMoney(dataset.payout?.platform_share_cents || 0)}</strong>
                 </div>
+                <button className="secondary-action" onClick={loadDataContract} disabled={loading}>
+                  Data Contract
+                </button>
               </div>
             ) : (
               <p className="empty-state">审核到 DRL3 后即可生成数据集，并产生 UsageEvent 与 PayoutEvent。</p>
             )}
           </div>
+        </section>
+
+        <section className="split lower-split">
+          <div className="panel">
+            <div className="panel-heading">
+              <FileCheck2 size={18} />
+              <h2>审核队列</h2>
+            </div>
+            {reviewQueue.length ? (
+              <div className="audit-list">
+                {reviewQueue.map((item) => (
+                  <div className="audit-row" key={item.case_id}>
+                    <span>{item.status}</span>
+                    <strong>{item.case_id}</strong>
+                    <small>{item.quality_gate.drl}</small>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="empty-state">待复核 Case 会进入抽检、隐私复核或 DRL3 升级队列。</p>
+            )}
+          </div>
+
+          <div className="panel">
+            <div className="panel-heading">
+              <Activity size={18} />
+              <h2>生产指标</h2>
+            </div>
+            {metricsSnapshot ? (
+              <div className="result-stack">
+                <div className="result-row">
+                  <span>数据集</span>
+                  <strong>{metricsSnapshot.datasets}</strong>
+                </div>
+                <div className="result-row">
+                  <span>审计事件</span>
+                  <strong>{metricsSnapshot.audit_events}</strong>
+                </div>
+                <div className="result-row">
+                  <span>待分账</span>
+                  <strong>{formatMoney(metricsSnapshot.pending_payout_cents)}</strong>
+                </div>
+              </div>
+            ) : (
+              <p className="empty-state">生产指标用于接入 SLS、Prometheus 和告警面板。</p>
+            )}
+          </div>
+        </section>
+
+        <section className="panel audit-panel">
+          <div className="panel-heading">
+            <FileCheck2 size={18} />
+            <h2>Data Contract</h2>
+          </div>
+          {dataContract ? (
+            <div className="result-stack">
+              <div className="result-row">
+                <span>版本</span>
+                <strong>{dataContract.contract.version}</strong>
+              </div>
+              <div className="result-row">
+                <span>用途</span>
+                <strong>{dataContract.contract.purpose}</strong>
+              </div>
+              <div className="result-row">
+                <span>Case 数</span>
+                <strong>{dataContract.contract.case_count}</strong>
+              </div>
+            </div>
+          ) : (
+            <p className="empty-state">数据集通过出厂门禁后，会生成可审计的 Data Contract。</p>
+          )}
         </section>
 
         <section className="module-grid">

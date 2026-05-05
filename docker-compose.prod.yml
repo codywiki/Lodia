@@ -16,6 +16,18 @@ services:
       timeout: 5s
       retries: 5
 
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - ./storage/prod/redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   api:
     build:
       context: ./apps/api
@@ -24,14 +36,31 @@ services:
       LODIA_ENV: production
       LODIA_DATA_DIR: /data
       POSTGRES_DSN: postgresql://lodia:${POSTGRES_PASSWORD}@postgres:5432/lodia
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      LODIA_QUEUE_BACKEND: ${LODIA_QUEUE_BACKEND:-redis}
+      LODIA_DB_POOL_MIN_SIZE: ${LODIA_DB_POOL_MIN_SIZE:-1}
+      LODIA_DB_POOL_MAX_SIZE: ${LODIA_DB_POOL_MAX_SIZE:-10}
       LODIA_ALLOWED_ORIGINS: ${LODIA_ALLOWED_ORIGINS:-http://localhost:18080}
-      LODIA_ASYNC_PROCESSING: ${LODIA_ASYNC_PROCESSING:-false}
+      LODIA_ASYNC_PROCESSING: ${LODIA_ASYNC_PROCESSING:-true}
+      LODIA_RAW_OBJECT_TTL_HOURS: ${LODIA_RAW_OBJECT_TTL_HOURS:-24}
+      LODIA_PASSWORD_PEPPER: ${LODIA_PASSWORD_PEPPER:?LODIA_PASSWORD_PEPPER is required}
+      LODIA_MAX_REQUEST_BODY_BYTES: ${LODIA_MAX_REQUEST_BODY_BYTES:-1048576}
+      LODIA_RATE_LIMIT_ENABLED: ${LODIA_RATE_LIMIT_ENABLED:-true}
+      LODIA_RATE_LIMIT_REQUESTS: ${LODIA_RATE_LIMIT_REQUESTS:-120}
+      LODIA_RATE_LIMIT_WINDOW_SECONDS: ${LODIA_RATE_LIMIT_WINDOW_SECONDS:-60}
+      LODIA_TRUST_PROXY_HEADERS: ${LODIA_TRUST_PROXY_HEADERS:-false}
+      LODIA_REQUIRE_REQUEST_SIGNATURE: ${LODIA_REQUIRE_REQUEST_SIGNATURE:-false}
+      LODIA_REQUEST_SIGNATURE_SECRET: ${LODIA_REQUEST_SIGNATURE_SECRET:-}
+      LODIA_MAX_PAGE_LIMIT: ${LODIA_MAX_PAGE_LIMIT:-500}
+      LODIA_DATASET_MAX_CASES: ${LODIA_DATASET_MAX_CASES:-5000}
       LODIA_OBJECT_STORAGE_BACKEND: ${LODIA_OBJECT_STORAGE_BACKEND:-local}
       LODIA_OBJECT_STORAGE_DIR: ${LODIA_OBJECT_STORAGE_DIR:-/objects}
       LODIA_S3_BUCKET: ${LODIA_S3_BUCKET:-}
       LODIA_S3_ENDPOINT_URL: ${LODIA_S3_ENDPOINT_URL:-}
       LODIA_S3_REGION: ${LODIA_S3_REGION:-}
       LODIA_S3_PREFIX: ${LODIA_S3_PREFIX:-lodia}
+      LODIA_S3_SSE_ALGORITHM: ${LODIA_S3_SSE_ALGORITHM:-AES256}
+      LODIA_S3_KMS_KEY_ID: ${LODIA_S3_KMS_KEY_ID:-}
       LODIA_ADMIN_TOKEN: ${LODIA_ADMIN_TOKEN:?LODIA_ADMIN_TOKEN is required}
       LODIA_REVIEWER_TOKEN: ${LODIA_REVIEWER_TOKEN:?LODIA_REVIEWER_TOKEN is required}
       LODIA_CONTRIBUTOR_TOKEN: ${LODIA_CONTRIBUTOR_TOKEN:?LODIA_CONTRIBUTOR_TOKEN is required}
@@ -43,13 +72,15 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     healthcheck:
       test:
         [
           "CMD",
           "python",
           "-c",
-          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3).read()",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/ready', timeout=3).read()",
         ]
       interval: 30s
       timeout: 5s
@@ -65,18 +96,29 @@ services:
       LODIA_ENV: production
       LODIA_DATA_DIR: /data
       POSTGRES_DSN: postgresql://lodia:${POSTGRES_PASSWORD}@postgres:5432/lodia
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      LODIA_QUEUE_BACKEND: ${LODIA_QUEUE_BACKEND:-redis}
+      LODIA_DB_POOL_MIN_SIZE: ${LODIA_DB_POOL_MIN_SIZE:-1}
+      LODIA_DB_POOL_MAX_SIZE: ${LODIA_DB_POOL_MAX_SIZE:-10}
+      LODIA_DATASET_MAX_CASES: ${LODIA_DATASET_MAX_CASES:-5000}
+      LODIA_RAW_OBJECT_TTL_HOURS: ${LODIA_RAW_OBJECT_TTL_HOURS:-24}
+      LODIA_PASSWORD_PEPPER: ${LODIA_PASSWORD_PEPPER:?LODIA_PASSWORD_PEPPER is required}
       LODIA_OBJECT_STORAGE_BACKEND: ${LODIA_OBJECT_STORAGE_BACKEND:-local}
       LODIA_OBJECT_STORAGE_DIR: ${LODIA_OBJECT_STORAGE_DIR:-/objects}
       LODIA_S3_BUCKET: ${LODIA_S3_BUCKET:-}
       LODIA_S3_ENDPOINT_URL: ${LODIA_S3_ENDPOINT_URL:-}
       LODIA_S3_REGION: ${LODIA_S3_REGION:-}
       LODIA_S3_PREFIX: ${LODIA_S3_PREFIX:-lodia}
+      LODIA_S3_SSE_ALGORITHM: ${LODIA_S3_SSE_ALGORITHM:-AES256}
+      LODIA_S3_KMS_KEY_ID: ${LODIA_S3_KMS_KEY_ID:-}
       LODIA_WORKER_QUEUE: ingestion
     volumes:
       - ./storage/prod:/data
       - ./storage/prod/objects:/objects
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
 
   web:
