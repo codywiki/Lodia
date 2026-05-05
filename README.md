@@ -1,31 +1,100 @@
 # Lodia
 
-Lodia is an AI Case-to-Dataset platform concept and website. It helps users turn AI conversations, task records, cases, attachments, and evaluation traces into reusable, auditable, and revenue-generating data assets.
+> 与其被 AI 吞没，不如成为 AI 生态的一部分。不是把人从未来的工作里移走，而是把人的经验、判断和反馈，留在价值链里。
 
-This repository currently contains:
+Lodia 想做一件很具体的事：把你每天和 AI 一起完成的对话、任务、案例、评测和执行记录，变成可授权、可复用、可持续分成的数据资产。
 
-- A static product website in [`site/`](./site)
-- Product requirements documentation in [`docs/LODIA_PRD.md`](./docs/LODIA_PRD.md)
-- Technical architecture documentation in [`docs/LODIA_TECH_ARCHITECTURE.md`](./docs/LODIA_TECH_ARCHITECTURE.md)
-- Technical risk and data quality assessment in [`docs/LODIA_TECH_RISK_ASSESSMENT.md`](./docs/LODIA_TECH_RISK_ASSESSMENT.md)
+我们相信，未来很多职业工作会被 AI 重写。真正稀缺的不会是又一段漂亮回答，而是真实世界里的问题、上下文、约束、失败路径、工具过程、人类反馈和行业判断。那些东西现在散落在聊天记录、邮件、文档、代码任务、客服工单、Agent trace 和评测表里，用完就沉底。
 
-## Website
+Lodia 要把这些沉底的经验重新打捞出来。
 
-The website is a static HTML/CSS/JS site. Open it locally:
+## Lodia 是什么
+
+Lodia 是一个 AI Case-to-Dataset 数据资产平台。
+
+个人可以把高质量 AI 对话、任务过程、案例和评测提交给 Lodia。Lodia 先隔离原始数据，再完成脱敏、去重、结构化、自动标注、人工审核和专家精标。只有通过授权、隐私、质量和可用性门禁的 Case，才可能进入可商用数据集、评测集、行业案例库或企业私有数据资产。
+
+当一条 Case 被采纳、授权、打包、调用或销售，收益会回到贡献者账本。不是一次性买断人的经验，而是只要这条 Case 还在产生价值，数据所有者就应该持续参与回报。
+
+## 我们相信
+
+- 每个人都应该拥有自己的数据资产，而不是只把劳动痕迹留给平台。
+- AI 公司需要更真实、更干净、更可追溯的数据，而不是一堆来路不明的聊天碎片。
+- 好数据不只是“内容”，还包括任务目标、约束条件、执行过程、工具结果、用户反馈和验收标准。
+- 隐私和授权不是发布前补一张协议，而应该写进数据处理链的第一天。
+- 真正有价值的 Case，应该让贡献者长期分到收益。
+
+## 它怎么工作
+
+```text
+上传或转发 AI 对话 / 任务 / 案例 / 评测
+-> 原始数据隔离
+-> 自动脱敏与风险扫描
+-> 去重、聚类和价值评分
+-> 结构化解析与自动标注
+-> 人工审核与专家精标
+-> 数据资产注册与授权快照
+-> 数据集打包、API 调用或企业交付
+-> 使用记录与收益分账
+```
+
+Lodia 的核心不是“收件箱”，也不是“自动标注”。核心是一条可信的数据资产生产线：知道数据从哪里来，谁授权了它，被怎样处理过，质量到了什么等级，用在了哪里，收益该回到谁。
+
+## 给贡献者
+
+如果你是 AI 重度用户、开发者、咨询顾问、运营、客服、销售、培训师、行业专家，或者只是每天认真使用 AI 完成工作的人，Lodia 想帮你保留那些本来会消失的劳动价值。
+
+你贡献的可以是：
+
+- 一个高质量问题和完整上下文
+- 一次复杂任务的执行过程
+- 一段 Agent 调用工具并完成目标的 trace
+- 一份人工验收过的回答
+- 一组模型评测样本
+- 一个行业场景里的失败案例、边界条件或修正过程
+
+低质量、重复、缺少授权或隐私风险过高的内容不会进入商业数据集。真正被采纳的 Case，会通过 CaseID、授权快照、使用事件和收益账本持续追踪。
+
+## 给 AI 公司和企业
+
+Lodia 面向需要高质量可训练数据、评测数据和真实任务样本的团队。
+
+你拿到的不是未经处理的原始聊天记录，而是经过脱敏、授权、去重、分级、审核和质量门禁的数据资产。每个数据集都应该带着清单、来源、用途边界、质量等级、已知限制和审计记录。
+
+适用场景包括：
+
+- 模型训练和指令微调候选数据
+- Agent 任务评测集
+- 行业场景案例库
+- 客服、销售、法务、财务、人力等企业 AI 流程评测
+- RAG 知识样本与 SOP 沉淀
+- 企业私有 AI 使用经验库
+
+## 为什么开源
+
+数据资产平台最先要解决的不是界面问题，而是信任问题。
+
+所以这个仓库先开放产品需求、技术架构和风险评估：Lodia 怎么理解隐私，怎么处理授权，怎么定义 Case 的价值，怎么区分自动标注和人工精标，怎么判断一条数据是否真的可以商用。
+
+这不是一个已经完成的产品仓库，而是 Lodia 从想法走向产品的公开起点。
+
+## 当前仓库包含
+
+- 静态官网：[`site/`](./site)
+- 产品需求文档：[`docs/LODIA_PRD.md`](./docs/LODIA_PRD.md)
+- 技术架构文档：[`docs/LODIA_TECH_ARCHITECTURE.md`](./docs/LODIA_TECH_ARCHITECTURE.md)
+- 技术风险与数据质量评估：[`docs/LODIA_TECH_RISK_ASSESSMENT.md`](./docs/LODIA_TECH_RISK_ASSESSMENT.md)
+
+官网预览：
+
+[https://codywiki.github.io/Lodia/](https://codywiki.github.io/Lodia/)
+
+本地打开：
 
 ```bash
 open site/index.html
 ```
 
-GitHub Pages is configured through GitHub Actions and publishes the contents of `site/`.
+## 许可证
 
-## Product Positioning
-
-Lodia is designed around two audiences:
-
-- **Contributors:** submit high-quality AI conversations and task cases, then earn when accepted cases are authorized, used in datasets, evaluations, RAG/API calls, or training inclusion.
-- **Enterprises:** build private case libraries, evaluation sets, training data candidates, and auditable data products from real AI work records.
-
-## License
-
-This project is licensed under the GNU Affero General Public License v3.0. See [`LICENSE`](./LICENSE).
+本项目采用 GNU Affero General Public License v3.0 开源协议。详见 [`LICENSE`](./LICENSE)。
