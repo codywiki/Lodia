@@ -1,0 +1,48 @@
+name: Reconstruct docs
+
+on:
+  push:
+    paths:
+      - ".lodia-upload/READY"
+
+permissions:
+  contents: write
+
+jobs:
+  reconstruct:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Restore full documentation files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p docs
+          decode_parts() {
+            local prefix="$1"
+            local output="$2"
+            cat ".lodia-upload/${prefix}".part* | tr -d '\n' | base64 -d > "$output"
+          }
+          decode_parts "docs_LODIA_PRD_md" "docs/LODIA_PRD.md"
+          decode_parts "docs_LODIA_TECH_ARCHITECTURE_md" "docs/LODIA_TECH_ARCHITECTURE.md"
+          decode_parts "docs_LODIA_TECH_RISK_ASSESSMENT_md" "docs/LODIA_TECH_RISK_ASSESSMENT.md"
+          decode_parts "LICENSE" "LICENSE"
+          rm -rf .lodia-upload .github/workflows/reconstruct-docs.yml
+
+      - name: Commit restored docs
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git commit -m "Add full Lodia docs and AGPL license"
+          git push
