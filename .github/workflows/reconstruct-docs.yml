@@ -21,16 +21,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p docs
-          decode_parts() {
-            local prefix="$1"
-            local output="$2"
-            cat ".lodia-upload/${prefix}".part* | tr -d '\n' | base64 -d > "$output"
-          }
-          decode_parts "docs_LODIA_PRD_md" "docs/LODIA_PRD.md"
-          decode_parts "docs_LODIA_TECH_ARCHITECTURE_md" "docs/LODIA_TECH_ARCHITECTURE.md"
-          decode_parts "docs_LODIA_TECH_RISK_ASSESSMENT_md" "docs/LODIA_TECH_RISK_ASSESSMENT.md"
-          decode_parts "LICENSE" "LICENSE"
+          cat .lodia-upload/lodia_docs_tar_gz_b64.part* | tr -d '\n' | base64 -d > /tmp/lodia-docs.tar.gz
+          tar -xzf /tmp/lodia-docs.tar.gz
           rm -rf .lodia-upload .github/workflows/reconstruct-docs.yml
 
       - name: Commit restored docs
