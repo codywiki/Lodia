@@ -49,6 +49,7 @@ class LodiaSettings:
     password_pepper: str
     raw_object_ttl_hours: int
     max_asset_bytes: int
+    upload_session_ttl_seconds: int
     max_request_body_bytes: int
     rate_limit_enabled: bool
     rate_limit_requests: int
@@ -91,6 +92,7 @@ class LodiaSettings:
             password_pepper=os.environ.get("LODIA_PASSWORD_PEPPER", ""),
             raw_object_ttl_hours=_int(os.environ.get("LODIA_RAW_OBJECT_TTL_HOURS"), 24),
             max_asset_bytes=_int(os.environ.get("LODIA_MAX_ASSET_BYTES"), 1_048_576),
+            upload_session_ttl_seconds=_int(os.environ.get("LODIA_UPLOAD_SESSION_TTL_SECONDS"), 900),
             max_request_body_bytes=_int(os.environ.get("LODIA_MAX_REQUEST_BODY_BYTES"), 1_048_576),
             rate_limit_enabled=_bool(
                 os.environ.get("LODIA_RATE_LIMIT_ENABLED"),
@@ -120,10 +122,10 @@ def _auth_token_specs() -> List[str]:
     reviewer = os.environ.get("LODIA_REVIEWER_TOKEN")
     contributor = os.environ.get("LODIA_CONTRIBUTOR_TOKEN")
     if admin:
-        specs.append(f"{admin}:admin,reviewer,contributor:admin")
+        specs.append(f"{admin}:admin,reviewer,contributor:admin:platform")
     if reviewer:
-        specs.append(f"{reviewer}:reviewer:reviewer")
+        specs.append(f"{reviewer}:reviewer:reviewer:platform")
     if contributor:
-        specs.append(f"{contributor}:contributor:contributor")
+        specs.append(f"{contributor}:contributor:contributor:default")
     specs.extend(_csv(os.environ.get("LODIA_AUTH_TOKENS", "")))
     return specs

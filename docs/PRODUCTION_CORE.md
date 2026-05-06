@@ -17,8 +17,10 @@
 - 授权快照：每次提交记录用途范围、协议版本和授权状态，撤回后同步阻断 Case、Asset 和未来数据集出厂。
 - Model Gateway：记录本地规则标注和多模态提取调用，为后续国内模型、OCR、ASR 和成本核算预留统一审计表。
 - Ledger：支持 UsageEvent、PayoutEvent、贡献者账本、payout settle、结算批次、批次 manifest 和幂等结算保护。
+- 直传会话：支持 `/api/assets/upload-sessions` 创建对象存储上传会话，上传完成后回调入库，避免大文件穿过 API。
+- 租户底座：支持 `tenants`、用户 `tenant_id` 和 token auth context，为企业租户、SSO 和配额隔离预留主键。
 - 操作审批：支持审批请求、审批/拒绝、审批审计，供高风险导出和结算接入。
-- 生产护栏：API request id、请求体上限、单节点限流、请求签名开关、分页查询、`/api/ready` 就绪检查和 `/api/admin/observability` 指标快照。
+- 生产护栏：API request id、请求体上限、单节点限流、请求签名开关、分页查询、`/api/ready` 就绪检查、`/api/admin/observability` 指标快照和 Prometheus 文本指标。
 - 查询性能：Case 增加 `drl`、`quality_score` 查询列和核心索引，数据集生成按 DRL/质量分筛选并限制批量大小。
 - Raw Quarantine：原始对象记录过期时间，支持 TTL purge，S3-compatible 存储支持 SSE/KMS 参数。
 - 部署：生产 Compose 启动 `postgres`、`redis`、`api`、`worker`、`web` 五类服务。
@@ -40,6 +42,7 @@ LODIA_RAW_OBJECT_TTL_HOURS=24
 LODIA_DB_POOL_MIN_SIZE=1
 LODIA_DB_POOL_MAX_SIZE=10
 LODIA_MAX_ASSET_BYTES=1048576
+LODIA_UPLOAD_SESSION_TTL_SECONDS=900
 LODIA_MAX_REQUEST_BODY_BYTES=1048576
 LODIA_RATE_LIMIT_ENABLED=true
 LODIA_RATE_LIMIT_REQUESTS=120
@@ -90,7 +93,15 @@ SQLite 使用单进程安全的简单领取逻辑。Postgres 使用 `FOR UPDATE 
 
 `/api/assets` 接收多模态资产，当前生产底座先完成类型识别、文件风险扫描、raw quarantine、文本/trace 证据抽取、PDF 文本层提取和红线文件拒收。图片、扫描 PDF、音频、视频默认进入 `extraction_pending`，可通过 `/api/assets/{asset_id}/extract` 投递到 `extraction` 队列，后续接入 OCR、ASR、视频关键帧和文档解析 Worker 时不改变资产表和任务队列接口。
 
+大文件走 `/api/assets/upload-sessions` 创建直传会话。S3-compatible/OSS 后端返回 presigned PUT URL；本地对象存储会返回 `direct_upload_supported=false`，只用于内部测试。客户端上传完成后调用 `/api/assets/upload-sessions/{session_id}/complete`，服务端重新读取对象、校验大小、执行风险扫描、绑定授权并进入原有资产处理链路。
+
 `authorization_snapshots` 是数据出厂的一等门禁。每个文本提交和资产上传都会绑定授权快照，Data Contract 会记录 `authorization_snapshot_ids`。授权撤回后，对应 Case 和 Asset 标记为 `withdrawn`，未来数据集生成会跳过这些 Case。
+
+## 租户与供应商审计
+
+`tenants` 和用户 `tenant_id` 已进入认证上下文。当前版本先完成租户元数据和用户归属，后续企业 SSO、租户级配额、按租户数据集出厂和租户级审计可直接复用该主键。
+
+每次本地规则标注或多模态提取都会写入 `model_invocations` 和 `vendor_processing_records`。接入国内 OCR、ASR、文档解析或 LLM 供应商时，必须继续记录 provider、service_type、region、purpose、data_category、input_hash 和状态，便于中国区合规审计和成本核算。
 
 ## DRL4/DRL5 与结算
 
@@ -107,14 +118,14 @@ SQLite 使用单进程安全的简单领取逻辑。Postgres 使用 `FOR UPDATE 
 - Postgres 使用托管 RDS 或独立高配实例，按实际并发调高 `LODIA_DB_POOL_MAX_SIZE`，并避免超过数据库 `max_connections`。
 - 对象存储使用 OSS/S3-compatible bucket，原始数据和脱敏数据分 bucket 或分前缀隔离，生产建议启用 KMS。
 - Worker 按 ingestion、extraction、redaction、annotation、review-export 分队列横向扩容。
-- 多模态大文件上传建议走对象存储直传和回调，本 API 当前作为控制面和内部测试入口。
+- 多模态大文件上传走对象存储直传和完成回调，API 只作为控制面和验收入口。
 - 列表接口必须分页，批量导出必须有 `LODIA_DATASET_MAX_CASES` 或后台离线任务上限。
 
 ## 下一步
 
 - 将当前内置 versioned migration 升级为 Alembic CLI 工作流。
-- 将审计日志、`/api/admin/metrics` 和 `/api/admin/observability` 接入 SLS/Prometheus/Grafana。
+- 将审计日志、`/api/admin/metrics`、`/api/admin/observability` 和 `/api/admin/metrics/prometheus` 接入 SLS/Prometheus/Grafana。
 - 接入真实 OSS RAM 角色或 STS 临时凭据，补删除证明对象。
 - 接入真实 PaddleOCR/ASR/文档解析供应商，并将供应商调用落入 `model_invocations`。
 - 将 Reviewer Console 拆成独立路由和更完整的人审工作台。
-- 增加企业租户、SSO、订单合同、真实提现通道和争议仲裁。
+- 在当前租户底座上增加企业 SSO、订单合同、租户配额、真实提现通道和争议仲裁。

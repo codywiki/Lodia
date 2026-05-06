@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from .assets import inspect_asset
+from .assets import inspect_asset, sanitize_filename
 from .config import LodiaSettings
 from .database import Database, row_to_dict
 from .domain import ContributionWeight, DataReadinessLevel, RevenueEvent
@@ -44,33 +44,88 @@ class LodiaStore:
         self.job_queue: JobQueue = create_job_queue(self.settings)
         self._init_db()
 
+    def close(self) -> None:
+        self.db.close()
+
     def create_user(
         self,
         email: str,
         password: str,
         roles: List[str],
         display_name: str = "",
+        tenant_id: str = "default",
         actor_id: str = "system",
     ) -> Dict[str, Any]:
         user_id = _id("usr")
         normalized = normalize_email(email)
         clean_roles = _clean_roles(roles)
+        clean_tenant_id = _clean_tenant_id(tenant_id)
         now = _now()
         password_value = hash_password(password, pepper=self.settings.password_pepper)
         with self._session() as conn:
+            self._ensure_tenant(conn, clean_tenant_id, clean_tenant_id, actor_id=actor_id)
             if self._get_one(conn, "SELECT id FROM users WHERE email = ?", (normalized,)):
                 raise ValueError("user_email_exists")
             self._execute(
                 conn,
                 """
                 INSERT INTO users
-                (id, email, display_name, password_hash, roles_json, status, created_at, updated_at, last_login_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, tenant_id, email, display_name, password_hash, roles_json, status, created_at, updated_at, last_login_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (user_id, normalized, display_name, password_value, dumps(clean_roles), "active", now, now, None),
+                (user_id, clean_tenant_id, normalized, display_name, password_value, dumps(clean_roles), "active", now, now, None),
             )
-            self._audit(conn, actor_id, "user.created", "user", user_id, {"email": normalized, "roles": clean_roles})
+            self._audit(conn, actor_id, "user.created", "user", user_id, {"email": normalized, "roles": clean_roles, "tenant_id": clean_tenant_id})
             return self.get_user(user_id, conn=conn)
+
+    def create_tenant(self, tenant_id: str, name: str, actor_id: str = "system") -> Dict[str, Any]:
+        clean_tenant_id = _clean_tenant_id(tenant_id)
+        now = _now()
+        with self._session() as conn:
+            if self._get_one(conn, "SELECT id FROM tenants WHERE id = ?", (clean_tenant_id,)):
+                raise ValueError("tenant_exists")
+            self._execute(
+                conn,
+                """
+                INSERT INTO tenants (id, name, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (clean_tenant_id, name[:160] or clean_tenant_id, "active", now, now),
+            )
+            self._audit(conn, actor_id, "tenant.created", "tenant", clean_tenant_id, {"name": name[:160]})
+            return self.get_tenant(clean_tenant_id, conn=conn)
+
+    def get_tenant(self, tenant_id: str, conn: Optional[Any] = None) -> Dict[str, Any]:
+        if conn is None:
+            with self._session() as active:
+                return self.get_tenant(tenant_id, conn=active)
+        row = self._get_one(conn, "SELECT * FROM tenants WHERE id = ?", (_clean_tenant_id(tenant_id),))
+        if not row:
+            raise KeyError("tenant_not_found")
+        return row_to_dict(row)
+
+    def list_tenants(self, limit: int = 100, offset: int = 0, status: Optional[str] = None) -> List[Dict[str, Any]]:
+        limit, offset = _page_bounds(limit, offset, self.settings.max_page_limit)
+        params: List[Any] = []
+        where = ""
+        if status:
+            where = "WHERE status = ?"
+            params.append(status)
+        params.extend([limit, offset])
+        with self._session() as conn:
+            return [
+                row_to_dict(row)
+                for row in self._execute(
+                    conn,
+                    f"""
+                    SELECT * FROM tenants
+                    {where}
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    tuple(params),
+                )
+            ]
 
     def authenticate_user(self, email: str, password: str, actor_id: str = "login") -> Dict[str, Any]:
         normalized = normalize_email(email)
@@ -184,7 +239,7 @@ class LodiaStore:
             row = self._get_one(
                 conn,
                 """
-                SELECT t.*, u.status AS user_status
+                SELECT t.*, u.status AS user_status, u.tenant_id AS tenant_id
                 FROM api_tokens t
                 JOIN users u ON u.id = t.user_id
                 WHERE t.token_hash = ?
@@ -202,6 +257,7 @@ class LodiaStore:
                 "subject_id": row["user_id"],
                 "roles": loads(row["roles_json"]),
                 "token_id": row["id"],
+                "tenant_id": row["tenant_id"],
             }
 
     def create_authorization_snapshot(
@@ -502,6 +558,208 @@ class LodiaStore:
             self._publish_job("ingestion", job_id)
             return {"asset": asset, "status": "queued"}
         return {"asset": self.process_asset(asset_id, actor_id=actor_id or owner_id)}
+
+    def create_asset_upload_session(
+        self,
+        owner_id: str,
+        filename: str,
+        media_type: str,
+        byte_size: int,
+        allowed_uses: List[str],
+        actor_id: Optional[str] = None,
+        authorization_snapshot_id: Optional[str] = None,
+        expires_in_seconds: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        if byte_size <= 0:
+            raise ValueError("asset_empty")
+        if byte_size > self.settings.max_asset_bytes:
+            raise ValueError("asset_too_large")
+        expires_in = max(60, min(expires_in_seconds or self.settings.upload_session_ttl_seconds, 86_400))
+        asset_id = _id("ast")
+        session_id = _id("upl")
+        clean_filename = sanitize_filename(filename)
+        clean_media_type = (media_type or "application/octet-stream").split(";", 1)[0].strip().lower() or "application/octet-stream"
+        object_key = f"raw/assets/{asset_id}/{clean_filename}"
+        now = _now()
+        with self._session() as conn:
+            authorization = self._resolve_authorization(
+                conn,
+                owner_id=owner_id,
+                allowed_uses=allowed_uses,
+                authorization_snapshot_id=authorization_snapshot_id,
+                actor_id=actor_id or owner_id,
+                source="asset_direct_upload",
+            )
+            upload = self.objects.presign_put(object_key, clean_media_type, expires_in)
+            self._execute(
+                conn,
+                """
+                INSERT INTO asset_upload_sessions
+                (id, asset_id, owner_id, authorization_snapshot_id, filename, media_type, expected_byte_size,
+                 object_key, object_uri, status, allowed_uses_json, expires_at, created_at, completed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    asset_id,
+                    owner_id,
+                    authorization["id"],
+                    clean_filename,
+                    clean_media_type,
+                    byte_size,
+                    upload["object_key"],
+                    upload["object_uri"],
+                    "pending",
+                    dumps(authorization["allowed_uses"]),
+                    _future_seconds(expires_in),
+                    now,
+                    None,
+                ),
+            )
+            self._audit(
+                conn,
+                actor_id or owner_id,
+                "asset_upload_session.created",
+                "asset_upload_session",
+                session_id,
+                {"asset_id": asset_id, "direct_upload_supported": upload["direct_upload_supported"]},
+            )
+            session = self.get_asset_upload_session(session_id, conn=conn)
+        return {"session": session, "upload": upload}
+
+    def complete_asset_upload_session(
+        self,
+        session_id: str,
+        actor_id: str = "system",
+        enqueue: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        with self._session() as conn:
+            session = self.get_asset_upload_session(session_id, conn=conn)
+            if session["status"] != "pending":
+                raise ValueError("upload_session_not_pending")
+            if _is_expired(session["expires_at"]):
+                self._execute(conn, "UPDATE asset_upload_sessions SET status = ? WHERE id = ?", ("expired", session_id))
+                raise ValueError("upload_session_expired")
+            authorization = self.get_authorization_snapshot(session["authorization_snapshot_id"], conn=conn)
+            if authorization["status"] != "active":
+                raise ValueError("authorization_not_active")
+            cursor = self._execute(
+                conn,
+                "UPDATE asset_upload_sessions SET status = ? WHERE id = ? AND status = ?",
+                ("processing", session_id, "pending"),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError("upload_session_not_pending")
+
+        try:
+            try:
+                content = self.objects.read_bytes(session["object_uri"])
+            except Exception as exc:
+                raise ValueError("upload_object_not_readable") from exc
+            if not content:
+                raise ValueError("asset_empty")
+            if len(content) > self.settings.max_asset_bytes:
+                raise ValueError("asset_too_large")
+            if session["expected_byte_size"] and len(content) != session["expected_byte_size"]:
+                raise ValueError("asset_size_mismatch")
+            inspection = inspect_asset(session["filename"], session["media_type"], content)
+        except Exception:
+            with self._session() as conn:
+                self._execute(
+                    conn,
+                    "UPDATE asset_upload_sessions SET status = ? WHERE id = ? AND status = ?",
+                    ("pending", session_id, "processing"),
+                )
+            raise
+
+        try:
+            with self._session() as conn:
+                session = self.get_asset_upload_session(session_id, conn=conn)
+                if session["status"] != "processing":
+                    raise ValueError("upload_session_not_pending")
+                authorization = self.get_authorization_snapshot(session["authorization_snapshot_id"], conn=conn)
+                if authorization["status"] != "active":
+                    raise ValueError("authorization_not_active")
+                now = _now()
+                raw_expires_at = _future_hours(self.settings.raw_object_ttl_hours)
+                self._execute(
+                    conn,
+                    """
+                    INSERT INTO assets
+                    (id, owner_id, submission_id, authorization_snapshot_id, filename, media_type, asset_type,
+                     byte_size, sha256, status, raw_path, extracted_text_path, metadata_json, risk_json,
+                     redaction_json, raw_expires_at, raw_deleted_at, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        session["asset_id"],
+                        session["owner_id"],
+                        None,
+                        authorization["id"],
+                        inspection.filename,
+                        inspection.media_type,
+                        inspection.asset_type,
+                        inspection.byte_size,
+                        inspection.sha256,
+                        "quarantined",
+                        session["object_uri"],
+                        None,
+                        dumps(inspection.metadata),
+                        dumps(inspection.risk),
+                        dumps(inspection.redaction or {}),
+                        raw_expires_at,
+                        None,
+                        now,
+                        now,
+                    ),
+                )
+                self._execute(
+                    conn,
+                    "UPDATE asset_upload_sessions SET status = ?, completed_at = ? WHERE id = ?",
+                    ("completed", now, session_id),
+                )
+                self._audit(
+                    conn,
+                    actor_id,
+                    "asset_upload_session.completed",
+                    "asset_upload_session",
+                    session_id,
+                    {"asset_id": session["asset_id"], "asset_type": inspection.asset_type},
+                )
+                should_enqueue = self.settings.async_processing if enqueue is None else enqueue
+                if should_enqueue:
+                    job_id = self._enqueue_job(
+                        conn,
+                        job_type="process_asset",
+                        payload={"asset_id": session["asset_id"]},
+                        queue_name="ingestion",
+                        actor_id=actor_id,
+                    )
+                    asset = self.get_asset(session["asset_id"], conn=conn)
+                else:
+                    job_id = ""
+                    asset = self.get_asset(session["asset_id"], conn=conn)
+        except Exception:
+            with self._session() as conn:
+                self._execute(
+                    conn,
+                    "UPDATE asset_upload_sessions SET status = ? WHERE id = ? AND status = ?",
+                    ("pending", session_id, "processing"),
+                )
+            raise
+        if job_id:
+            self._publish_job("ingestion", job_id)
+            return {"asset": asset, "status": "queued"}
+        return {"asset": self.process_asset(session["asset_id"], actor_id=actor_id)}
+
+    def get_asset_upload_session(self, session_id: str, conn: Optional[Any] = None) -> Dict[str, Any]:
+        if conn is None:
+            with self._session() as active:
+                return self.get_asset_upload_session(session_id, conn=active)
+        row = self._get_one(conn, "SELECT * FROM asset_upload_sessions WHERE id = ?", (session_id,))
+        if not row:
+            raise KeyError("upload_session_not_found")
+        return self._asset_upload_session_from_row(row)
 
     def process_asset(self, asset_id: str, actor_id: str = "system") -> Dict[str, Any]:
         with self._session() as conn:
@@ -1522,6 +1780,63 @@ class LodiaStore:
                 )
             ]
 
+    def list_vendor_processing_records(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        entity_id: Optional[str] = None,
+        provider: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        limit, offset = _page_bounds(limit, offset, self.settings.max_page_limit)
+        filters: List[str] = []
+        params: List[Any] = []
+        if entity_id:
+            filters.append("entity_id = ?")
+            params.append(entity_id)
+        if provider:
+            filters.append("provider = ?")
+            params.append(provider)
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        params.extend([limit, offset])
+        with self._session() as conn:
+            return [
+                self._vendor_processing_from_row(row)
+                for row in self._execute(
+                    conn,
+                    f"""
+                    SELECT * FROM vendor_processing_records
+                    {where}
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    tuple(params),
+                )
+            ]
+
+    def prometheus_metrics(self) -> str:
+        snapshot = self.observability_snapshot()
+        lines = [
+            "# HELP lodia_service_ready Service readiness flag.",
+            "# TYPE lodia_service_ready gauge",
+            f"lodia_service_ready {1 if snapshot['ok'] else 0}",
+        ]
+        for status, value in snapshot["metrics"].get("cases", {}).items():
+            lines.append(f'lodia_cases_total{{status="{_label_value(status)}"}} {int(value)}')
+        for drl, value in snapshot["case_drl"].items():
+            lines.append(f'lodia_cases_by_drl_total{{drl="{_label_value(drl)}"}} {int(value)}')
+        for status, value in snapshot["metrics"].get("assets", {}).items():
+            lines.append(f'lodia_assets_total{{status="{_label_value(status)}"}} {int(value)}')
+        for key, value in snapshot["queue_depth"].items():
+            queue_name, status = _split_metric_key(key)
+            lines.append(f'lodia_jobs_total{{queue="{_label_value(queue_name)}",status="{_label_value(status)}"}} {int(value)}')
+        for status, value in snapshot["payouts"].items():
+            lines.append(f'lodia_payout_events_total{{status="{_label_value(status)}"}} {int(value)}')
+        for status, value in snapshot["model_invocations"].items():
+            lines.append(f'lodia_model_invocations_total{{status="{_label_value(status)}"}} {int(value)}')
+        lines.append(f"lodia_pending_payout_cents {int(snapshot['metrics'].get('pending_payout_cents', 0))}")
+        lines.append(f"lodia_audit_events_total {int(snapshot['metrics'].get('audit_events', 0))}")
+        return "\n".join(lines) + "\n"
+
     def create_approval_request(
         self,
         operation_type: str,
@@ -1816,6 +2131,20 @@ class LodiaStore:
             conn=conn,
         )
 
+    def _ensure_tenant(self, conn: Any, tenant_id: str, name: str, actor_id: str = "system") -> None:
+        if self._get_one(conn, "SELECT id FROM tenants WHERE id = ?", (tenant_id,)):
+            return
+        now = _now()
+        self._execute(
+            conn,
+            """
+            INSERT INTO tenants (id, name, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (tenant_id, name[:160] or tenant_id, "active", now, now),
+        )
+        self._audit(conn, actor_id, "tenant.created", "tenant", tenant_id, {"auto_created": True})
+
     def _create_submission_from_asset(
         self,
         conn: Any,
@@ -1907,6 +2236,8 @@ class LodiaStore:
             return None
 
     def _record_model_invocation(self, conn: Any, invocation: Dict[str, Any]) -> None:
+        invocation_id = _id("minv")
+        now = _now()
         self._execute(
             conn,
             """
@@ -1916,7 +2247,7 @@ class LodiaStore:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                _id("minv"),
+                invocation_id,
                 invocation["provider"],
                 invocation["task_type"],
                 invocation["entity_type"],
@@ -1927,7 +2258,30 @@ class LodiaStore:
                 invocation.get("error", ""),
                 int(invocation.get("cost_micros", 0)),
                 int(invocation.get("latency_ms", 0)),
-                _now(),
+                now,
+            ),
+        )
+        self._execute(
+            conn,
+            """
+            INSERT INTO vendor_processing_records
+            (id, model_invocation_id, provider, service_type, entity_type, entity_id,
+             data_category, status, region, purpose, input_hash, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                _id("vpr"),
+                invocation_id,
+                invocation["provider"],
+                invocation["task_type"],
+                invocation["entity_type"],
+                invocation["entity_id"],
+                _vendor_data_category(invocation["task_type"]),
+                invocation["status"],
+                self.settings.region,
+                _vendor_processing_purpose(invocation["task_type"]),
+                invocation.get("input_hash", ""),
+                now,
             ),
         )
 
@@ -1952,6 +2306,7 @@ class LodiaStore:
     def _user_from_row(self, row: Any) -> Dict[str, Any]:
         return {
             "id": row["id"],
+            "tenant_id": row["tenant_id"] if "tenant_id" in row.keys() else "default",
             "email": row["email"],
             "display_name": row["display_name"],
             "roles": loads(row["roles_json"]),
@@ -2012,6 +2367,24 @@ class LodiaStore:
             "updated_at": row["updated_at"],
         }
 
+    def _asset_upload_session_from_row(self, row: Any) -> Dict[str, Any]:
+        return {
+            "id": row["id"],
+            "asset_id": row["asset_id"],
+            "owner_id": row["owner_id"],
+            "authorization_snapshot_id": row["authorization_snapshot_id"],
+            "filename": row["filename"],
+            "media_type": row["media_type"],
+            "expected_byte_size": row["expected_byte_size"],
+            "object_key": row["object_key"],
+            "object_uri": row["object_uri"],
+            "status": row["status"],
+            "allowed_uses": loads(row["allowed_uses_json"]),
+            "expires_at": row["expires_at"],
+            "created_at": row["created_at"],
+            "completed_at": row["completed_at"],
+        }
+
     def _job_from_row(self, row: Any) -> Dict[str, Any]:
         result = row_to_dict(row)
         result["payload"] = loads(result.pop("payload_json"))
@@ -2037,6 +2410,9 @@ class LodiaStore:
         result = row_to_dict(row)
         result["output"] = loads(result.pop("output_json") or "{}")
         return result
+
+    def _vendor_processing_from_row(self, row: Any) -> Dict[str, Any]:
+        return row_to_dict(row)
 
     @contextmanager
     def _session(self):
@@ -2082,14 +2458,17 @@ class LodiaStore:
             )
             """,
         )
+        self._ensure_tenant_tables(conn)
         self._ensure_authorization_tables(conn)
         self._ensure_asset_tables(conn)
+        self._ensure_asset_upload_session_tables(conn)
         self._ensure_submission_columns(conn)
         self._ensure_dataset_columns(conn)
         self._ensure_case_query_columns(conn)
         self._ensure_review_columns(conn)
         self._ensure_payout_tables(conn)
         self._ensure_model_invocation_tables(conn)
+        self._ensure_vendor_processing_tables(conn)
         self._backfill_authorization_snapshots(conn)
         self._execute(
             conn,
@@ -2118,6 +2497,15 @@ class LodiaStore:
             """,
             ("20260506_p2_commercial_controls", _now()),
         )
+        self._execute(
+            conn,
+            """
+            INSERT INTO schema_migrations (version, applied_at)
+            VALUES (?, ?)
+            ON CONFLICT(version) DO NOTHING
+            """,
+            ("20260506_p3_upload_observability", _now()),
+        )
 
     def _ensure_submission_columns(self, conn: Any) -> None:
         columns = self.db.column_names(conn, "submissions")
@@ -2129,6 +2517,28 @@ class LodiaStore:
             self._execute(conn, "ALTER TABLE submissions ADD COLUMN raw_deleted_at TEXT")
         self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_submissions_raw_expiry ON submissions(raw_expires_at, raw_deleted_at)")
         self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_submissions_authorization ON submissions(authorization_snapshot_id)")
+
+    def _ensure_tenant_tables(self, conn: Any) -> None:
+        self._execute(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS tenants (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """,
+        )
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_tenants_status_created ON tenants(status, created_at)")
+        columns = self.db.column_names(conn, "users")
+        if "tenant_id" not in columns:
+            self._execute(conn, "ALTER TABLE users ADD COLUMN tenant_id TEXT")
+        self._execute(conn, "UPDATE users SET tenant_id = ? WHERE tenant_id IS NULL", ("default",))
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_users_tenant_status ON users(tenant_id, status, created_at)")
+        self._ensure_tenant(conn, "default", "Default Tenant")
+        self._ensure_tenant(conn, "platform", "Platform")
 
     def _ensure_dataset_columns(self, conn: Any) -> None:
         columns = self.db.column_names(conn, "datasets")
@@ -2233,6 +2643,29 @@ class LodiaStore:
         self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_model_invocations_entity ON model_invocations(entity_type, entity_id)")
         self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_model_invocations_status ON model_invocations(status, created_at)")
 
+    def _ensure_vendor_processing_tables(self, conn: Any) -> None:
+        self._execute(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS vendor_processing_records (
+                id TEXT PRIMARY KEY,
+                model_invocation_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                service_type TEXT NOT NULL,
+                entity_type TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                data_category TEXT NOT NULL,
+                status TEXT NOT NULL,
+                region TEXT NOT NULL,
+                purpose TEXT NOT NULL,
+                input_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """,
+        )
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_vendor_processing_entity ON vendor_processing_records(entity_type, entity_id)")
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_vendor_processing_provider ON vendor_processing_records(provider, created_at)")
+
     def _ensure_authorization_tables(self, conn: Any) -> None:
         self._execute(
             conn,
@@ -2286,6 +2719,31 @@ class LodiaStore:
         self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_assets_submission ON assets(submission_id)")
         self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_assets_authorization ON assets(authorization_snapshot_id)")
         self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_assets_raw_expiry ON assets(raw_expires_at, raw_deleted_at)")
+
+    def _ensure_asset_upload_session_tables(self, conn: Any) -> None:
+        self._execute(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS asset_upload_sessions (
+                id TEXT PRIMARY KEY,
+                asset_id TEXT NOT NULL UNIQUE,
+                owner_id TEXT NOT NULL,
+                authorization_snapshot_id TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                media_type TEXT NOT NULL,
+                expected_byte_size INTEGER NOT NULL,
+                object_key TEXT NOT NULL,
+                object_uri TEXT NOT NULL,
+                status TEXT NOT NULL,
+                allowed_uses_json TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                completed_at TEXT
+            )
+            """,
+        )
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_asset_upload_sessions_owner_status ON asset_upload_sessions(owner_id, status, created_at)")
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_asset_upload_sessions_expiry ON asset_upload_sessions(status, expires_at)")
 
     def _backfill_authorization_snapshots(self, conn: Any) -> None:
         rows = self._execute(
@@ -2427,6 +2885,25 @@ CREATE INDEX IF NOT EXISTS idx_assets_submission ON assets(submission_id);
 CREATE INDEX IF NOT EXISTS idx_assets_authorization ON assets(authorization_snapshot_id);
 CREATE INDEX IF NOT EXISTS idx_assets_raw_expiry ON assets(raw_expires_at, raw_deleted_at);
 
+CREATE TABLE IF NOT EXISTS asset_upload_sessions (
+    id TEXT PRIMARY KEY,
+    asset_id TEXT NOT NULL UNIQUE,
+    owner_id TEXT NOT NULL,
+    authorization_snapshot_id TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    media_type TEXT NOT NULL,
+    expected_byte_size INTEGER NOT NULL,
+    object_key TEXT NOT NULL,
+    object_uri TEXT NOT NULL,
+    status TEXT NOT NULL,
+    allowed_uses_json TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    completed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_asset_upload_sessions_owner_status ON asset_upload_sessions(owner_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_asset_upload_sessions_expiry ON asset_upload_sessions(status, expires_at);
+
 CREATE TABLE IF NOT EXISTS reviews (
     id TEXT PRIMARY KEY,
     case_id TEXT NOT NULL,
@@ -2519,8 +2996,18 @@ CREATE TABLE IF NOT EXISTS payout_batches (
 );
 CREATE INDEX IF NOT EXISTS idx_payout_batches_status_created ON payout_batches(status, created_at);
 
+CREATE TABLE IF NOT EXISTS tenants (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tenants_status_created ON tenants(status, created_at);
+
 CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
     email TEXT NOT NULL UNIQUE,
     display_name TEXT NOT NULL,
     password_hash TEXT NOT NULL,
@@ -2531,6 +3018,7 @@ CREATE TABLE IF NOT EXISTS users (
     last_login_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_users_status_created ON users(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_users_tenant_status ON users(tenant_id, status, created_at);
 
 CREATE TABLE IF NOT EXISTS api_tokens (
     id TEXT PRIMARY KEY,
@@ -2593,6 +3081,23 @@ CREATE TABLE IF NOT EXISTS model_invocations (
 );
 CREATE INDEX IF NOT EXISTS idx_model_invocations_entity ON model_invocations(entity_type, entity_id);
 CREATE INDEX IF NOT EXISTS idx_model_invocations_status ON model_invocations(status, created_at);
+
+CREATE TABLE IF NOT EXISTS vendor_processing_records (
+    id TEXT PRIMARY KEY,
+    model_invocation_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    service_type TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    data_category TEXT NOT NULL,
+    status TEXT NOT NULL,
+    region TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_vendor_processing_entity ON vendor_processing_records(entity_type, entity_id);
+CREATE INDEX IF NOT EXISTS idx_vendor_processing_provider ON vendor_processing_records(provider, created_at);
 
 CREATE TABLE IF NOT EXISTS audit_logs (
     id TEXT PRIMARY KEY,
@@ -2777,6 +3282,33 @@ def _safe_metric_identifier(value: str) -> str:
     return value
 
 
+def _label_value(value: Any) -> str:
+    return str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "_")
+
+
+def _split_metric_key(value: str) -> tuple[str, str]:
+    parts = value.split(":", 1)
+    if len(parts) == 1:
+        return parts[0], ""
+    return parts[0], parts[1]
+
+
+def _vendor_data_category(task_type: str) -> str:
+    if "extraction" in task_type:
+        return "raw_asset_content"
+    if "annotation" in task_type:
+        return "redacted_case_content"
+    return "operational_metadata"
+
+
+def _vendor_processing_purpose(task_type: str) -> str:
+    if "extraction" in task_type:
+        return "multimodal_evidence_extraction"
+    if "annotation" in task_type:
+        return "structured_case_annotation"
+    return "platform_processing"
+
+
 def _page_bounds(limit: int, offset: int, max_limit: int) -> tuple[int, int]:
     return _bounded_limit(limit, max_limit), max(0, offset)
 
@@ -2794,6 +3326,14 @@ def _clean_roles(roles: List[str]) -> List[str]:
     clean = sorted({role for role in roles if role in allowed})
     if not clean:
         raise ValueError("roles_required")
+    return clean
+
+
+def _clean_tenant_id(tenant_id: str) -> str:
+    clean = (tenant_id or "default").strip().lower()
+    clean = clean.replace("-", "_")
+    if not clean.replace("_", "").isalnum() or len(clean) > 80:
+        raise ValueError("invalid_tenant_id")
     return clean
 
 
@@ -2851,3 +3391,7 @@ def _is_expired(value: str) -> bool:
 
 def _future_hours(hours: int) -> str:
     return (datetime.now(timezone.utc) + timedelta(hours=max(1, hours))).isoformat()
+
+
+def _future_seconds(seconds: int) -> str:
+    return (datetime.now(timezone.utc) + timedelta(seconds=max(1, seconds))).isoformat()
