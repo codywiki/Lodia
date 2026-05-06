@@ -91,6 +91,24 @@ type MetricsSnapshot = {
   audit_events: number;
 };
 
+type ObservabilitySnapshot = {
+  ok: boolean;
+  case_drl: Record<string, number>;
+  payouts: Record<string, number>;
+  payout_batches: Record<string, number>;
+  reviews: Record<string, number>;
+  model_invocations: Record<string, number>;
+  queue_depth: Record<string, number>;
+};
+
+type PayoutBatch = {
+  id: string;
+  status: string;
+  payout_count: number;
+  total_amount_cents: number;
+  settled_at: string | null;
+};
+
 type DataContract = {
   id: string;
   dataset_id: string;
@@ -152,10 +170,12 @@ function App() {
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
   const [reviewQueue, setReviewQueue] = useState<ReviewQueueItem[]>([]);
   const [metricsSnapshot, setMetricsSnapshot] = useState<MetricsSnapshot | null>(null);
+  const [observabilitySnapshot, setObservabilitySnapshot] = useState<ObservabilitySnapshot | null>(null);
   const [dataContract, setDataContract] = useState<DataContract | null>(null);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [uploadedAsset, setUploadedAsset] = useState<AssetItem | null>(null);
   const [authorizations, setAuthorizations] = useState<AuthorizationSnapshot[]>([]);
+  const [payoutBatch, setPayoutBatch] = useState<PayoutBatch | null>(null);
   const [apiToken, setApiToken] = useState("");
   const [loginEmail, setLoginEmail] = useState("contributor@lodia.local");
   const [loginPassword, setLoginPassword] = useState("");
@@ -207,6 +227,48 @@ function App() {
         method: "POST",
         headers: requestHeaders(apiToken),
         body: JSON.stringify({ reviewer_id: "reviewer_demo", notes: "Phase 1 demo approval" }),
+      });
+      setCaseItem(await response.json());
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function expertVerifyCase() {
+    if (!caseItem) return;
+    setLoading(true);
+    try {
+      const response = await fetch(apiUrl(`/api/review/${caseItem.case_id}/expert-verify`), {
+        method: "POST",
+        headers: requestHeaders(apiToken),
+        body: JSON.stringify({
+          reviewer_id: "expert_demo",
+          notes: "Expert verification",
+          score: 1,
+          rubric: { evidence: "checked", usefulness: "high" },
+          evidence: { source: "console" },
+        }),
+      });
+      setCaseItem(await response.json());
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function goldReviewCase() {
+    if (!caseItem) return;
+    setLoading(true);
+    try {
+      const response = await fetch(apiUrl(`/api/review/${caseItem.case_id}/gold-review`), {
+        method: "POST",
+        headers: requestHeaders(apiToken),
+        body: JSON.stringify({
+          reviewer_id: `gold_${Date.now()}`,
+          notes: "Gold review",
+          score: 1,
+          rubric: { answer_key: "verified", holdout: "isolated" },
+          evidence: { source: "console" },
+        }),
       });
       setCaseItem(await response.json());
     } finally {
@@ -305,6 +367,18 @@ function App() {
     }
   }
 
+  async function loadObservability() {
+    setLoading(true);
+    try {
+      const response = await fetch(apiUrl("/api/admin/observability"), {
+        headers: requestHeaders(apiToken, false),
+      });
+      setObservabilitySnapshot(await response.json());
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function loadDataContract() {
     if (!dataset) return;
     setLoading(true);
@@ -336,6 +410,49 @@ function App() {
       if (payload.asset?.submission_id) {
         await loadReviewQueue();
       }
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function requestAssetExtraction() {
+    if (!uploadedAsset) return;
+    setLoading(true);
+    try {
+      await fetch(apiUrl(`/api/assets/${uploadedAsset.id}/extract`), {
+        method: "POST",
+        headers: requestHeaders(apiToken),
+      });
+      setUploadedAsset({ ...uploadedAsset, status: "extraction_queued" });
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function createPayoutBatch() {
+    setLoading(true);
+    try {
+      const response = await fetch(apiUrl("/api/ledger/payout-batches"), {
+        method: "POST",
+        headers: requestHeaders(apiToken),
+        body: JSON.stringify({ min_amount_cents: 1, max_events: 1000 }),
+      });
+      setPayoutBatch(await response.json());
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function settlePayoutBatch() {
+    if (!payoutBatch) return;
+    setLoading(true);
+    try {
+      const response = await fetch(apiUrl(`/api/ledger/payout-batches/${payoutBatch.id}/settle`), {
+        method: "POST",
+        headers: requestHeaders(apiToken),
+        body: JSON.stringify({ external_reference: "console-settlement", notes: "Settled from console" }),
+      });
+      setPayoutBatch(await response.json());
     } finally {
       setLoading(false);
     }
@@ -449,7 +566,13 @@ function App() {
               <button className="secondary-action" onClick={rejectCurrentCase} disabled={loading || !caseItem}>
                 驳回
               </button>
-              <button className="secondary-action" onClick={buildDataset} disabled={loading || !caseItem || caseItem.quality_gate.drl !== "DRL3"}>
+              <button className="secondary-action" onClick={expertVerifyCase} disabled={loading || !caseItem || caseItem.quality_gate.drl !== "DRL3"}>
+                专家验证
+              </button>
+              <button className="secondary-action" onClick={goldReviewCase} disabled={loading || !caseItem || caseItem.quality_gate.drl !== "DRL4"}>
+                Gold 复核
+              </button>
+              <button className="secondary-action" onClick={buildDataset} disabled={loading || !caseItem || !caseItem.quality_gate.commercial_ready}>
                 生成数据集
               </button>
               <button className="secondary-action" onClick={loadReviewQueue} disabled={loading}>
@@ -460,6 +583,9 @@ function App() {
               </button>
               <button className="secondary-action" onClick={loadMetrics} disabled={loading}>
                 指标
+              </button>
+              <button className="secondary-action" onClick={loadObservability} disabled={loading}>
+                观测
               </button>
             </div>
           </div>
@@ -501,6 +627,9 @@ function App() {
               <input type="file" onChange={(event) => setSelectedFile(event.target.files?.[0] || null)} />
               <button className="secondary-action" onClick={uploadAsset} disabled={loading || !selectedFile}>
                 上传资产
+              </button>
+              <button className="secondary-action" onClick={requestAssetExtraction} disabled={loading || !uploadedAsset || uploadedAsset.status !== "extraction_pending"}>
+                提取
               </button>
             </div>
             {uploadedAsset ? (
@@ -612,6 +741,18 @@ function App() {
                 <button className="secondary-action" onClick={loadDataContract} disabled={loading}>
                   Data Contract
                 </button>
+                <button className="secondary-action" onClick={createPayoutBatch} disabled={loading}>
+                  生成结算批次
+                </button>
+                <button className="secondary-action" onClick={settlePayoutBatch} disabled={loading || !payoutBatch || payoutBatch.status !== "ready"}>
+                  结算批次
+                </button>
+                {payoutBatch ? (
+                  <div className="result-row">
+                    <span>批次</span>
+                    <strong>{payoutBatch.status} · {formatMoney(payoutBatch.total_amount_cents)}</strong>
+                  </div>
+                ) : null}
               </div>
             ) : (
               <p className="empty-state">审核到 DRL3 后即可生成数据集，并产生 UsageEvent 与 PayoutEvent。</p>
@@ -663,6 +804,18 @@ function App() {
                   <span>待分账</span>
                   <strong>{formatMoney(metricsSnapshot.pending_payout_cents)}</strong>
                 </div>
+                {observabilitySnapshot ? (
+                  <>
+                    <div className="result-row">
+                      <span>DRL5</span>
+                      <strong>{observabilitySnapshot.case_drl.DRL5 || 0}</strong>
+                    </div>
+                    <div className="result-row">
+                      <span>模型调用</span>
+                      <strong>{Object.values(observabilitySnapshot.model_invocations).reduce((sum, value) => sum + value, 0)}</strong>
+                    </div>
+                  </>
+                ) : null}
               </div>
             ) : (
               <p className="empty-state">生产指标用于接入 SLS、Prometheus 和告警面板。</p>
