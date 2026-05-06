@@ -13,6 +13,9 @@ services:
       LODIA_MAX_ASSET_BYTES: 1048576
       LODIA_UPLOAD_SESSION_TTL_SECONDS: 900
       LODIA_MAX_REQUEST_BODY_BYTES: 1048576
+      LODIA_INBOUND_DOMAIN: inbox.lodia.local
+      LODIA_INBOUND_GATEWAY_TOKEN: dev-inbound-gateway-token
+      LODIA_PROVIDER_ADAPTER_MODE: mock
     ports:
       - "8000:8000"
     volumes:
@@ -32,6 +35,9 @@ services:
       LODIA_UPLOAD_SESSION_TTL_SECONDS: 900
       LODIA_OBJECT_STORAGE_BACKEND: local
       LODIA_OBJECT_STORAGE_DIR: /data
+      LODIA_INBOUND_DOMAIN: inbox.lodia.local
+      LODIA_INBOUND_GATEWAY_TOKEN: dev-inbound-gateway-token
+      LODIA_PROVIDER_ADAPTER_MODE: mock
     volumes:
       - ./apps/api:/app
       - ./storage/dev:/data

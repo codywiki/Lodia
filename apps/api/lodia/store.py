@@ -4,15 +4,18 @@ import hashlib
 import hmac
 import json
 import uuid
+from email.utils import parseaddr
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from .assets import inspect_asset, sanitize_filename
+from .compliance import compliance_result_to_dict, screen_text_for_compliance
 from .config import LodiaSettings
 from .database import Database, row_to_dict
 from .domain import ContributionWeight, DataReadinessLevel, RevenueEvent
 from .identity import hash_password, new_api_token, normalize_email, token_hash, token_suffix, verify_password
+from .inbox import inbound_case_text, inbox_local_part, normalize_inbox_address, parse_inbound_message
 from .job_queue import JobQueue, create_job_queue
 from .model_gateway import annotation_invocation, extract_asset_text, extraction_invocation
 from .object_storage import ObjectStorage, create_object_storage
@@ -37,6 +40,18 @@ DATASET_ARTIFACTS = {
     "data_contract": ("data_contract_path", "application/json", "data_contract.json"),
     "data": ("data_path", "application/x-ndjson", "data.jsonl"),
 }
+
+EXPECTED_SCHEMA_MIGRATIONS = [
+    "20260506_p0_foundation",
+    "20260506_p1_assets_authorization",
+    "20260506_p2_commercial_controls",
+    "20260506_p3_upload_observability",
+    "20260506_p4_contributor_review_delivery",
+    "20260506_p5_enterprise_delivery_payout_profiles",
+    "20260506_p6_commercial_ops",
+    "20260506_p7_production_completion",
+    "20260506_p8_p0_completion",
+]
 
 
 class LodiaStore:
@@ -1019,7 +1034,8 @@ class LodiaStore:
             self._audit(conn, actor_id, "case.processed", "case", case["case_id"], {"status": processed.status})
             stored_case = self.get_case(case["case_id"], conn=conn)
             self._record_model_invocation(conn, annotation_invocation(stored_case))
-            return stored_case
+            self._run_content_safety_screen(conn, "case", stored_case["case_id"], stored_case["redacted_text"], actor_id=actor_id)
+            return self.get_case(case["case_id"], conn=conn)
 
     def list_cases(
         self,
@@ -1057,6 +1073,8 @@ class LodiaStore:
     def contributor_dashboard(self, contributor_id: str, limit: int = 10) -> Dict[str, Any]:
         limit = _bounded_limit(limit, self.settings.max_page_limit)
         with self._session() as conn:
+            trust_row = self._get_one(conn, "SELECT * FROM source_trust_profiles WHERE contributor_id = ?", (contributor_id,))
+            source_trust = row_to_dict(trust_row) if trust_row else _default_source_trust_profile(contributor_id)
             recent_cases = [
                 self._case_from_row(row)
                 for row in self._execute(
@@ -1108,7 +1126,873 @@ class LodiaStore:
                     "payout_count": payout_totals["total_count"],
                     "recent": recent_payouts[:limit],
                 },
+                "source_trust": source_trust,
             }
+
+    def refresh_source_trust_profile(
+        self,
+        contributor_id: str,
+        actor_id: str = "system",
+        conn: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        if conn is None:
+            with self._session() as active:
+                return self.refresh_source_trust_profile(contributor_id, actor_id=actor_id, conn=active)
+
+        now = _now()
+        case_row = self._get_one(
+            conn,
+            """
+            SELECT
+              COUNT(*) AS case_count,
+              SUM(CASE WHEN status = 'commercial_ready' THEN 1 ELSE 0 END) AS accepted_count,
+              SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) AS rejected_count
+            FROM cases
+            WHERE owner_id = ?
+            """,
+            (contributor_id,),
+        )
+        duplicate_rows = self._execute(
+            conn,
+            "SELECT dedup_json FROM cases WHERE owner_id = ?",
+            (contributor_id,),
+        )
+        duplicate_count = 0
+        for row in duplicate_rows:
+            dedup = loads(row["dedup_json"] or "{}")
+            if dedup.get("duplicate_status") not in {None, "unique"}:
+                duplicate_count += 1
+
+        dispute_row = self._get_one(
+            conn,
+            """
+            SELECT COUNT(*) AS value
+            FROM disputes d
+            JOIN cases c ON c.id = d.entity_id
+            WHERE d.entity_type = ? AND c.owner_id = ?
+            """,
+            ("case", contributor_id),
+        )
+        void_row = self._get_one(
+            conn,
+            """
+            SELECT COUNT(*) AS value
+            FROM payout_events
+            WHERE contributor_id = ? AND status = ?
+            """,
+            (contributor_id, "voided"),
+        )
+        case_count = int(case_row["case_count"] or 0) if case_row else 0
+        accepted_count = int(case_row["accepted_count"] or 0) if case_row else 0
+        rejected_count = int(case_row["rejected_count"] or 0) if case_row else 0
+        dispute_count = int(dispute_row["value"] or 0) if dispute_row else 0
+        payout_void_count = int(void_row["value"] or 0) if void_row else 0
+        score = _source_trust_score_from_counts(
+            case_count=case_count,
+            accepted_count=accepted_count,
+            rejected_count=rejected_count,
+            duplicate_count=duplicate_count,
+            dispute_count=dispute_count,
+            payout_void_count=payout_void_count,
+        )
+
+        existing = self._get_one(conn, "SELECT contributor_id FROM source_trust_profiles WHERE contributor_id = ?", (contributor_id,))
+        if existing:
+            self._execute(
+                conn,
+                """
+                UPDATE source_trust_profiles
+                SET score = ?, case_count = ?, accepted_count = ?, rejected_count = ?,
+                    duplicate_count = ?, dispute_count = ?, payout_void_count = ?,
+                    last_recalculated_at = ?, updated_at = ?
+                WHERE contributor_id = ?
+                """,
+                (
+                    score,
+                    case_count,
+                    accepted_count,
+                    rejected_count,
+                    duplicate_count,
+                    dispute_count,
+                    payout_void_count,
+                    now,
+                    now,
+                    contributor_id,
+                ),
+            )
+        else:
+            self._execute(
+                conn,
+                """
+                INSERT INTO source_trust_profiles
+                (contributor_id, score, case_count, accepted_count, rejected_count,
+                 duplicate_count, dispute_count, payout_void_count,
+                 last_recalculated_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    contributor_id,
+                    score,
+                    case_count,
+                    accepted_count,
+                    rejected_count,
+                    duplicate_count,
+                    dispute_count,
+                    payout_void_count,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+        self._audit(conn, actor_id, "source_trust.refreshed", "contributor", contributor_id, {"score": score})
+        return self.get_source_trust_profile(contributor_id, conn=conn)
+
+    def get_source_trust_profile(self, contributor_id: str, conn: Optional[Any] = None) -> Dict[str, Any]:
+        if conn is None:
+            with self._session() as active:
+                return self.get_source_trust_profile(contributor_id, conn=active)
+        row = self._get_one(conn, "SELECT * FROM source_trust_profiles WHERE contributor_id = ?", (contributor_id,))
+        if not row:
+            raise KeyError("source_trust_profile_not_found")
+        return row_to_dict(row)
+
+    def list_source_trust_profiles(self, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
+        limit, offset = _page_bounds(limit, offset, self.settings.max_page_limit)
+        with self._session() as conn:
+            return [
+                row_to_dict(row)
+                for row in self._execute(
+                    conn,
+                    """
+                    SELECT * FROM source_trust_profiles
+                    ORDER BY score DESC, updated_at DESC, contributor_id DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    (limit, offset),
+                )
+            ]
+
+    def create_inbox(
+        self,
+        owner_id: str,
+        allowed_uses: Optional[List[str]] = None,
+        address: str = "",
+        authorization_snapshot_id: Optional[str] = None,
+        actor_id: str = "system",
+    ) -> Dict[str, Any]:
+        inbox_id = _id("inb")
+        uses = _clean_allowed_uses(allowed_uses or ["private_library", "candidate_pool", "commercial_dataset"])
+        address_value = normalize_inbox_address(
+            address or f"{inbox_local_part(owner_id)}-{uuid.uuid4().hex[:6]}",
+            self.settings.inbound_domain,
+        )
+        now = _now()
+        with self._session() as conn:
+            authorization = self._resolve_authorization(
+                conn,
+                owner_id=owner_id,
+                allowed_uses=uses,
+                authorization_snapshot_id=authorization_snapshot_id,
+                actor_id=actor_id,
+                source="inbox",
+            )
+            self._execute(
+                conn,
+                """
+                INSERT INTO inboxes
+                (id, owner_id, address, status, allowed_uses_json, authorization_snapshot_id,
+                 created_by, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (inbox_id, owner_id, address_value, "active", dumps(authorization["allowed_uses"]), authorization["id"], actor_id, now, now),
+            )
+            self._audit(conn, actor_id, "inbox.created", "inbox", inbox_id, {"owner_id": owner_id, "address": address_value})
+            return self.get_inbox(inbox_id, conn=conn)
+
+    def get_inbox(self, inbox_id: str, conn: Optional[Any] = None) -> Dict[str, Any]:
+        if conn is None:
+            with self._session() as active:
+                return self.get_inbox(inbox_id, conn=active)
+        row = self._get_one(conn, "SELECT * FROM inboxes WHERE id = ?", (inbox_id,))
+        if not row:
+            raise KeyError("inbox_not_found")
+        return self._inbox_from_row(row)
+
+    def list_inboxes(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        owner_id: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        limit, offset = _page_bounds(limit, offset, self.settings.max_page_limit)
+        filters: List[str] = []
+        params: List[Any] = []
+        if owner_id:
+            filters.append("owner_id = ?")
+            params.append(owner_id)
+        if status:
+            filters.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        params.extend([limit, offset])
+        with self._session() as conn:
+            return [
+                self._inbox_from_row(row)
+                for row in self._execute(
+                    conn,
+                    f"""
+                    SELECT * FROM inboxes
+                    {where}
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    tuple(params),
+                )
+            ]
+
+    def receive_inbound_message(
+        self,
+        recipient: str,
+        message_id: str,
+        sender: str = "",
+        subject: str = "",
+        body_text: str = "",
+        raw_mime: Optional[bytes] = None,
+        actor_id: str = "system",
+        enqueue: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        parsed = parse_inbound_message(subject=subject, body_text=body_text, raw_mime=raw_mime)
+        case_text = inbound_case_text(parsed.subject, parsed.body_text)
+        if not case_text.strip():
+            raise ValueError("inbound_message_empty")
+        address = normalize_inbox_address(recipient, self.settings.inbound_domain)
+        external_id = (message_id or _sha256(case_text)).strip()[:240]
+        raw_payload = raw_mime.decode("utf-8", errors="replace") if raw_mime else case_text
+        raw_hash = _sha256(raw_payload)
+        sender_email = normalize_email(parseaddr(sender)[1] or sender or "unknown@unknown.local")
+        sender_domain = _email_domain(sender_email)
+        now = _now()
+        raw_ref = None
+        with self._session() as conn:
+            inbox_row = self._get_one(conn, "SELECT * FROM inboxes WHERE address = ? AND status = ?", (address, "active"))
+            if not inbox_row:
+                raise KeyError("inbox_not_found")
+            inbox = self._inbox_from_row(inbox_row)
+            existing = self._get_one(conn, "SELECT * FROM inbound_messages WHERE inbox_id = ? AND external_id = ?", (inbox["id"], external_id))
+            if existing:
+                return self._inbound_message_from_row(existing)
+            raw_ref = self.objects.put_text(f"inbound/{inbox['id']}/{_id('msg')}.eml", raw_payload)
+            message_row_id = _id("msg")
+            self._execute(
+                conn,
+                """
+                INSERT INTO inbound_messages
+                (id, inbox_id, owner_id, source_type, external_id, sender_hash, sender_domain,
+                 subject, status, raw_path, raw_hash, parsed_json, submission_id, error,
+                 received_at, processed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    message_row_id,
+                    inbox["id"],
+                    inbox["owner_id"],
+                    "email",
+                    external_id,
+                    _sha256(sender_email),
+                    sender_domain,
+                    parsed.subject[:500],
+                    "quarantined",
+                    raw_ref.uri,
+                    raw_hash,
+                    dumps({"body_chars": len(parsed.body_text), "metadata": parsed.metadata}),
+                    "",
+                    "",
+                    now,
+                    None,
+                ),
+            )
+            self._audit(conn, actor_id, "inbound_message.received", "inbound_message", message_row_id, {"inbox_id": inbox["id"]})
+
+        try:
+            submitted = self.submit_text(
+                owner_id=inbox["owner_id"],
+                text=case_text,
+                allowed_uses=inbox["allowed_uses"],
+                actor_id=actor_id,
+                enqueue=enqueue,
+                authorization_snapshot_id=inbox["authorization_snapshot_id"],
+            )
+            submission_id = submitted["submission_id"]
+            status = "queued" if "case" not in submitted else "processed"
+            error = ""
+        except Exception as exc:
+            submission_id = ""
+            status = "failed"
+            error = str(exc)[:500]
+
+        with self._session() as conn:
+            self._execute(
+                conn,
+                "UPDATE inbound_messages SET status = ?, submission_id = ?, error = ?, processed_at = ? WHERE inbox_id = ? AND external_id = ?",
+                (status, submission_id, error, _now(), inbox["id"], external_id),
+            )
+            if error:
+                self._audit(conn, actor_id, "inbound_message.failed", "inbound_message", external_id, {"error": error})
+            return self._inbound_message_from_row(
+                self._get_one(conn, "SELECT * FROM inbound_messages WHERE inbox_id = ? AND external_id = ?", (inbox["id"], external_id))
+            )
+
+    def list_inbound_messages(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        inbox_id: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        limit, offset = _page_bounds(limit, offset, self.settings.max_page_limit)
+        filters: List[str] = []
+        params: List[Any] = []
+        if inbox_id:
+            filters.append("inbox_id = ?")
+            params.append(inbox_id)
+        if status:
+            filters.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        params.extend([limit, offset])
+        with self._session() as conn:
+            return [
+                self._inbound_message_from_row(row)
+                for row in self._execute(
+                    conn,
+                    f"""
+                    SELECT * FROM inbound_messages
+                    {where}
+                    ORDER BY received_at DESC, id DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    tuple(params),
+                )
+            ]
+
+    def ingest_webhook_case(
+        self,
+        source: str,
+        external_id: str,
+        owner_id: str,
+        text: str,
+        allowed_uses: Optional[List[str]] = None,
+        actor_id: str = "system",
+        enqueue: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        clean_source = _clean_provider_name(source or "webhook")
+        clean_external_id = (external_id or _sha256(text))[:240]
+        payload_hash = _sha256(f"{clean_source}:{clean_external_id}:{text}")
+        now = _now()
+        with self._session() as conn:
+            existing = self._get_one(conn, "SELECT * FROM webhook_ingestions WHERE source = ? AND external_id = ?", (clean_source, clean_external_id))
+            if existing:
+                return self._webhook_ingestion_from_row(existing)
+            webhook_id = _id("whk")
+            self._execute(
+                conn,
+                """
+                INSERT INTO webhook_ingestions
+                (id, source, external_id, owner_id, status, payload_hash, payload_json,
+                 result_json, error, received_at, processed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    webhook_id,
+                    clean_source,
+                    clean_external_id,
+                    owner_id,
+                    "received",
+                    payload_hash,
+                    dumps({"text_chars": len(text), "allowed_uses": allowed_uses or []}),
+                    "{}",
+                    "",
+                    now,
+                    None,
+                ),
+            )
+            self._audit(conn, actor_id, "webhook_ingestion.received", "webhook_ingestion", webhook_id, {"source": clean_source})
+
+        try:
+            submitted = self.submit_text(
+                owner_id=owner_id,
+                text=text,
+                allowed_uses=allowed_uses or ["private_library", "candidate_pool"],
+                actor_id=actor_id,
+                enqueue=enqueue,
+            )
+            status = "queued" if "case" not in submitted else "processed"
+            result = submitted
+            error = ""
+        except Exception as exc:
+            status = "failed"
+            result = {}
+            error = str(exc)[:500]
+
+        with self._session() as conn:
+            self._execute(
+                conn,
+                "UPDATE webhook_ingestions SET status = ?, result_json = ?, error = ?, processed_at = ? WHERE source = ? AND external_id = ?",
+                (status, dumps(result), error, _now(), clean_source, clean_external_id),
+            )
+            return self._webhook_ingestion_from_row(
+                self._get_one(conn, "SELECT * FROM webhook_ingestions WHERE source = ? AND external_id = ?", (clean_source, clean_external_id))
+            )
+
+    def list_webhook_ingestions(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        source: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        limit, offset = _page_bounds(limit, offset, self.settings.max_page_limit)
+        filters: List[str] = []
+        params: List[Any] = []
+        if source:
+            filters.append("source = ?")
+            params.append(_clean_provider_name(source))
+        if status:
+            filters.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        params.extend([limit, offset])
+        with self._session() as conn:
+            return [
+                self._webhook_ingestion_from_row(row)
+                for row in self._execute(conn, f"SELECT * FROM webhook_ingestions {where} ORDER BY received_at DESC, id DESC LIMIT ? OFFSET ?", tuple(params))
+            ]
+
+    def run_content_safety(
+        self,
+        entity_type: str,
+        entity_id: str,
+        actor_id: str = "system",
+    ) -> Dict[str, Any]:
+        entity_type = _clean_compliance_entity_type(entity_type)
+        with self._session() as conn:
+            text = self._compliance_entity_text(conn, entity_type, entity_id)
+            return self._run_content_safety_screen(conn, entity_type, entity_id, text, actor_id=actor_id)
+
+    def list_content_safety_results(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        entity_type: Optional[str] = None,
+        entity_id: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        limit, offset = _page_bounds(limit, offset, self.settings.max_page_limit)
+        filters: List[str] = []
+        params: List[Any] = []
+        if entity_type:
+            filters.append("entity_type = ?")
+            params.append(_clean_compliance_entity_type(entity_type))
+        if entity_id:
+            filters.append("entity_id = ?")
+            params.append(entity_id)
+        if status:
+            filters.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        params.extend([limit, offset])
+        with self._session() as conn:
+            return [
+                self._content_safety_from_row(row)
+                for row in self._execute(conn, f"SELECT * FROM content_safety_results {where} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?", tuple(params))
+            ]
+
+    def create_compliance_review(
+        self,
+        entity_type: str,
+        entity_id: str,
+        review_type: str = "content_safety",
+        risk_level: str = "high",
+        reason: str = "",
+        assigned_to: str = "",
+        actor_id: str = "system",
+    ) -> Dict[str, Any]:
+        entity_type = _clean_compliance_entity_type(entity_type)
+        review_type = _clean_review_type(review_type)
+        risk_level = _clean_risk_level(risk_level)
+        review_id = _id("crev")
+        now = _now()
+        with self._session() as conn:
+            self._ensure_entity_exists(conn, entity_type, entity_id)
+            self._execute(
+                conn,
+                """
+                INSERT INTO compliance_reviews
+                (id, entity_type, entity_id, review_type, status, risk_level, reason,
+                 decision, notes, created_by, assigned_to, created_at, updated_at, completed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (review_id, entity_type, entity_id, review_type, "open", risk_level, reason[:1000], "", "", actor_id, assigned_to[:128], now, now, None),
+            )
+            self._audit(conn, actor_id, "compliance_review.created", "compliance_review", review_id, {"entity_type": entity_type, "entity_id": entity_id})
+            return self.get_compliance_review(review_id, conn=conn)
+
+    def get_compliance_review(self, review_id: str, conn: Optional[Any] = None) -> Dict[str, Any]:
+        if conn is None:
+            with self._session() as active:
+                return self.get_compliance_review(review_id, conn=active)
+        row = self._get_one(conn, "SELECT * FROM compliance_reviews WHERE id = ?", (review_id,))
+        if not row:
+            raise KeyError("compliance_review_not_found")
+        return row_to_dict(row)
+
+    def list_compliance_reviews(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        status: Optional[str] = None,
+        entity_type: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        limit, offset = _page_bounds(limit, offset, self.settings.max_page_limit)
+        filters: List[str] = []
+        params: List[Any] = []
+        if status:
+            filters.append("status = ?")
+            params.append(status)
+        if entity_type:
+            filters.append("entity_type = ?")
+            params.append(_clean_compliance_entity_type(entity_type))
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        params.extend([limit, offset])
+        with self._session() as conn:
+            return [row_to_dict(row) for row in self._execute(conn, f"SELECT * FROM compliance_reviews {where} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?", tuple(params))]
+
+    def complete_compliance_review(
+        self,
+        review_id: str,
+        decision: str,
+        notes: str = "",
+        actor_id: str = "system",
+    ) -> Dict[str, Any]:
+        decision = _clean_compliance_decision(decision)
+        now = _now()
+        with self._session() as conn:
+            review = self.get_compliance_review(review_id, conn=conn)
+            if review["status"] != "open":
+                raise ValueError("compliance_review_not_open")
+            self._execute(
+                conn,
+                """
+                UPDATE compliance_reviews
+                SET status = ?, decision = ?, notes = ?, updated_at = ?, completed_at = ?
+                WHERE id = ?
+                """,
+                ("completed", decision, notes[:2000], now, now, review_id),
+            )
+            if review["entity_type"] == "case":
+                self._apply_compliance_review_decision(conn, review["entity_id"], decision, now)
+            self._audit(conn, actor_id, "compliance_review.completed", "compliance_review", review_id, {"decision": decision})
+            return self.get_compliance_review(review_id, conn=conn)
+
+    def create_compliance_task(
+        self,
+        task_type: str,
+        title: str,
+        owner: str = "",
+        due_at: str = "",
+        evidence_ref: str = "",
+        actor_id: str = "system",
+    ) -> Dict[str, Any]:
+        task_type = _clean_compliance_task_type(task_type)
+        task_id = _id("ctsk")
+        now = _now()
+        with self._session() as conn:
+            self._execute(
+                conn,
+                """
+                INSERT INTO compliance_tasks
+                (id, task_type, title, status, owner, due_at, evidence_ref,
+                 created_by, created_at, updated_at, completed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (task_id, task_type, title[:240] or task_type, "open", owner[:128], due_at[:80], evidence_ref[:500], actor_id, now, now, None),
+            )
+            self._audit(conn, actor_id, "compliance_task.created", "compliance_task", task_id, {"task_type": task_type})
+            return self.get_compliance_task(task_id, conn=conn)
+
+    def update_compliance_task(
+        self,
+        task_id: str,
+        status: str,
+        evidence_ref: str = "",
+        actor_id: str = "system",
+    ) -> Dict[str, Any]:
+        status = _clean_compliance_task_status(status)
+        now = _now()
+        with self._session() as conn:
+            task = self.get_compliance_task(task_id, conn=conn)
+            completed_at = now if status == "completed" else task["completed_at"]
+            self._execute(
+                conn,
+                """
+                UPDATE compliance_tasks
+                SET status = ?, evidence_ref = CASE WHEN ? != '' THEN ? ELSE evidence_ref END,
+                    updated_at = ?, completed_at = ?
+                WHERE id = ?
+                """,
+                (status, evidence_ref[:500], evidence_ref[:500], now, completed_at, task_id),
+            )
+            self._audit(conn, actor_id, "compliance_task.updated", "compliance_task", task_id, {"status": status})
+            return self.get_compliance_task(task_id, conn=conn)
+
+    def get_compliance_task(self, task_id: str, conn: Optional[Any] = None) -> Dict[str, Any]:
+        if conn is None:
+            with self._session() as active:
+                return self.get_compliance_task(task_id, conn=active)
+        row = self._get_one(conn, "SELECT * FROM compliance_tasks WHERE id = ?", (task_id,))
+        if not row:
+            raise KeyError("compliance_task_not_found")
+        return row_to_dict(row)
+
+    def list_compliance_tasks(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        status: Optional[str] = None,
+        task_type: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        limit, offset = _page_bounds(limit, offset, self.settings.max_page_limit)
+        filters: List[str] = []
+        params: List[Any] = []
+        if status:
+            filters.append("status = ?")
+            params.append(_clean_compliance_task_status(status))
+        if task_type:
+            filters.append("task_type = ?")
+            params.append(_clean_compliance_task_type(task_type))
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        params.extend([limit, offset])
+        with self._session() as conn:
+            return [row_to_dict(row) for row in self._execute(conn, f"SELECT * FROM compliance_tasks {where} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?", tuple(params))]
+
+    def production_launch_readiness(self) -> Dict[str, Any]:
+        required_provider_types = {"llm", "ocr", "asr", "object_storage", "payment", "invoice"}
+        required_compliance_tasks = {"icp_filing", "mlps_leveling", "pipl_assessment", "content_safety_policy"}
+        with self._session() as conn:
+            active_provider_rows = [
+                row_to_dict(row)
+                for row in self._execute(
+                    conn,
+                    "SELECT provider_type, provider_name, region FROM provider_configs WHERE status = ?",
+                    ("active",),
+                )
+            ]
+            active_provider_types = {row["provider_type"] for row in active_provider_rows}
+            completed_task_types = {
+                row["task_type"]
+                for row in self._execute(conn, "SELECT DISTINCT task_type FROM compliance_tasks WHERE status = ?", ("completed",))
+            }
+            applied_schema_versions = {
+                row["version"]
+                for row in self._execute(conn, "SELECT version FROM schema_migrations")
+            }
+            open_reviews = _single_count_where(conn, self, "compliance_reviews", "status", "open")
+            failed_content = _single_count_where(conn, self, "content_safety_results", "status", "failed")
+            queued_jobs = _single_count_where(conn, self, "jobs", "status", "queued")
+            blockers = []
+            missing_providers = sorted(required_provider_types - active_provider_types)
+            missing_tasks = sorted(required_compliance_tasks - completed_task_types)
+            missing_schema_migrations = [version for version in EXPECTED_SCHEMA_MIGRATIONS if version not in applied_schema_versions]
+            non_local_active_providers = [
+                {
+                    "provider_type": row["provider_type"],
+                    "provider_name": row["provider_name"],
+                    "region": row["region"],
+                }
+                for row in active_provider_rows
+                if not _provider_region_allowed(self.settings.region, row["region"])
+            ]
+            if missing_schema_migrations:
+                blockers.append({"code": "schema_migrations_missing", "items": missing_schema_migrations})
+            if missing_providers:
+                blockers.append({"code": "provider_configs_missing", "items": missing_providers})
+            if non_local_active_providers:
+                blockers.append({"code": "provider_region_not_allowed", "items": non_local_active_providers})
+            if missing_tasks:
+                blockers.append({"code": "compliance_tasks_missing", "items": missing_tasks})
+            if open_reviews:
+                blockers.append({"code": "open_compliance_reviews", "count": open_reviews})
+            if failed_content:
+                blockers.append({"code": "failed_content_safety_results", "count": failed_content})
+            return {
+                "ready": not blockers,
+                "blockers": blockers,
+                "signals": {
+                    "active_provider_types": sorted(active_provider_types),
+                    "active_provider_regions": [
+                        {
+                            "provider_type": row["provider_type"],
+                            "provider_name": row["provider_name"],
+                            "region": row["region"],
+                        }
+                        for row in active_provider_rows
+                    ],
+                    "schema_migrations_ok": not missing_schema_migrations,
+                    "schema_migrations_applied": len(applied_schema_versions),
+                    "schema_migrations_expected": len(EXPECTED_SCHEMA_MIGRATIONS),
+                    "completed_compliance_tasks": sorted(completed_task_types),
+                    "open_compliance_reviews": open_reviews,
+                    "failed_content_safety_results": failed_content,
+                    "queued_jobs": queued_jobs,
+                },
+            }
+
+    def schema_migration_status(self) -> Dict[str, Any]:
+        with self._session() as conn:
+            rows = [
+                row_to_dict(row)
+                for row in self._execute(conn, "SELECT version, applied_at FROM schema_migrations ORDER BY applied_at ASC, version ASC")
+            ]
+        applied_versions = [row["version"] for row in rows]
+        applied_set = set(applied_versions)
+        missing_versions = [version for version in EXPECTED_SCHEMA_MIGRATIONS if version not in applied_set]
+        extra_versions = sorted(applied_set - set(EXPECTED_SCHEMA_MIGRATIONS))
+        return {
+            "ok": not missing_versions,
+            "latest_expected": EXPECTED_SCHEMA_MIGRATIONS[-1],
+            "latest_applied": applied_versions[-1] if applied_versions else "",
+            "expected_versions": list(EXPECTED_SCHEMA_MIGRATIONS),
+            "applied_versions": applied_versions,
+            "missing_versions": missing_versions,
+            "extra_versions": extra_versions,
+            "applied": rows,
+        }
+
+    def operational_alerts(self) -> Dict[str, Any]:
+        readiness = self.readiness_check()
+        launch = self.production_launch_readiness()
+        alerts: List[Dict[str, Any]] = []
+        with self._session() as conn:
+            now = _now()
+            failed_jobs = _count_custom(conn, self, "SELECT COUNT(*) AS value FROM jobs WHERE status = ?", ("failed",))
+            queued_jobs = _count_custom(conn, self, "SELECT COUNT(*) AS value FROM jobs WHERE status = ?", ("queued",))
+            expired_upload_sessions = _count_custom(
+                conn,
+                self,
+                "SELECT COUNT(*) AS value FROM asset_upload_sessions WHERE status = ? AND expires_at <= ?",
+                ("pending", now),
+            )
+            expired_submission_raw = _count_custom(
+                conn,
+                self,
+                """
+                SELECT COUNT(*) AS value
+                FROM submissions
+                WHERE raw_deleted_at IS NULL AND raw_expires_at IS NOT NULL AND raw_expires_at <= ?
+                """,
+                (now,),
+            )
+            expired_asset_raw = _count_custom(
+                conn,
+                self,
+                """
+                SELECT COUNT(*) AS value
+                FROM assets
+                WHERE raw_deleted_at IS NULL AND raw_expires_at IS NOT NULL AND raw_expires_at <= ?
+                """,
+                (now,),
+            )
+            failed_provider_events = _count_custom(conn, self, "SELECT COUNT(*) AS value FROM provider_events WHERE status = ?", ("failed",))
+            failed_payout_transfers = _count_custom(conn, self, "SELECT COUNT(*) AS value FROM payout_transfers WHERE status = ?", ("failed",))
+            open_compliance_reviews = _single_count_where(conn, self, "compliance_reviews", "status", "open")
+            failed_content_safety = _single_count_where(conn, self, "content_safety_results", "status", "failed")
+            pending_approvals = _single_count_where(conn, self, "approval_requests", "status", "pending")
+            pending_dsr = _single_count_where(conn, self, "dsr_requests", "status", "pending")
+
+        if not readiness["ok"]:
+            alerts.append(_operational_alert("readiness_failed", "critical", "service readiness check is failing", readiness=readiness))
+        if not launch["ready"]:
+            alerts.append(_operational_alert("launch_readiness_blocked", "critical", "production launch readiness has blockers", blockers=launch["blockers"]))
+        if failed_jobs:
+            alerts.append(_operational_alert("failed_jobs", "critical", "background jobs exhausted retries", count=failed_jobs))
+        if failed_content_safety:
+            alerts.append(_operational_alert("failed_content_safety_results", "critical", "content safety produced blocking results", count=failed_content_safety))
+        if failed_provider_events:
+            alerts.append(_operational_alert("failed_provider_events", "warning", "provider health or processing events failed", count=failed_provider_events))
+        if failed_payout_transfers:
+            alerts.append(_operational_alert("failed_payout_transfers", "critical", "payout transfer receipts reported failures", count=failed_payout_transfers))
+        if open_compliance_reviews:
+            alerts.append(_operational_alert("open_compliance_reviews", "warning", "compliance reviews are waiting for decision", count=open_compliance_reviews))
+        if pending_approvals:
+            alerts.append(_operational_alert("pending_approvals", "warning", "high risk operations are waiting for approval", count=pending_approvals))
+        if pending_dsr:
+            alerts.append(_operational_alert("pending_dsr_requests", "warning", "data subject rights requests are pending", count=pending_dsr))
+        if queued_jobs:
+            alerts.append(_operational_alert("queued_jobs", "info", "background queue has pending jobs", count=queued_jobs))
+        expired_raw_count = expired_submission_raw + expired_asset_raw
+        if expired_raw_count:
+            alerts.append(
+                _operational_alert(
+                    "expired_raw_objects",
+                    "warning",
+                    "raw quarantine objects are past retention TTL",
+                    count=expired_raw_count,
+                    submissions=expired_submission_raw,
+                    assets=expired_asset_raw,
+                )
+            )
+        if expired_upload_sessions:
+            alerts.append(_operational_alert("expired_upload_sessions", "warning", "direct upload sessions should be expired", count=expired_upload_sessions))
+
+        critical_count = sum(1 for alert in alerts if alert["severity"] == "critical")
+        return {
+            "ok": critical_count == 0,
+            "alert_count": len(alerts),
+            "critical_count": critical_count,
+            "generated_at": _now(),
+            "alerts": alerts,
+        }
+
+    def expire_upload_sessions(self, limit: int = 100, actor_id: str = "system") -> Dict[str, Any]:
+        limit = _bounded_limit(limit, self.settings.max_page_limit)
+        expired: List[str] = []
+        now = _now()
+        with self._session() as conn:
+            rows = self._execute(
+                conn,
+                """
+                SELECT id
+                FROM asset_upload_sessions
+                WHERE status = ? AND expires_at <= ?
+                ORDER BY expires_at ASC
+                LIMIT ?
+                """,
+                ("pending", now, limit),
+            )
+            for row in rows:
+                self._execute(conn, "UPDATE asset_upload_sessions SET status = ? WHERE id = ? AND status = ?", ("expired", row["id"], "pending"))
+                self._audit(conn, actor_id, "asset_upload_session.expired", "asset_upload_session", row["id"], {})
+                expired.append(row["id"])
+        return {"expired_count": len(expired), "session_ids": expired}
+
+    def run_maintenance(self, limit: int = 100, actor_id: str = "system") -> Dict[str, Any]:
+        limit = _bounded_limit(limit, self.settings.max_page_limit)
+        raw = self.purge_expired_raw_objects(limit=limit, actor_id=actor_id)
+        remaining = max(1, limit - int(raw["purged_count"]))
+        uploads = self.expire_upload_sessions(limit=remaining, actor_id=actor_id)
+        alerts = self.operational_alerts()
+        result = {
+            "status": "completed",
+            "raw": raw,
+            "upload_sessions": uploads,
+            "remaining_alert_count": alerts["alert_count"],
+            "remaining_critical_count": alerts["critical_count"],
+            "completed_at": _now(),
+        }
+        with self._session() as conn:
+            self._audit(conn, actor_id, "maintenance.completed", "maintenance", "run", result)
+        return result
 
     def get_case(self, case_id: str, conn: Optional[Any] = None) -> Dict[str, Any]:
         if conn is None:
@@ -1126,6 +2010,8 @@ class LodiaStore:
                 raise ValueError("case_withdrawn")
             if case["status"] == "rejected":
                 raise ValueError("case_rejected")
+            if case["status"] == "compliance_review":
+                raise ValueError("compliance_review_required")
             _assert_review_claim(case, reviewer_id)
             if not self._case_authorization_active(conn, case):
                 raise ValueError("authorization_not_active")
@@ -1174,6 +2060,8 @@ class LodiaStore:
                 raise ValueError("case_withdrawn")
             if case["status"] == "rejected":
                 raise ValueError("case_rejected")
+            if case["status"] == "compliance_review":
+                raise ValueError("compliance_review_required")
             _assert_review_claim(case, reviewer_id)
             if not self._case_authorization_active(conn, case):
                 raise ValueError("authorization_not_active")
@@ -1221,6 +2109,8 @@ class LodiaStore:
                 raise ValueError("case_withdrawn")
             if case["status"] == "rejected":
                 raise ValueError("case_rejected")
+            if case["status"] == "compliance_review":
+                raise ValueError("compliance_review_required")
             _assert_review_claim(case, reviewer_id)
             if not self._case_authorization_active(conn, case):
                 raise ValueError("authorization_not_active")
@@ -1450,6 +2340,203 @@ class LodiaStore:
             self._audit(conn, reviewer_id, "review.released", "case", case_id, {"force": force})
             return self.get_case(case_id, conn=conn)
 
+    def create_review_sample(
+        self,
+        case_id: str,
+        sample_type: str = "random_audit",
+        assigned_to: str = "",
+        blind: bool = True,
+        reason: str = "",
+        actor_id: str = "system",
+        conn: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        if conn is None:
+            with self._session() as active:
+                return self.create_review_sample(case_id, sample_type, assigned_to, blind, reason, actor_id, conn=active)
+        sample_id = _id("rsmp")
+        sample_type = _clean_sample_type(sample_type)
+        now = _now()
+        self.get_case(case_id, conn=conn)
+        existing = self._get_one(
+            conn,
+            "SELECT id FROM review_samples WHERE case_id = ? AND status = ?",
+            (case_id, "open"),
+        )
+        if existing:
+            raise ValueError("review_sample_already_open")
+        self._execute(
+            conn,
+            """
+            INSERT INTO review_samples
+            (id, case_id, sample_type, status, assigned_to, blind, reason,
+             created_by, created_at, updated_at, completed_at, reviewer_id,
+             decision, score, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                sample_id,
+                case_id,
+                sample_type,
+                "open",
+                assigned_to[:128],
+                1 if blind else 0,
+                reason[:1000],
+                actor_id,
+                now,
+                now,
+                None,
+                "",
+                "",
+                0.0,
+                "",
+            ),
+        )
+        self._audit(conn, actor_id, "review_sample.created", "review_sample", sample_id, {"case_id": case_id, "sample_type": sample_type})
+        return self.get_review_sample(sample_id, conn=conn)
+
+    def schedule_review_samples(
+        self,
+        sample_type: str = "random_audit",
+        limit: int = 20,
+        min_drl: str = "DRL3",
+        reason: str = "",
+        actor_id: str = "system",
+    ) -> Dict[str, Any]:
+        if min_drl not in DRL_ORDER:
+            raise ValueError("invalid_min_drl")
+        limit = _bounded_limit(limit, min(self.settings.max_page_limit, 500))
+        created: List[Dict[str, Any]] = []
+        with self._session() as conn:
+            candidates = [
+                self._case_from_row(row)
+                for row in self._execute(
+                    conn,
+                    """
+                    SELECT * FROM cases
+                    WHERE status = ?
+                    ORDER BY quality_score DESC, created_at ASC, id ASC
+                    LIMIT ?
+                    """,
+                    ("commercial_ready", max(limit * 5, limit)),
+                )
+            ]
+            for case in candidates:
+                if len(created) >= limit:
+                    break
+                if DRL_ORDER.get(case["quality_gate"]["drl"], 0) < DRL_ORDER[min_drl]:
+                    continue
+                existing = self._get_one(
+                    conn,
+                    "SELECT id FROM review_samples WHERE case_id = ? AND status = ?",
+                    (case["case_id"], "open"),
+                )
+                if existing:
+                    continue
+                created.append(
+                    self.create_review_sample(
+                        case_id=case["case_id"],
+                        sample_type=sample_type,
+                        reason=reason or "scheduled quality audit",
+                        actor_id=actor_id,
+                        conn=conn,
+                    )
+                )
+            self._audit(conn, actor_id, "review_sample.scheduled", "review_sample", "batch", {"count": len(created), "min_drl": min_drl})
+        return {"created_count": len(created), "items": created}
+
+    def get_review_sample(self, sample_id: str, conn: Optional[Any] = None) -> Dict[str, Any]:
+        if conn is None:
+            with self._session() as active:
+                return self.get_review_sample(sample_id, conn=active)
+        row = self._get_one(conn, "SELECT * FROM review_samples WHERE id = ?", (sample_id,))
+        if not row:
+            raise KeyError("review_sample_not_found")
+        return self._review_sample_from_row(row, conn=conn)
+
+    def list_review_samples(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        status: Optional[str] = None,
+        sample_type: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        limit, offset = _page_bounds(limit, offset, self.settings.max_page_limit)
+        filters: List[str] = []
+        params: List[Any] = []
+        if status:
+            filters.append("status = ?")
+            params.append(status)
+        if sample_type:
+            filters.append("sample_type = ?")
+            params.append(_clean_sample_type(sample_type))
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        params.extend([limit, offset])
+        with self._session() as conn:
+            return [
+                self._review_sample_from_row(row, conn=conn)
+                for row in self._execute(
+                    conn,
+                    f"""
+                    SELECT * FROM review_samples
+                    {where}
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    tuple(params),
+                )
+            ]
+
+    def complete_review_sample(
+        self,
+        sample_id: str,
+        reviewer_id: str,
+        decision: str,
+        notes: str = "",
+        score: float = 1.0,
+    ) -> Dict[str, Any]:
+        clean_decision = _clean_sample_decision(decision)
+        now = _now()
+        with self._session() as conn:
+            sample = self.get_review_sample(sample_id, conn=conn)
+            if sample["status"] != "open":
+                raise ValueError("review_sample_not_open")
+            if sample.get("assigned_to") and sample["assigned_to"] != reviewer_id:
+                raise ValueError("review_sample_assigned_to_other")
+            self._execute(
+                conn,
+                """
+                UPDATE review_samples
+                SET status = ?, reviewer_id = ?, decision = ?, score = ?, notes = ?,
+                    completed_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    "completed",
+                    reviewer_id,
+                    clean_decision,
+                    _bounded_score(score),
+                    notes[:2000],
+                    now,
+                    now,
+                    sample_id,
+                ),
+            )
+            self._audit(conn, reviewer_id, "review_sample.completed", "review_sample", sample_id, {"decision": clean_decision})
+            return self.get_review_sample(sample_id, conn=conn)
+
+    def reviewer_performance(self, reviewer_id: str) -> Dict[str, Any]:
+        with self._session() as conn:
+            reviews = _reviewer_review_counts(conn, self, reviewer_id)
+            samples = _reviewer_sample_counts(conn, self, reviewer_id)
+            return {
+                "reviewer_id": reviewer_id,
+                "reviews": reviews,
+                "samples": samples,
+                "quality_flags": {
+                    "sample_failure_rate": _ratio(samples.get("failed", 0), max(samples.get("completed", 0), 1)),
+                },
+            }
+
     def create_dataset(
         self,
         name: str,
@@ -1594,7 +2681,7 @@ class LodiaStore:
                     gross_revenue_cents=gross_revenue_cents,
                     direct_cost_cents=direct_cost_cents,
                 ),
-                [_contribution_from_case(case) for case in eligible],
+                [_contribution_from_case(case, self._source_trust_score(conn, case["owner_id"])) for case in eligible],
             )
             for allocation in payout.allocations:
                 self._execute(
@@ -1677,6 +2764,8 @@ class LodiaStore:
     def read_dataset_artifact(self, dataset_id: str, artifact: str, actor_id: str = "system") -> Dict[str, Any]:
         column_name, media_type, filename = _dataset_artifact_descriptor(artifact)
         dataset = self.get_dataset(dataset_id)
+        if dataset["status"] != "ready":
+            raise ValueError("dataset_not_ready")
         uri = dataset.get(column_name)
         if not uri:
             raise ValueError("dataset_artifact_missing")
@@ -1995,7 +3084,7 @@ class LodiaStore:
                     gross_revenue_cents=order["gross_revenue_cents"],
                     direct_cost_cents=order["direct_cost_cents"],
                 ),
-                [_contribution_from_case(case) for case in cases],
+                [_contribution_from_case(case, self._source_trust_score(conn, case["owner_id"])) for case in cases],
             )
             for allocation in payout.allocations:
                 self._execute(
@@ -2200,6 +3289,75 @@ class LodiaStore:
             self._audit(conn, f"customer:{grant['customer_id']}", "delivery_grant.artifact_read", "delivery_grant", grant_id, {"artifact": artifact})
         return self.read_dataset_artifact(grant["dataset_id"], artifact, actor_id=f"customer:{grant['customer_id']}")
 
+    def record_buyer_usage_report(
+        self,
+        grant_id: str,
+        external_event_id: str,
+        reported_case_count: int,
+        purpose: str = "buyer_usage_report",
+        payload: Optional[Dict[str, Any]] = None,
+        actor_id: str = "system",
+    ) -> Dict[str, Any]:
+        report_id = _id("bur")
+        external_event_id = (external_event_id or _id("buyer_evt"))[:240]
+        now = _now()
+        with self._session() as conn:
+            grant = self.get_dataset_delivery_grant(grant_id, conn=conn)
+            existing = self._get_one(conn, "SELECT * FROM buyer_usage_reports WHERE grant_id = ? AND external_event_id = ?", (grant_id, external_event_id))
+            if existing:
+                return self._buyer_usage_report_from_row(existing)
+            if grant["status"] != "active":
+                raise ValueError("delivery_grant_not_active")
+            order_id = grant.get("order_id") or ""
+            self._execute(
+                conn,
+                """
+                INSERT INTO buyer_usage_reports
+                (id, grant_id, order_id, customer_id, dataset_id, external_event_id,
+                 reported_case_count, purpose, status, payload_json, created_by, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    report_id,
+                    grant_id,
+                    order_id,
+                    grant["customer_id"],
+                    grant["dataset_id"],
+                    external_event_id,
+                    max(0, int(reported_case_count)),
+                    purpose[:120],
+                    "recorded",
+                    dumps(payload or {}),
+                    actor_id,
+                    now,
+                ),
+            )
+            if order_id:
+                self._execute(conn, "UPDATE enterprise_orders SET last_delivery_at = ?, updated_at = ? WHERE id = ?", (now, now, order_id))
+            self._audit(conn, actor_id, "buyer_usage_report.recorded", "delivery_grant", grant_id, {"external_event_id": external_event_id})
+            return self._buyer_usage_report_from_row(self._get_one(conn, "SELECT * FROM buyer_usage_reports WHERE id = ?", (report_id,)))
+
+    def list_buyer_usage_reports(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        grant_id: Optional[str] = None,
+        dataset_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        limit, offset = _page_bounds(limit, offset, self.settings.max_page_limit)
+        filters: List[str] = []
+        params: List[Any] = []
+        if grant_id:
+            filters.append("grant_id = ?")
+            params.append(grant_id)
+        if dataset_id:
+            filters.append("dataset_id = ?")
+            params.append(dataset_id)
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        params.extend([limit, offset])
+        with self._session() as conn:
+            return [self._buyer_usage_report_from_row(row) for row in self._execute(conn, f"SELECT * FROM buyer_usage_reports {where} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?", tuple(params))]
+
     def upsert_tenant_quota(
         self,
         tenant_id: str,
@@ -2386,6 +3544,788 @@ class LodiaStore:
             )
             self._audit(conn, actor_id, f"dispute.resolved_{decision}", "dispute", dispute_id, {"payout_count": released_count})
             return self.get_dispute(dispute_id, conn=conn)
+
+    def register_holdout_case(
+        self,
+        case_id: str,
+        purpose: str = "gold_eval",
+        reason: str = "",
+        actor_id: str = "system",
+    ) -> Dict[str, Any]:
+        purpose = _clean_holdout_purpose(purpose)
+        now = _now()
+        holdout_id = _id("hold")
+        with self._session() as conn:
+            self.get_case(case_id, conn=conn)
+            existing = self._get_one(conn, "SELECT * FROM holdout_items WHERE case_id = ? AND purpose = ?", (case_id, purpose))
+            if existing:
+                return self._holdout_from_row(existing)
+            self._execute(
+                conn,
+                """
+                INSERT INTO holdout_items
+                (id, case_id, purpose, reason, created_by, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (holdout_id, case_id, purpose, reason[:1000], actor_id, now),
+            )
+            self._audit(conn, actor_id, "holdout.registered", "holdout", holdout_id, {"case_id": case_id, "purpose": purpose})
+            return self._holdout_from_row(self._get_one(conn, "SELECT * FROM holdout_items WHERE id = ?", (holdout_id,)))
+
+    def list_holdout_items(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        purpose: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        limit, offset = _page_bounds(limit, offset, self.settings.max_page_limit)
+        filters: List[str] = []
+        params: List[Any] = []
+        if purpose:
+            filters.append("purpose = ?")
+            params.append(_clean_holdout_purpose(purpose))
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        params.extend([limit, offset])
+        with self._session() as conn:
+            return [
+                self._holdout_from_row(row)
+                for row in self._execute(
+                    conn,
+                    f"""
+                    SELECT * FROM holdout_items
+                    {where}
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    tuple(params),
+                )
+            ]
+
+    def run_dataset_evaluation(
+        self,
+        dataset_id: str,
+        eval_type: str = "quality_regression",
+        actor_id: str = "system",
+    ) -> Dict[str, Any]:
+        eval_type = _clean_eval_type(eval_type)
+        eval_id = _id("eval")
+        now = _now()
+        with self._session() as conn:
+            dataset = self.get_dataset(dataset_id, conn=conn)
+            cases = [self.get_case(case_id, conn=conn) for case_id in dataset["case_ids"]]
+            contract = self.get_data_contract(dataset_id, conn=conn)
+            violations = _data_contract_violations(contract["contract"], cases)
+            holdout_case_ids = {
+                row["case_id"]
+                for row in self._execute(conn, "SELECT case_id FROM holdout_items")
+            }
+            overlap = sorted(set(dataset["case_ids"]).intersection(holdout_case_ids))
+            duplicate_count = sum(1 for case in cases if case["dedup"]["duplicate_status"] != "unique")
+            residual_privacy_count = sum(1 for case in cases if not case["redaction"]["passed"])
+            metrics = {
+                "case_count": len(cases),
+                "average_quality_score": round(sum(case["annotation"]["quality_score"] for case in cases) / max(len(cases), 1), 4),
+                "duplicate_count": duplicate_count,
+                "holdout_overlap_count": len(overlap),
+                "residual_privacy_count": residual_privacy_count,
+                "drl_distribution": _case_drl_distribution(cases),
+            }
+            findings: List[Dict[str, Any]] = []
+            for violation in violations:
+                findings.append({"severity": "blocker", "code": violation})
+            if overlap and dataset["purpose"] in {"training", "commercial_dataset"}:
+                findings.append({"severity": "blocker", "code": "holdout_overlap", "case_ids": overlap})
+            if duplicate_count:
+                findings.append({"severity": "warning", "code": "duplicates_present", "count": duplicate_count})
+            if residual_privacy_count:
+                findings.append({"severity": "blocker", "code": "privacy_residuals_present", "count": residual_privacy_count})
+            status = "passed" if not any(item["severity"] == "blocker" for item in findings) else "failed"
+            self._execute(
+                conn,
+                """
+                INSERT INTO eval_runs
+                (id, dataset_id, eval_type, status, metrics_json, findings_json,
+                 created_by, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (eval_id, dataset_id, eval_type, status, dumps(metrics), dumps(findings), actor_id, now),
+            )
+            self._audit(conn, actor_id, "dataset_evaluation.run", "dataset", dataset_id, {"status": status, "eval_id": eval_id})
+            return self.get_eval_run(eval_id, conn=conn)
+
+    def get_eval_run(self, eval_id: str, conn: Optional[Any] = None) -> Dict[str, Any]:
+        if conn is None:
+            with self._session() as active:
+                return self.get_eval_run(eval_id, conn=active)
+        row = self._get_one(conn, "SELECT * FROM eval_runs WHERE id = ?", (eval_id,))
+        if not row:
+            raise KeyError("eval_run_not_found")
+        return self._eval_run_from_row(row)
+
+    def list_eval_runs(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        dataset_id: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        limit, offset = _page_bounds(limit, offset, self.settings.max_page_limit)
+        filters: List[str] = []
+        params: List[Any] = []
+        if dataset_id:
+            filters.append("dataset_id = ?")
+            params.append(dataset_id)
+        if status:
+            filters.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        params.extend([limit, offset])
+        with self._session() as conn:
+            return [
+                self._eval_run_from_row(row)
+                for row in self._execute(
+                    conn,
+                    f"""
+                    SELECT * FROM eval_runs
+                    {where}
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    tuple(params),
+                )
+            ]
+
+    def run_reconciliation(
+        self,
+        scope_type: str = "all",
+        scope_id: str = "",
+        actor_id: str = "system",
+    ) -> Dict[str, Any]:
+        scope_type = _clean_reconciliation_scope(scope_type)
+        report_id = _id("rec")
+        now = _now()
+        with self._session() as conn:
+            anomalies = self._reconciliation_anomalies(conn, scope_type, scope_id)
+            summary = {
+                "scope_type": scope_type,
+                "scope_id": scope_id,
+                "anomaly_count": len(anomalies),
+                "orders": _single_count(conn, self, "enterprise_orders"),
+                "usage_events": _single_count(conn, self, "usage_events"),
+                "payout_events": _single_count(conn, self, "payout_events"),
+                "delivery_grants": _single_count(conn, self, "dataset_delivery_grants"),
+            }
+            status = "passed" if not anomalies else "failed"
+            self._execute(
+                conn,
+                """
+                INSERT INTO reconciliation_reports
+                (id, scope_type, scope_id, status, summary_json, anomalies_json,
+                 created_by, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (report_id, scope_type, scope_id, status, dumps(summary), dumps(anomalies), actor_id, now),
+            )
+            self._audit(conn, actor_id, "reconciliation.run", "reconciliation_report", report_id, {"status": status, "anomaly_count": len(anomalies)})
+            return self.get_reconciliation_report(report_id, conn=conn)
+
+    def get_reconciliation_report(self, report_id: str, conn: Optional[Any] = None) -> Dict[str, Any]:
+        if conn is None:
+            with self._session() as active:
+                return self.get_reconciliation_report(report_id, conn=active)
+        row = self._get_one(conn, "SELECT * FROM reconciliation_reports WHERE id = ?", (report_id,))
+        if not row:
+            raise KeyError("reconciliation_report_not_found")
+        return self._reconciliation_report_from_row(row)
+
+    def list_reconciliation_reports(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        status: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        limit, offset = _page_bounds(limit, offset, self.settings.max_page_limit)
+        filters: List[str] = []
+        params: List[Any] = []
+        if status:
+            filters.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        params.extend([limit, offset])
+        with self._session() as conn:
+            return [
+                self._reconciliation_report_from_row(row)
+                for row in self._execute(
+                    conn,
+                    f"""
+                    SELECT * FROM reconciliation_reports
+                    {where}
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    tuple(params),
+                )
+            ]
+
+    def create_dsr_request(
+        self,
+        owner_id: str,
+        request_type: str = "delete",
+        reason: str = "",
+        actor_id: str = "system",
+    ) -> Dict[str, Any]:
+        request_type = _clean_dsr_request_type(request_type)
+        request_id = _id("dsr")
+        now = _now()
+        with self._session() as conn:
+            self._execute(
+                conn,
+                """
+                INSERT INTO dsr_requests
+                (id, owner_id, request_type, status, reason, deleted_cases,
+                 deleted_assets, proof_path, created_by, created_at, completed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (request_id, owner_id, request_type, "open", reason[:1000], 0, 0, "", actor_id, now, None),
+            )
+            self._audit(conn, actor_id, "dsr.opened", "dsr_request", request_id, {"owner_id": owner_id, "request_type": request_type})
+            return self.get_dsr_request(request_id, conn=conn)
+
+    def fulfill_dsr_request(self, request_id: str, actor_id: str = "system") -> Dict[str, Any]:
+        now = _now()
+        with self._session() as conn:
+            request = self.get_dsr_request(request_id, conn=conn)
+            if request["status"] != "open":
+                raise ValueError("dsr_request_not_open")
+            owner_id = request["owner_id"]
+            proof: Dict[str, Any] = {
+                "request_id": request_id,
+                "owner_ref": _sha256(owner_id)[:16],
+                "request_type": request["request_type"],
+                "completed_at": now,
+                "deleted_objects": [],
+                "mutations": [],
+            }
+            deleted_cases = 0
+            deleted_assets = 0
+            recalled_datasets = 0
+            revoked_delivery_grants = 0
+            if request["request_type"] == "export":
+                proof["export"] = self._dsr_export_snapshot(conn, owner_id)
+            if request["request_type"] in {"delete", "restrict"}:
+                recall = self._recall_datasets_for_owner(conn, owner_id, now, proof, actor_id=actor_id)
+                recalled_datasets = recall["datasets"]
+                revoked_delivery_grants = recall["delivery_grants"]
+                authorization_rows = self._execute(
+                    conn,
+                    "SELECT id FROM authorization_snapshots WHERE owner_id = ? AND status = ?",
+                    (owner_id, "active"),
+                )
+                for row in authorization_rows:
+                    self._execute(
+                        conn,
+                        "UPDATE authorization_snapshots SET status = ?, withdrawn_at = ?, withdrawal_reason = ? WHERE id = ?",
+                        ("withdrawn", now, "dsr_request", row["id"]),
+                    )
+                submission_rows = self._execute(
+                    conn,
+                    "SELECT id, raw_path FROM submissions WHERE owner_id = ? AND raw_deleted_at IS NULL",
+                    (owner_id,),
+                )
+                for row in submission_rows:
+                    self._delete_object_with_proof(row["raw_path"], proof)
+                    self._execute(conn, "UPDATE submissions SET raw_deleted_at = ?, status = ? WHERE id = ?", (now, "dsr_restricted", row["id"]))
+                case_cursor = self._execute(
+                    conn,
+                    """
+                    UPDATE cases
+                    SET status = ?, redacted_text = ?, updated_at = ?
+                    WHERE owner_id = ? AND status != ?
+                    """,
+                    ("withdrawn", "[DSR_DELETED]", now, owner_id, "withdrawn"),
+                )
+                deleted_cases = int(case_cursor.rowcount or 0)
+                asset_rows = self._execute(
+                    conn,
+                    "SELECT id, raw_path, extracted_text_path FROM assets WHERE owner_id = ? AND raw_deleted_at IS NULL",
+                    (owner_id,),
+                )
+                for row in asset_rows:
+                    self._delete_object_with_proof(row["raw_path"], proof)
+                    if row["extracted_text_path"]:
+                        self._delete_object_with_proof(row["extracted_text_path"], proof)
+                    self._execute(conn, "UPDATE assets SET status = ?, raw_deleted_at = ?, updated_at = ? WHERE id = ?", ("withdrawn", now, now, row["id"]))
+                    deleted_assets += 1
+            proof["mutations"] = [
+                {"table": "cases", "count": deleted_cases},
+                {"table": "assets", "count": deleted_assets},
+                {"table": "datasets", "count": recalled_datasets},
+                {"table": "dataset_delivery_grants", "count": revoked_delivery_grants},
+            ]
+            proof_ref = self.objects.put_text(
+                f"dsr/{request_id}/response_proof.json",
+                json.dumps(proof, ensure_ascii=False, indent=2),
+            )
+            self._execute(
+                conn,
+                """
+                UPDATE dsr_requests
+                SET status = ?, deleted_cases = ?, deleted_assets = ?,
+                    proof_path = ?, completed_at = ?
+                WHERE id = ?
+                """,
+                ("completed", deleted_cases, deleted_assets, proof_ref.uri, now, request_id),
+            )
+            self._audit(conn, actor_id, "dsr.completed", "dsr_request", request_id, {"deleted_cases": deleted_cases, "deleted_assets": deleted_assets})
+            return self.get_dsr_request(request_id, conn=conn)
+
+    def get_dsr_request(self, request_id: str, conn: Optional[Any] = None) -> Dict[str, Any]:
+        if conn is None:
+            with self._session() as active:
+                return self.get_dsr_request(request_id, conn=active)
+        row = self._get_one(conn, "SELECT * FROM dsr_requests WHERE id = ?", (request_id,))
+        if not row:
+            raise KeyError("dsr_request_not_found")
+        return row_to_dict(row)
+
+    def list_dsr_requests(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        status: Optional[str] = None,
+        owner_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        limit, offset = _page_bounds(limit, offset, self.settings.max_page_limit)
+        filters: List[str] = []
+        params: List[Any] = []
+        if status:
+            filters.append("status = ?")
+            params.append(status)
+        if owner_id:
+            filters.append("owner_id = ?")
+            params.append(owner_id)
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        params.extend([limit, offset])
+        with self._session() as conn:
+            return [row_to_dict(row) for row in self._execute(conn, f"SELECT * FROM dsr_requests {where} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?", tuple(params))]
+
+    def read_dsr_proof(self, request_id: str, actor_id: str = "system") -> Dict[str, Any]:
+        request = self.get_dsr_request(request_id)
+        if not request["proof_path"]:
+            raise ValueError("dsr_proof_missing")
+        content = self.objects.read_text(request["proof_path"])
+        with self._session() as conn:
+            self._audit(conn, actor_id, "dsr.proof_read", "dsr_request", request_id, {})
+        return {"request_id": request_id, "content": content}
+
+    def create_invoice(
+        self,
+        order_id: str,
+        invoice_no: str,
+        amount_cents: int,
+        tax_cents: int = 0,
+        currency: str = "CNY",
+        actor_id: str = "system",
+    ) -> Dict[str, Any]:
+        invoice_id = _id("inv")
+        now = _now()
+        with self._session() as conn:
+            order = self.get_enterprise_order(order_id, conn=conn)
+            amount_cents = max(0, int(amount_cents))
+            tax_cents = max(0, int(tax_cents))
+            if amount_cents + tax_cents > int(order["gross_revenue_cents"]) * 2:
+                raise ValueError("invoice_amount_unusual")
+            self._execute(
+                conn,
+                """
+                INSERT INTO invoices
+                (id, order_id, invoice_no_hash, invoice_no_suffix, status,
+                 amount_cents, tax_cents, currency, issued_at, paid_at,
+                 created_by, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    invoice_id,
+                    order_id,
+                    _sha256(invoice_no),
+                    _suffix(invoice_no),
+                    "issued",
+                    amount_cents,
+                    tax_cents,
+                    currency[:12].upper() or "CNY",
+                    now,
+                    None,
+                    actor_id,
+                    now,
+                    now,
+                ),
+            )
+            self._audit(conn, actor_id, "invoice.issued", "invoice", invoice_id, {"order_id": order_id})
+            return self.get_invoice(invoice_id, conn=conn)
+
+    def mark_invoice_paid(self, invoice_id: str, actor_id: str = "system") -> Dict[str, Any]:
+        now = _now()
+        with self._session() as conn:
+            invoice = self.get_invoice(invoice_id, conn=conn)
+            if invoice["status"] == "paid":
+                return invoice
+            self._execute(
+                conn,
+                "UPDATE invoices SET status = ?, paid_at = ?, updated_at = ? WHERE id = ?",
+                ("paid", now, now, invoice_id),
+            )
+            self._audit(conn, actor_id, "invoice.paid", "invoice", invoice_id, {"order_id": invoice["order_id"]})
+            return self.get_invoice(invoice_id, conn=conn)
+
+    def get_invoice(self, invoice_id: str, conn: Optional[Any] = None) -> Dict[str, Any]:
+        if conn is None:
+            with self._session() as active:
+                return self.get_invoice(invoice_id, conn=active)
+        row = self._get_one(conn, "SELECT * FROM invoices WHERE id = ?", (invoice_id,))
+        if not row:
+            raise KeyError("invoice_not_found")
+        return self._invoice_from_row(row)
+
+    def list_invoices(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        order_id: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        limit, offset = _page_bounds(limit, offset, self.settings.max_page_limit)
+        filters: List[str] = []
+        params: List[Any] = []
+        if order_id:
+            filters.append("order_id = ?")
+            params.append(order_id)
+        if status:
+            filters.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        params.extend([limit, offset])
+        with self._session() as conn:
+            return [self._invoice_from_row(row) for row in self._execute(conn, f"SELECT * FROM invoices {where} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?", tuple(params))]
+
+    def upsert_sso_provider_config(
+        self,
+        tenant_id: str,
+        provider_type: str,
+        issuer: str,
+        domain: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        status: str = "active",
+        actor_id: str = "system",
+    ) -> Dict[str, Any]:
+        clean_tenant_id = _clean_tenant_id(tenant_id)
+        provider_type = _clean_sso_provider_type(provider_type)
+        status = _clean_sso_status(status)
+        clean_domain = _clean_domain(domain)
+        now = _now()
+        with self._session() as conn:
+            self._ensure_tenant(conn, clean_tenant_id, clean_tenant_id, actor_id=actor_id)
+            existing = self._get_one(conn, "SELECT id FROM sso_provider_configs WHERE tenant_id = ? AND provider_type = ?", (clean_tenant_id, provider_type))
+            if existing:
+                config_id = existing["id"]
+                self._execute(
+                    conn,
+                    """
+                    UPDATE sso_provider_configs
+                    SET status = ?, issuer = ?, domain = ?, metadata_json = ?,
+                        updated_by = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (status, issuer[:255], clean_domain, dumps(metadata or {}), actor_id, now, config_id),
+                )
+                event_type = "sso_provider.updated"
+            else:
+                config_id = _id("sso")
+                self._execute(
+                    conn,
+                    """
+                    INSERT INTO sso_provider_configs
+                    (id, tenant_id, provider_type, status, issuer, domain,
+                     metadata_json, created_by, updated_by, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (config_id, clean_tenant_id, provider_type, status, issuer[:255], clean_domain, dumps(metadata or {}), actor_id, actor_id, now, now),
+                )
+                event_type = "sso_provider.created"
+            self._audit(conn, actor_id, event_type, "sso_provider", config_id, {"tenant_id": clean_tenant_id, "provider_type": provider_type})
+            return self.get_sso_provider_config(config_id, conn=conn)
+
+    def get_sso_provider_config(self, config_id: str, conn: Optional[Any] = None) -> Dict[str, Any]:
+        if conn is None:
+            with self._session() as active:
+                return self.get_sso_provider_config(config_id, conn=active)
+        row = self._get_one(conn, "SELECT * FROM sso_provider_configs WHERE id = ?", (config_id,))
+        if not row:
+            raise KeyError("sso_provider_not_found")
+        return self._sso_provider_from_row(row)
+
+    def list_sso_provider_configs(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        tenant_id: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        limit, offset = _page_bounds(limit, offset, self.settings.max_page_limit)
+        filters: List[str] = []
+        params: List[Any] = []
+        if tenant_id:
+            filters.append("tenant_id = ?")
+            params.append(_clean_tenant_id(tenant_id))
+        if status:
+            filters.append("status = ?")
+            params.append(_clean_sso_status(status))
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        params.extend([limit, offset])
+        with self._session() as conn:
+            return [self._sso_provider_from_row(row) for row in self._execute(conn, f"SELECT * FROM sso_provider_configs {where} ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?", tuple(params))]
+
+    def upsert_provider_config(
+        self,
+        provider_type: str,
+        provider_name: str,
+        status: str = "testing",
+        region: Optional[str] = None,
+        mode: Optional[str] = None,
+        endpoint: str = "",
+        credential_ref: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+        actor_id: str = "system",
+    ) -> Dict[str, Any]:
+        provider_type = _clean_provider_type(provider_type)
+        provider_name = _clean_provider_name(provider_name)
+        status = _clean_provider_status(status)
+        region_value = (region or self.settings.region or "CN").strip()[:40]
+        mode_value = (mode or self.settings.provider_adapter_mode or "mock").strip().lower()[:40]
+        if status == "active" and not _provider_region_allowed(self.settings.region, region_value):
+            raise ValueError("provider_region_not_allowed")
+        now = _now()
+        with self._session() as conn:
+            existing = self._get_one(conn, "SELECT id FROM provider_configs WHERE provider_type = ? AND provider_name = ?", (provider_type, provider_name))
+            if existing:
+                config_id = existing["id"]
+                self._execute(
+                    conn,
+                    """
+                    UPDATE provider_configs
+                    SET status = ?, region = ?, mode = ?, endpoint_hash = ?, credential_ref_hash = ?,
+                        metadata_json = ?, updated_by = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (status, region_value, mode_value, _sha256(endpoint) if endpoint else "", _sha256(credential_ref) if credential_ref else "", dumps(metadata or {}), actor_id, now, config_id),
+                )
+                event_type = "provider_config.updated"
+            else:
+                config_id = _id("prv")
+                self._execute(
+                    conn,
+                    """
+                    INSERT INTO provider_configs
+                    (id, provider_type, provider_name, status, region, mode, endpoint_hash,
+                     credential_ref_hash, metadata_json, created_by, updated_by, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (config_id, provider_type, provider_name, status, region_value, mode_value, _sha256(endpoint) if endpoint else "", _sha256(credential_ref) if credential_ref else "", dumps(metadata or {}), actor_id, actor_id, now, now),
+                )
+                event_type = "provider_config.created"
+            self._audit(conn, actor_id, event_type, "provider_config", config_id, {"provider_type": provider_type, "provider_name": provider_name})
+            return self.get_provider_config(config_id, conn=conn)
+
+    def get_provider_config(self, config_id: str, conn: Optional[Any] = None) -> Dict[str, Any]:
+        if conn is None:
+            with self._session() as active:
+                return self.get_provider_config(config_id, conn=active)
+        row = self._get_one(conn, "SELECT * FROM provider_configs WHERE id = ?", (config_id,))
+        if not row:
+            raise KeyError("provider_config_not_found")
+        return self._provider_config_from_row(row)
+
+    def list_provider_configs(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        provider_type: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        limit, offset = _page_bounds(limit, offset, self.settings.max_page_limit)
+        filters: List[str] = []
+        params: List[Any] = []
+        if provider_type:
+            filters.append("provider_type = ?")
+            params.append(_clean_provider_type(provider_type))
+        if status:
+            filters.append("status = ?")
+            params.append(_clean_provider_status(status))
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        params.extend([limit, offset])
+        with self._session() as conn:
+            return [self._provider_config_from_row(row) for row in self._execute(conn, f"SELECT * FROM provider_configs {where} ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?", tuple(params))]
+
+    def run_provider_health_check(self, config_id: str, actor_id: str = "system") -> Dict[str, Any]:
+        now = _now()
+        with self._session() as conn:
+            config = self.get_provider_config(config_id, conn=conn)
+            status = "succeeded" if config["status"] in {"active", "testing"} else "skipped"
+            event_id = _id("pevt")
+            self._execute(
+                conn,
+                """
+                INSERT INTO provider_events
+                (id, provider_type, provider_name, entity_type, entity_id, status,
+                 request_hash, response_json, error, cost_micros, latency_ms, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    config["provider_type"],
+                    config["provider_name"],
+                    "provider_config",
+                    config_id,
+                    status,
+                    _sha256(f"health:{config_id}:{now}"),
+                    dumps({"mode": config["mode"], "region": config["region"], "adapter_ready": status == "succeeded"}),
+                    "" if status == "succeeded" else "provider_disabled",
+                    0,
+                    0,
+                    now,
+                ),
+            )
+            self._audit(conn, actor_id, "provider.health_checked", "provider_config", config_id, {"status": status})
+            return self._provider_event_from_row(self._get_one(conn, "SELECT * FROM provider_events WHERE id = ?", (event_id,)))
+
+    def list_provider_events(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        provider_type: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        limit, offset = _page_bounds(limit, offset, self.settings.max_page_limit)
+        filters: List[str] = []
+        params: List[Any] = []
+        if provider_type:
+            filters.append("provider_type = ?")
+            params.append(_clean_provider_type(provider_type))
+        if status:
+            filters.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        params.extend([limit, offset])
+        with self._session() as conn:
+            return [self._provider_event_from_row(row) for row in self._execute(conn, f"SELECT * FROM provider_events {where} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?", tuple(params))]
+
+    def submit_payout_transfer(
+        self,
+        batch_id: str,
+        provider_name: str = "mock_payout",
+        actor_id: str = "system",
+    ) -> Dict[str, Any]:
+        provider_name = _clean_provider_name(provider_name)
+        transfer_id = _id("ptr")
+        now = _now()
+        with self._session() as conn:
+            batch = self.get_payout_batch(batch_id, conn=conn)
+            if batch["status"] != "ready":
+                raise ValueError("payout_batch_not_ready")
+            existing = self._get_one(conn, "SELECT * FROM payout_transfers WHERE batch_id = ? AND status IN (?, ?)", (batch_id, "submitted", "succeeded"))
+            if existing:
+                return self._payout_transfer_from_row(existing)
+            request_payload = {
+                "batch_id": batch_id,
+                "amount_cents": int(batch["total_amount_cents"]),
+                "payout_count": int(batch["payout_count"]),
+                "provider_name": provider_name,
+            }
+            self._execute(
+                conn,
+                """
+                INSERT INTO payout_transfers
+                (id, batch_id, provider_name, status, amount_cents, external_reference,
+                 request_json, response_json, error, created_by, created_at, updated_at, completed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (transfer_id, batch_id, provider_name, "submitted", int(batch["total_amount_cents"]), "", dumps(request_payload), "{}", "", actor_id, now, now, None),
+            )
+            self._audit(conn, actor_id, "payout_transfer.submitted", "payout_transfer", transfer_id, {"batch_id": batch_id, "provider_name": provider_name})
+            return self._payout_transfer_from_row(self._get_one(conn, "SELECT * FROM payout_transfers WHERE id = ?", (transfer_id,)))
+
+    def confirm_payout_transfer(
+        self,
+        transfer_id: str,
+        status: str,
+        external_reference: str = "",
+        response: Optional[Dict[str, Any]] = None,
+        error: str = "",
+        actor_id: str = "system",
+    ) -> Dict[str, Any]:
+        clean_status = _clean_transfer_status(status)
+        now = _now()
+        with self._session() as conn:
+            transfer = self.get_payout_transfer(transfer_id, conn=conn)
+            if transfer["status"] not in {"submitted", "failed"}:
+                raise ValueError("payout_transfer_closed")
+            self._execute(
+                conn,
+                """
+                UPDATE payout_transfers
+                SET status = ?, external_reference = ?, response_json = ?, error = ?,
+                    updated_at = ?, completed_at = ?
+                WHERE id = ?
+                """,
+                (clean_status, external_reference[:160], dumps(response or {}), error[:1000], now, now if clean_status in {"succeeded", "failed"} else None, transfer_id),
+            )
+            if clean_status == "succeeded":
+                batch = self.get_payout_batch(transfer["batch_id"], conn=conn)
+                if batch["status"] == "ready":
+                    self._execute(
+                        conn,
+                        """
+                        UPDATE payout_batches
+                        SET status = ?, settled_by = ?, settled_at = ?, external_reference = ?, notes = ?
+                        WHERE id = ?
+                        """,
+                        ("settled", actor_id, now, external_reference[:160], "provider_transfer_confirmed", transfer["batch_id"]),
+                    )
+                    self._execute(
+                        conn,
+                        """
+                        UPDATE payout_events
+                        SET status = ?, settled_at = ?
+                        WHERE settlement_batch_id = ? AND status = ?
+                        """,
+                        ("settled", now, transfer["batch_id"], "batched"),
+                    )
+            self._audit(conn, actor_id, "payout_transfer.confirmed", "payout_transfer", transfer_id, {"status": clean_status})
+            return self.get_payout_transfer(transfer_id, conn=conn)
+
+    def get_payout_transfer(self, transfer_id: str, conn: Optional[Any] = None) -> Dict[str, Any]:
+        if conn is None:
+            with self._session() as active:
+                return self.get_payout_transfer(transfer_id, conn=active)
+        row = self._get_one(conn, "SELECT * FROM payout_transfers WHERE id = ?", (transfer_id,))
+        if not row:
+            raise KeyError("payout_transfer_not_found")
+        return self._payout_transfer_from_row(row)
+
+    def list_payout_transfers(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        status: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        limit, offset = _page_bounds(limit, offset, self.settings.max_page_limit)
+        params: List[Any] = []
+        where = ""
+        if status:
+            where = "WHERE status = ?"
+            params.append(status)
+        params.extend([limit, offset])
+        with self._session() as conn:
+            return [self._payout_transfer_from_row(row) for row in self._execute(conn, f"SELECT * FROM payout_transfers {where} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?", tuple(params))]
 
     def list_usage_events(self, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
         limit, offset = _page_bounds(limit, offset, self.settings.max_page_limit)
@@ -2724,14 +4664,121 @@ class LodiaStore:
             self._audit(conn, actor_id, "payout.settled", "payout_event", payout_id, {"contributor_id": row["contributor_id"]})
             return row_to_dict(self._get_one(conn, "SELECT * FROM payout_events WHERE id = ?", (payout_id,)))
 
-    def get_data_contract(self, dataset_id: str) -> Dict[str, Any]:
+    def get_data_contract(self, dataset_id: str, conn: Optional[Any] = None) -> Dict[str, Any]:
+        if conn is None:
+            with self._session() as active:
+                return self.get_data_contract(dataset_id, conn=active)
+        row = self._get_one(conn, "SELECT * FROM data_contracts WHERE dataset_id = ?", (dataset_id,))
+        if not row:
+            raise KeyError("data_contract_not_found")
+        result = row_to_dict(row)
+        result["contract"] = loads(result.pop("contract_json"))
+        return result
+
+    def dataset_commercial_proof(self, dataset_id: str, actor_id: str = "system") -> Dict[str, Any]:
+        dataset = self.get_dataset(dataset_id)
+        if dataset["status"] != "ready":
+            raise ValueError("dataset_not_ready")
+        artifact_hashes: Dict[str, Dict[str, Any]] = {}
+        for artifact in DATASET_ARTIFACTS:
+            column_name, media_type, filename = _dataset_artifact_descriptor(artifact)
+            uri = dataset.get(column_name)
+            if not uri:
+                continue
+            content = self.objects.read_text(uri)
+            artifact_hashes[artifact] = {
+                "filename": filename,
+                "media_type": media_type,
+                "sha256": _sha256(content),
+                "byte_size": len(content.encode("utf-8")),
+                "line_count": len([line for line in content.splitlines() if line.strip()]),
+            }
+
         with self._session() as conn:
-            row = self._get_one(conn, "SELECT * FROM data_contracts WHERE dataset_id = ?", (dataset_id,))
-            if not row:
-                raise KeyError("data_contract_not_found")
-            result = row_to_dict(row)
-            result["contract"] = loads(result.pop("contract_json"))
-            return result
+            cases = [self.get_case(case_id, conn=conn) for case_id in dataset["case_ids"]]
+            contract = self.get_data_contract(dataset_id, conn=conn)
+            case_ids = [case["case_id"] for case in cases]
+            authorization_ids = sorted({case.get("authorization_snapshot_id") for case in cases if case.get("authorization_snapshot_id")})
+            authorizations = []
+            if authorization_ids:
+                placeholders = ",".join("?" for _ in authorization_ids)
+                authorizations = [
+                    {
+                        "id": row["id"],
+                        "owner_ref": _sha256(row["owner_id"])[:16],
+                        "status": row["status"],
+                        "allowed_uses": loads(row["allowed_uses_json"]),
+                        "policy_version": row["policy_version"],
+                        "terms_version": row["terms_version"],
+                        "source": row["source"],
+                        "created_at": row["created_at"],
+                        "withdrawn_at": row["withdrawn_at"],
+                    }
+                    for row in self._execute(
+                        conn,
+                        f"SELECT * FROM authorization_snapshots WHERE id IN ({placeholders}) ORDER BY id ASC",
+                        tuple(authorization_ids),
+                    )
+                ]
+            review_summary = _review_summary_for_cases(conn, self, case_ids)
+            content_safety_summary = _content_safety_summary_for_cases(conn, self, case_ids)
+            usage_summary = _usage_summary_for_dataset(conn, self, dataset_id)
+            payout_summary = _payout_summary_for_dataset(conn, self, dataset_id)
+            case_refs = [
+                {
+                    "case_id": case["case_id"],
+                    "owner_ref": _sha256(case["owner_id"])[:16],
+                    "drl": case["quality_gate"]["drl"],
+                    "quality_score": case["annotation"]["quality_score"],
+                    "value_score": case["annotation"].get("value_score", 0),
+                    "duplicate_status": case["dedup"]["duplicate_status"],
+                    "novelty_score": case["dedup"]["novelty_score"],
+                    "redaction_passed": bool(case["redaction"]["passed"]),
+                    "required_actions": list(case["quality_gate"].get("required_actions") or []),
+                    "allowed_uses": list(case["quality_gate"].get("allowed_uses") or []),
+                    "authorization_snapshot_id": case.get("authorization_snapshot_id"),
+                    "content_safety": content_safety_summary.get(case["case_id"], {}),
+                    "reviews": review_summary.get(case["case_id"], {}),
+                    "created_at": case["created_at"],
+                }
+                for case in cases
+            ]
+            proof = {
+                "proof_id": _id("proof"),
+                "dataset_id": dataset_id,
+                "dataset_status": dataset["status"],
+                "name": dataset["name"],
+                "purpose": dataset["purpose"],
+                "min_drl": dataset["min_drl"],
+                "case_count": len(cases),
+                "generated_at": _now(),
+                "contains_raw_data": False,
+                "privacy_statement": "Proof excludes raw data, raw object paths, original contributor identifiers, and redacted case text.",
+                "contract": {
+                    "id": contract["id"],
+                    "version": contract["version"],
+                    "status": contract["status"],
+                    "rules": contract["contract"].get("rules", {}),
+                    "authorization_snapshot_ids": contract["contract"].get("authorization_snapshot_ids", []),
+                },
+                "artifact_hashes": artifact_hashes,
+                "authorizations": authorizations,
+                "case_refs": case_refs,
+                "usage_summary": usage_summary,
+                "payout_summary": payout_summary,
+                "commercial_checks": {
+                    "all_cases_commercial_ready": all(case["status"] == "commercial_ready" for case in cases),
+                    "all_redaction_passed": all(case["redaction"]["passed"] for case in cases),
+                    "all_authorizations_active": all(item["status"] == "active" for item in authorizations) and len(authorizations) == len(authorization_ids),
+                    "all_required_actions_closed": all(not case["quality_gate"].get("required_actions") for case in cases),
+                    "artifact_hashes_present": set(DATASET_ARTIFACTS).issubset(set(artifact_hashes)),
+                    "contributor_pool_rate": 0.80,
+                    "platform_net_margin_rate": 0.20,
+                },
+            }
+            proof["proof_hash"] = _sha256(dumps(proof))
+            self._audit(conn, actor_id, "dataset.commercial_proof_generated", "dataset", dataset_id, {"proof_hash": proof["proof_hash"]})
+            return proof
 
     def purge_expired_raw_objects(self, limit: int = 100, actor_id: str = "system") -> Dict[str, Any]:
         limit = _bounded_limit(limit, self.settings.max_page_limit)
@@ -2788,6 +4835,19 @@ class LodiaStore:
                 "datasets": _single_count(conn, self, "datasets"),
                 "enterprise_orders": _count_by(conn, self, "enterprise_orders", "status"),
                 "disputes": _count_by(conn, self, "disputes", "status"),
+                "review_samples": _count_by(conn, self, "review_samples", "status"),
+                "eval_runs": _count_by(conn, self, "eval_runs", "status"),
+                "reconciliation_reports": _count_by(conn, self, "reconciliation_reports", "status"),
+                "dsr_requests": _count_by(conn, self, "dsr_requests", "status"),
+                "invoices": _count_by(conn, self, "invoices", "status"),
+                "inbound_messages": _count_by(conn, self, "inbound_messages", "status"),
+                "webhook_ingestions": _count_by(conn, self, "webhook_ingestions", "status"),
+                "content_safety_results": _count_by(conn, self, "content_safety_results", "status"),
+                "compliance_reviews": _count_by(conn, self, "compliance_reviews", "status"),
+                "compliance_tasks": _count_by(conn, self, "compliance_tasks", "status"),
+                "provider_events": _count_by(conn, self, "provider_events", "status"),
+                "payout_transfers": _count_by(conn, self, "payout_transfers", "status"),
+                "buyer_usage_reports": _single_count(conn, self, "buyer_usage_reports"),
                 "users": _count_by(conn, self, "users", "status"),
                 "authorizations": _count_by(conn, self, "authorization_snapshots", "status"),
                 "pending_payout_cents": _sum_where(conn, self, "payout_events", "amount_cents", "status", "pending"),
@@ -2806,6 +4866,19 @@ class LodiaStore:
                 "payout_batches": _count_by(conn, self, "payout_batches", "status"),
                 "enterprise_orders": _count_by(conn, self, "enterprise_orders", "status"),
                 "disputes": _count_by(conn, self, "disputes", "status"),
+                "review_samples": _count_by(conn, self, "review_samples", "status"),
+                "eval_runs": _count_by(conn, self, "eval_runs", "status"),
+                "reconciliation_reports": _count_by(conn, self, "reconciliation_reports", "status"),
+                "dsr_requests": _count_by(conn, self, "dsr_requests", "status"),
+                "invoices": _count_by(conn, self, "invoices", "status"),
+                "inbound_messages": _count_by(conn, self, "inbound_messages", "status"),
+                "webhook_ingestions": _count_by(conn, self, "webhook_ingestions", "status"),
+                "content_safety_results": _count_by(conn, self, "content_safety_results", "status"),
+                "compliance_reviews": _count_by(conn, self, "compliance_reviews", "status"),
+                "compliance_tasks": _count_by(conn, self, "compliance_tasks", "status"),
+                "provider_events": _count_by(conn, self, "provider_events", "status"),
+                "payout_transfers": _count_by(conn, self, "payout_transfers", "status"),
+                "buyer_usage_reports": _single_count(conn, self, "buyer_usage_reports"),
                 "reviews": _count_by(conn, self, "reviews", "review_type"),
                 "model_invocations": _count_by(conn, self, "model_invocations", "status"),
                 "queue_depth": _count_grouped(conn, self, "jobs", ["queue_name", "status"]),
@@ -2879,6 +4952,7 @@ class LodiaStore:
 
     def prometheus_metrics(self) -> str:
         snapshot = self.observability_snapshot()
+        alerts = self.operational_alerts()
         lines = [
             "# HELP lodia_service_ready Service readiness flag.",
             "# TYPE lodia_service_ready gauge",
@@ -2899,10 +4973,33 @@ class LodiaStore:
             lines.append(f'lodia_enterprise_orders_total{{status="{_label_value(status)}"}} {int(value)}')
         for status, value in snapshot["disputes"].items():
             lines.append(f'lodia_disputes_total{{status="{_label_value(status)}"}} {int(value)}')
+        for status, value in snapshot["review_samples"].items():
+            lines.append(f'lodia_review_samples_total{{status="{_label_value(status)}"}} {int(value)}')
+        for status, value in snapshot["eval_runs"].items():
+            lines.append(f'lodia_eval_runs_total{{status="{_label_value(status)}"}} {int(value)}')
+        for status, value in snapshot["reconciliation_reports"].items():
+            lines.append(f'lodia_reconciliation_reports_total{{status="{_label_value(status)}"}} {int(value)}')
+        for status, value in snapshot["dsr_requests"].items():
+            lines.append(f'lodia_dsr_requests_total{{status="{_label_value(status)}"}} {int(value)}')
+        for status, value in snapshot["invoices"].items():
+            lines.append(f'lodia_invoices_total{{status="{_label_value(status)}"}} {int(value)}')
+        for status, value in snapshot["inbound_messages"].items():
+            lines.append(f'lodia_inbound_messages_total{{status="{_label_value(status)}"}} {int(value)}')
+        for status, value in snapshot["content_safety_results"].items():
+            lines.append(f'lodia_content_safety_results_total{{status="{_label_value(status)}"}} {int(value)}')
+        for status, value in snapshot["compliance_reviews"].items():
+            lines.append(f'lodia_compliance_reviews_total{{status="{_label_value(status)}"}} {int(value)}')
+        for status, value in snapshot["compliance_tasks"].items():
+            lines.append(f'lodia_compliance_tasks_total{{status="{_label_value(status)}"}} {int(value)}')
+        for status, value in snapshot["payout_transfers"].items():
+            lines.append(f'lodia_payout_transfers_total{{status="{_label_value(status)}"}} {int(value)}')
+        lines.append(f"lodia_buyer_usage_reports_total {int(snapshot.get('buyer_usage_reports', 0))}")
         for status, value in snapshot["model_invocations"].items():
             lines.append(f'lodia_model_invocations_total{{status="{_label_value(status)}"}} {int(value)}')
         lines.append(f"lodia_pending_payout_cents {int(snapshot['metrics'].get('pending_payout_cents', 0))}")
         lines.append(f"lodia_audit_events_total {int(snapshot['metrics'].get('audit_events', 0))}")
+        lines.append(f"lodia_operational_alerts_total {int(alerts['alert_count'])}")
+        lines.append(f"lodia_operational_critical_alerts_total {int(alerts['critical_count'])}")
         return "\n".join(lines) + "\n"
 
     def create_approval_request(
@@ -3484,6 +5581,30 @@ class LodiaStore:
     def _vendor_processing_from_row(self, row: Any) -> Dict[str, Any]:
         return row_to_dict(row)
 
+    def _inbox_from_row(self, row: Any) -> Dict[str, Any]:
+        result = row_to_dict(row)
+        result["allowed_uses"] = loads(result.pop("allowed_uses_json") or "[]")
+        return result
+
+    def _inbound_message_from_row(self, row: Any) -> Dict[str, Any]:
+        result = row_to_dict(row)
+        result.pop("raw_path", None)
+        result.pop("sender_hash", None)
+        result["parsed"] = loads(result.pop("parsed_json") or "{}")
+        return result
+
+    def _webhook_ingestion_from_row(self, row: Any) -> Dict[str, Any]:
+        result = row_to_dict(row)
+        result["payload"] = loads(result.pop("payload_json") or "{}")
+        result["result"] = loads(result.pop("result_json") or "{}")
+        return result
+
+    def _content_safety_from_row(self, row: Any) -> Dict[str, Any]:
+        result = row_to_dict(row)
+        result["categories"] = loads(result.pop("categories_json") or "[]")
+        result["findings"] = loads(result.pop("findings_json") or "[]")
+        return result
+
     def _enterprise_customer_from_row(self, row: Any) -> Dict[str, Any]:
         result = row_to_dict(row)
         result.pop("contact_email_hash", None)
@@ -3513,6 +5634,65 @@ class LodiaStore:
     def _dispute_from_row(self, row: Any) -> Dict[str, Any]:
         result = row_to_dict(row)
         result["hold_payouts"] = bool(result["hold_payouts"])
+        return result
+
+    def _review_sample_from_row(self, row: Any, conn: Optional[Any] = None) -> Dict[str, Any]:
+        result = row_to_dict(row)
+        result["blind"] = bool(result["blind"])
+        if conn is not None:
+            try:
+                case = self.get_case(result["case_id"], conn=conn)
+                result["case_snapshot"] = _blind_case_snapshot(case) if result["blind"] else case
+            except KeyError:
+                result["case_snapshot"] = {}
+        return result
+
+    def _holdout_from_row(self, row: Any) -> Dict[str, Any]:
+        return row_to_dict(row)
+
+    def _eval_run_from_row(self, row: Any) -> Dict[str, Any]:
+        result = row_to_dict(row)
+        result["metrics"] = loads(result.pop("metrics_json") or "{}")
+        result["findings"] = loads(result.pop("findings_json") or "[]")
+        return result
+
+    def _reconciliation_report_from_row(self, row: Any) -> Dict[str, Any]:
+        result = row_to_dict(row)
+        result["summary"] = loads(result.pop("summary_json") or "{}")
+        result["anomalies"] = loads(result.pop("anomalies_json") or "[]")
+        return result
+
+    def _invoice_from_row(self, row: Any) -> Dict[str, Any]:
+        result = row_to_dict(row)
+        result.pop("invoice_no_hash", None)
+        return result
+
+    def _sso_provider_from_row(self, row: Any) -> Dict[str, Any]:
+        result = row_to_dict(row)
+        result["metadata"] = loads(result.pop("metadata_json") or "{}")
+        return result
+
+    def _provider_config_from_row(self, row: Any) -> Dict[str, Any]:
+        result = row_to_dict(row)
+        result.pop("endpoint_hash", None)
+        result.pop("credential_ref_hash", None)
+        result["metadata"] = loads(result.pop("metadata_json") or "{}")
+        return result
+
+    def _provider_event_from_row(self, row: Any) -> Dict[str, Any]:
+        result = row_to_dict(row)
+        result["response"] = loads(result.pop("response_json") or "{}")
+        return result
+
+    def _payout_transfer_from_row(self, row: Any) -> Dict[str, Any]:
+        result = row_to_dict(row)
+        result["request"] = loads(result.pop("request_json") or "{}")
+        result["response"] = loads(result.pop("response_json") or "{}")
+        return result
+
+    def _buyer_usage_report_from_row(self, row: Any) -> Dict[str, Any]:
+        result = row_to_dict(row)
+        result["payload"] = loads(result.pop("payload_json") or "{}")
         return result
 
     @contextmanager
@@ -3671,6 +5851,349 @@ class LodiaStore:
         )
         return [row_to_dict(row) for row in rows]
 
+    def _source_trust_score(self, conn: Any, contributor_id: str) -> float:
+        row = self._get_one(conn, "SELECT score FROM source_trust_profiles WHERE contributor_id = ?", (contributor_id,))
+        if not row:
+            return 1.0
+        return max(0.25, min(float(row["score"] or 1.0), 1.5))
+
+    def _delete_object_with_proof(self, uri: str, proof: Dict[str, Any]) -> None:
+        if not uri:
+            return
+        entry = {"uri_hash": _sha256(uri), "deleted": False, "error": ""}
+        try:
+            self.objects.delete(uri)
+            entry["deleted"] = True
+        except Exception as exc:  # deletion proof must record provider failures without leaking object names
+            entry["error"] = type(exc).__name__
+        proof.setdefault("deleted_objects", []).append(entry)
+
+    def _run_content_safety_screen(
+        self,
+        conn: Any,
+        entity_type: str,
+        entity_id: str,
+        text: str,
+        actor_id: str,
+    ) -> Dict[str, Any]:
+        result = compliance_result_to_dict(screen_text_for_compliance(text))
+        now = _now()
+        result_id = _id("csr")
+        self._execute(
+            conn,
+            """
+            INSERT INTO content_safety_results
+            (id, entity_type, entity_id, status, risk_level, action,
+             categories_json, findings_json, policy_version, created_by, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                result_id,
+                entity_type,
+                entity_id,
+                result["status"],
+                result["risk_level"],
+                result["action"],
+                dumps(result["categories"]),
+                dumps(result["findings"]),
+                result["policy_version"],
+                actor_id,
+                now,
+            ),
+        )
+        self._audit(conn, actor_id, "content_safety.screened", entity_type, entity_id, {"status": result["status"], "action": result["action"]})
+        if entity_type == "case" and result["action"] in {"block", "review"}:
+            self._apply_case_content_safety_hold(conn, entity_id, result, now, actor_id=actor_id)
+        return self._content_safety_from_row(self._get_one(conn, "SELECT * FROM content_safety_results WHERE id = ?", (result_id,)))
+
+    def _apply_case_content_safety_hold(
+        self,
+        conn: Any,
+        case_id: str,
+        result: Dict[str, Any],
+        now: str,
+        actor_id: str,
+    ) -> None:
+        row = self._get_one(conn, "SELECT * FROM cases WHERE id = ?", (case_id,))
+        if not row:
+            return
+        case = self._case_from_row(row)
+        if case["status"] in {"withdrawn", "rejected"}:
+            return
+        gate = dict(case["quality_gate"])
+        gate_results = dict(gate.get("gate_results") or {})
+        gate_results["content_safety_gate"] = "failed" if result["action"] == "block" else "limited"
+        gate["gate_results"] = gate_results
+        required = list(gate.get("required_actions") or [])
+        if "content_safety_review" not in required:
+            required.append("content_safety_review")
+        gate["required_actions"] = required
+        gate["commercial_ready"] = False
+        status = "rejected" if result["action"] == "block" else "compliance_review"
+        self._execute(conn, "UPDATE cases SET status = ?, quality_gate_json = ?, updated_at = ? WHERE id = ?", (status, dumps(gate), now, case_id))
+        self._execute(
+            conn,
+            """
+            INSERT INTO compliance_reviews
+            (id, entity_type, entity_id, review_type, status, risk_level, reason,
+             decision, notes, created_by, assigned_to, created_at, updated_at, completed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                _id("crev"),
+                "case",
+                case_id,
+                "content_safety",
+                "open",
+                str(result["risk_level"]),
+                ",".join(result.get("categories") or [])[:1000],
+                "",
+                "",
+                actor_id,
+                "",
+                now,
+                now,
+                None,
+            ),
+        )
+
+    def _apply_compliance_review_decision(self, conn: Any, case_id: str, decision: str, now: str) -> None:
+        row = self._get_one(conn, "SELECT * FROM cases WHERE id = ?", (case_id,))
+        if not row:
+            return
+        case = self._case_from_row(row)
+        gate = dict(case["quality_gate"])
+        if decision == "rejected":
+            gate["commercial_ready"] = False
+            required = list(gate.get("required_actions") or [])
+            if "compliance_rejected" not in required:
+                required.append("compliance_rejected")
+            gate["required_actions"] = required
+            self._execute(conn, "UPDATE cases SET status = ?, quality_gate_json = ?, updated_at = ? WHERE id = ?", ("rejected", dumps(gate), now, case_id))
+            return
+        required = [action for action in gate.get("required_actions", []) if action != "content_safety_review"]
+        gate["required_actions"] = required
+        gate_results = dict(gate.get("gate_results") or {})
+        gate_results["content_safety_gate"] = "passed"
+        gate["gate_results"] = gate_results
+        target_status = "review_pending" if "human_review" in required else "candidate_ready"
+        if DRL_ORDER.get(str(gate.get("drl", "DRL0")), 0) >= DRL_ORDER["DRL3"]:
+            gate["commercial_ready"] = True
+            target_status = "commercial_ready"
+        self._execute(conn, "UPDATE cases SET status = ?, quality_gate_json = ?, updated_at = ? WHERE id = ?", (target_status, dumps(gate), now, case_id))
+
+    def _compliance_entity_text(self, conn: Any, entity_type: str, entity_id: str) -> str:
+        if entity_type == "case":
+            return self.get_case(entity_id, conn=conn)["redacted_text"]
+        if entity_type == "asset":
+            asset = self.get_asset(entity_id, conn=conn)
+            if asset.get("extracted_text_path"):
+                return self.objects.read_text(asset["extracted_text_path"])
+            return f"{asset['filename']} {asset['media_type']} {asset['asset_type']}"
+        if entity_type == "inbound_message":
+            row = self._get_one(conn, "SELECT subject, raw_path FROM inbound_messages WHERE id = ?", (entity_id,))
+            if not row:
+                raise KeyError("inbound_message_not_found")
+            return f"{row['subject']}\n\n{self.objects.read_text(row['raw_path'])}"
+        raise ValueError("invalid_compliance_entity_type")
+
+    def _ensure_entity_exists(self, conn: Any, entity_type: str, entity_id: str) -> None:
+        table_by_type = {
+            "case": "cases",
+            "asset": "assets",
+            "dataset": "datasets",
+            "inbound_message": "inbound_messages",
+            "enterprise_order": "enterprise_orders",
+            "payout_batch": "payout_batches",
+        }
+        table = table_by_type.get(entity_type)
+        if not table:
+            raise ValueError("invalid_compliance_entity_type")
+        if not self._get_one(conn, f"SELECT id FROM {table} WHERE id = ?", (entity_id,)):
+            raise KeyError("entity_not_found")
+
+    def _recall_datasets_for_owner(
+        self,
+        conn: Any,
+        owner_id: str,
+        now: str,
+        proof: Dict[str, Any],
+        actor_id: str,
+    ) -> Dict[str, int]:
+        dataset_rows = self._execute(
+            conn,
+            """
+            SELECT DISTINCT d.*
+            FROM datasets d
+            JOIN dataset_cases dc ON dc.dataset_id = d.id
+            JOIN cases c ON c.id = dc.case_id
+            WHERE c.owner_id = ?
+            """,
+            (owner_id,),
+        )
+        recalled = 0
+        revoked_grants = 0
+        for row in dataset_rows:
+            dataset = row_to_dict(row)
+            artifact_uris = _dataset_artifact_uris(dataset)
+            for uri in artifact_uris:
+                self._delete_object_with_proof(uri, proof)
+            dataset_cursor = self._execute(
+                conn,
+                """
+                UPDATE datasets
+                SET status = ?, contract_status = ?
+                WHERE id = ? AND status != ?
+                """,
+                ("privacy_recalled", "recalled", dataset["id"], "privacy_recalled"),
+            )
+            grant_cursor = self._execute(
+                conn,
+                """
+                UPDATE dataset_delivery_grants
+                SET status = ?, revoked_at = ?
+                WHERE dataset_id = ? AND status != ?
+                """,
+                ("revoked", now, dataset["id"], "revoked"),
+            )
+            order_cursor = self._execute(
+                conn,
+                """
+                UPDATE enterprise_orders
+                SET status = ?, updated_at = ?
+                WHERE dataset_id = ? AND status NOT IN (?, ?)
+                """,
+                ("data_recalled", now, dataset["id"], "cancelled", "closed"),
+            )
+            dataset_recalled = int(dataset_cursor.rowcount or 0)
+            grant_count = int(grant_cursor.rowcount or 0)
+            order_count = int(order_cursor.rowcount or 0)
+            recalled += dataset_recalled
+            revoked_grants += grant_count
+            proof.setdefault("dataset_recalls", []).append(
+                {
+                    "dataset_id": dataset["id"],
+                    "artifact_count": len(artifact_uris),
+                    "delivery_grants_revoked": grant_count,
+                    "orders_marked_recalled": order_count,
+                }
+            )
+            if dataset_recalled or grant_count or order_count:
+                self._audit(
+                    conn,
+                    actor_id,
+                    "dataset.privacy_recalled",
+                    "dataset",
+                    dataset["id"],
+                    {"delivery_grants_revoked": grant_count, "orders_marked_recalled": order_count},
+                )
+        return {"datasets": recalled, "delivery_grants": revoked_grants}
+
+    def _dsr_export_snapshot(self, conn: Any, owner_id: str) -> Dict[str, Any]:
+        submissions: List[Dict[str, Any]] = []
+        for row in self._execute(conn, "SELECT * FROM submissions WHERE owner_id = ? ORDER BY created_at ASC", (owner_id,)):
+            item = row_to_dict(row)
+            item["allowed_uses"] = loads(item.pop("allowed_uses_json") or "[]")
+            item.pop("raw_path", None)
+            item.pop("raw_hash", None)
+            submissions.append(item)
+
+        cases: List[Dict[str, Any]] = []
+        for row in self._execute(conn, "SELECT * FROM cases WHERE owner_id = ? ORDER BY created_at ASC", (owner_id,)):
+            case = self._case_from_row(row)
+            cases.append(
+                {
+                    "case_id": case["case_id"],
+                    "submission_id": case["submission_id"],
+                    "status": case["status"],
+                    "redacted_text": case["redacted_text"],
+                    "redaction": case["redaction"],
+                    "annotation": case["annotation"],
+                    "dedup": case["dedup"],
+                    "quality_gate": case["quality_gate"],
+                    "created_at": case["created_at"],
+                    "updated_at": case["updated_at"],
+                }
+            )
+
+        assets: List[Dict[str, Any]] = []
+        for row in self._execute(conn, "SELECT * FROM assets WHERE owner_id = ? ORDER BY created_at ASC", (owner_id,)):
+            item = row_to_dict(row)
+            item["metadata"] = loads(item.pop("metadata_json") or "{}")
+            item["risk"] = loads(item.pop("risk_json") or "{}")
+            item["redaction"] = loads(item.pop("redaction_json") or "{}")
+            item.pop("raw_path", None)
+            item.pop("extracted_text_path", None)
+            item.pop("sha256", None)
+            assets.append(item)
+
+        payouts = [
+            {
+                "id": row["id"],
+                "case_id": row["case_id"],
+                "amount_cents": int(row["amount_cents"]),
+                "weight": float(row["weight"]),
+                "status": row["status"],
+                "settlement_batch_id": row["settlement_batch_id"],
+                "settled_at": row["settled_at"],
+                "created_at": row["created_at"],
+            }
+            for row in self._execute(conn, "SELECT * FROM payout_events WHERE contributor_id = ? ORDER BY created_at ASC", (owner_id,))
+        ]
+        return {"submissions": submissions, "cases": cases, "assets": assets, "payout_events": payouts}
+
+    def _reconciliation_anomalies(self, conn: Any, scope_type: str, scope_id: str) -> List[Dict[str, Any]]:
+        anomalies: List[Dict[str, Any]] = []
+        orders: List[Dict[str, Any]]
+        if scope_type == "enterprise_order":
+            orders = [self.get_enterprise_order(scope_id, conn=conn)]
+        elif scope_type == "dataset":
+            self.get_dataset(scope_id, conn=conn)
+            orders = [
+                self._enterprise_order_from_row(row)
+                for row in self._execute(conn, "SELECT * FROM enterprise_orders WHERE dataset_id = ?", (scope_id,))
+            ]
+        elif scope_type == "payout_batch":
+            batch = self.get_payout_batch(scope_id, conn=conn)
+            rows = self._execute(conn, "SELECT * FROM payout_events WHERE settlement_batch_id = ?", (batch["id"],))
+            if int(batch["total_amount_cents"]) != sum(int(row["amount_cents"]) for row in rows):
+                anomalies.append({"code": "payout_batch_total_mismatch", "batch_id": batch["id"]})
+            return anomalies
+        else:
+            orders = [
+                self._enterprise_order_from_row(row)
+                for row in self._execute(
+                    conn,
+                    "SELECT * FROM enterprise_orders ORDER BY created_at DESC, id DESC LIMIT ?",
+                    (self.settings.max_page_limit,),
+                )
+            ]
+
+        for order in orders:
+            if order["status"] == "recognized" and not order["usage_event_id"]:
+                anomalies.append({"code": "recognized_order_missing_usage_event", "order_id": order["id"]})
+                continue
+            if order["usage_event_id"]:
+                usage = self._get_one(conn, "SELECT * FROM usage_events WHERE id = ?", (order["usage_event_id"],))
+                if not usage:
+                    anomalies.append({"code": "usage_event_missing", "order_id": order["id"], "usage_event_id": order["usage_event_id"]})
+                    continue
+                net_margin = max(int(order["gross_revenue_cents"]) - int(order["direct_cost_cents"]), 0)
+                expected_pool = int(round(net_margin * 0.80))
+                payout_sum_row = self._get_one(
+                    conn,
+                    "SELECT COALESCE(SUM(amount_cents), 0) AS value FROM payout_events WHERE usage_event_id = ?",
+                    (order["usage_event_id"],),
+                )
+                payout_sum = int(payout_sum_row["value"] or 0) if payout_sum_row else 0
+                if payout_sum != expected_pool:
+                    anomalies.append({"code": "payout_pool_mismatch", "order_id": order["id"], "expected_cents": expected_pool, "actual_cents": payout_sum})
+            if order["delivery_grant_id"]:
+                grant = self.get_dataset_delivery_grant(order["delivery_grant_id"], conn=conn)
+                if int(grant["read_count"]) > int(grant["max_reads"]) or int(grant["read_count"]) > int(order["max_reads"]):
+                    anomalies.append({"code": "delivery_read_limit_mismatch", "order_id": order["id"], "grant_id": grant["id"]})
+        return anomalies
+
     def _apply_versioned_migrations(self, conn: Any) -> None:
         self._execute(
             conn,
@@ -3693,6 +6216,8 @@ class LodiaStore:
         self._ensure_payout_profile_tables(conn)
         self._ensure_enterprise_delivery_tables(conn)
         self._ensure_commercial_ops_tables(conn)
+        self._ensure_production_completion_tables(conn)
+        self._ensure_p0_completion_tables(conn)
         self._ensure_model_invocation_tables(conn)
         self._ensure_vendor_processing_tables(conn)
         self._backfill_authorization_snapshots(conn)
@@ -3758,6 +6283,24 @@ class LodiaStore:
             ON CONFLICT(version) DO NOTHING
             """,
             ("20260506_p6_commercial_ops", _now()),
+        )
+        self._execute(
+            conn,
+            """
+            INSERT INTO schema_migrations (version, applied_at)
+            VALUES (?, ?)
+            ON CONFLICT(version) DO NOTHING
+            """,
+            ("20260506_p7_production_completion", _now()),
+        )
+        self._execute(
+            conn,
+            """
+            INSERT INTO schema_migrations (version, applied_at)
+            VALUES (?, ?)
+            ON CONFLICT(version) DO NOTHING
+            """,
+            ("20260506_p8_p0_completion", _now()),
         )
 
     def _ensure_submission_columns(self, conn: Any) -> None:
@@ -4056,6 +6599,382 @@ class LodiaStore:
         self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_disputes_status_created ON disputes(status, created_at)")
         self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_disputes_entity ON disputes(entity_type, entity_id, status)")
         self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_dispute_holds_payout ON dispute_holds(payout_id)")
+
+    def _ensure_production_completion_tables(self, conn: Any) -> None:
+        self._execute(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS source_trust_profiles (
+                contributor_id TEXT PRIMARY KEY,
+                score REAL NOT NULL,
+                case_count INTEGER NOT NULL,
+                accepted_count INTEGER NOT NULL,
+                rejected_count INTEGER NOT NULL,
+                duplicate_count INTEGER NOT NULL,
+                dispute_count INTEGER NOT NULL,
+                payout_void_count INTEGER NOT NULL,
+                last_recalculated_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """,
+        )
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_source_trust_score ON source_trust_profiles(score, updated_at)")
+        self._execute(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS review_samples (
+                id TEXT PRIMARY KEY,
+                case_id TEXT NOT NULL,
+                sample_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                assigned_to TEXT NOT NULL,
+                blind INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT,
+                reviewer_id TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                score REAL NOT NULL,
+                notes TEXT NOT NULL,
+                FOREIGN KEY (case_id) REFERENCES cases(id)
+            )
+            """,
+        )
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_review_samples_status_created ON review_samples(status, created_at)")
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_review_samples_case_status ON review_samples(case_id, status)")
+        self._execute(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS holdout_items (
+                id TEXT PRIMARY KEY,
+                case_id TEXT NOT NULL,
+                purpose TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(case_id, purpose),
+                FOREIGN KEY (case_id) REFERENCES cases(id)
+            )
+            """,
+        )
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_holdout_items_purpose_created ON holdout_items(purpose, created_at)")
+        self._execute(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS eval_runs (
+                id TEXT PRIMARY KEY,
+                dataset_id TEXT NOT NULL,
+                eval_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                metrics_json TEXT NOT NULL,
+                findings_json TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (dataset_id) REFERENCES datasets(id)
+            )
+            """,
+        )
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_eval_runs_dataset_created ON eval_runs(dataset_id, created_at)")
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_eval_runs_status_created ON eval_runs(status, created_at)")
+        self._execute(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS reconciliation_reports (
+                id TEXT PRIMARY KEY,
+                scope_type TEXT NOT NULL,
+                scope_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                summary_json TEXT NOT NULL,
+                anomalies_json TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """,
+        )
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_reconciliation_reports_status_created ON reconciliation_reports(status, created_at)")
+        self._execute(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS dsr_requests (
+                id TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL,
+                request_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                deleted_cases INTEGER NOT NULL,
+                deleted_assets INTEGER NOT NULL,
+                proof_path TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                completed_at TEXT
+            )
+            """,
+        )
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_dsr_requests_owner_status ON dsr_requests(owner_id, status, created_at)")
+        self._execute(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS invoices (
+                id TEXT PRIMARY KEY,
+                order_id TEXT NOT NULL,
+                invoice_no_hash TEXT NOT NULL,
+                invoice_no_suffix TEXT NOT NULL,
+                status TEXT NOT NULL,
+                amount_cents INTEGER NOT NULL,
+                tax_cents INTEGER NOT NULL,
+                currency TEXT NOT NULL,
+                issued_at TEXT NOT NULL,
+                paid_at TEXT,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (order_id) REFERENCES enterprise_orders(id)
+            )
+            """,
+        )
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_invoices_order_status ON invoices(order_id, status)")
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_invoices_status_created ON invoices(status, created_at)")
+        self._execute(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS sso_provider_configs (
+                id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                provider_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                issuer TEXT NOT NULL,
+                domain TEXT NOT NULL,
+                metadata_json TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                updated_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(tenant_id, provider_type)
+            )
+            """,
+        )
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_sso_provider_tenant_status ON sso_provider_configs(tenant_id, status)")
+
+    def _ensure_p0_completion_tables(self, conn: Any) -> None:
+        self._execute(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS inboxes (
+                id TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL,
+                address TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL,
+                allowed_uses_json TEXT NOT NULL,
+                authorization_snapshot_id TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (authorization_snapshot_id) REFERENCES authorization_snapshots(id)
+            )
+            """,
+        )
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_inboxes_owner_status ON inboxes(owner_id, status, created_at)")
+        self._execute(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS inbound_messages (
+                id TEXT PRIMARY KEY,
+                inbox_id TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                source_type TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                sender_hash TEXT NOT NULL,
+                sender_domain TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                status TEXT NOT NULL,
+                raw_path TEXT NOT NULL,
+                raw_hash TEXT NOT NULL,
+                parsed_json TEXT NOT NULL,
+                submission_id TEXT NOT NULL,
+                error TEXT NOT NULL,
+                received_at TEXT NOT NULL,
+                processed_at TEXT,
+                UNIQUE(inbox_id, external_id),
+                FOREIGN KEY (inbox_id) REFERENCES inboxes(id)
+            )
+            """,
+        )
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_inbound_messages_inbox_status ON inbound_messages(inbox_id, status, received_at)")
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_inbound_messages_owner_status ON inbound_messages(owner_id, status, received_at)")
+        self._execute(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS webhook_ingestions (
+                id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                payload_hash TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                result_json TEXT NOT NULL,
+                error TEXT NOT NULL,
+                received_at TEXT NOT NULL,
+                processed_at TEXT,
+                UNIQUE(source, external_id)
+            )
+            """,
+        )
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_webhook_ingestions_source_status ON webhook_ingestions(source, status, received_at)")
+        self._execute(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS content_safety_results (
+                id TEXT PRIMARY KEY,
+                entity_type TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                risk_level TEXT NOT NULL,
+                action TEXT NOT NULL,
+                categories_json TEXT NOT NULL,
+                findings_json TEXT NOT NULL,
+                policy_version TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """,
+        )
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_content_safety_entity ON content_safety_results(entity_type, entity_id, created_at)")
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_content_safety_status ON content_safety_results(status, created_at)")
+        self._execute(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS compliance_reviews (
+                id TEXT PRIMARY KEY,
+                entity_type TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                review_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                risk_level TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                notes TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                assigned_to TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT
+            )
+            """,
+        )
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_compliance_reviews_status ON compliance_reviews(status, created_at)")
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_compliance_reviews_entity ON compliance_reviews(entity_type, entity_id, status)")
+        self._execute(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS compliance_tasks (
+                id TEXT PRIMARY KEY,
+                task_type TEXT NOT NULL,
+                title TEXT NOT NULL,
+                status TEXT NOT NULL,
+                owner TEXT NOT NULL,
+                due_at TEXT NOT NULL,
+                evidence_ref TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT
+            )
+            """,
+        )
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_compliance_tasks_status ON compliance_tasks(status, created_at)")
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_compliance_tasks_type_status ON compliance_tasks(task_type, status)")
+        self._execute(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS provider_configs (
+                id TEXT PRIMARY KEY,
+                provider_type TEXT NOT NULL,
+                provider_name TEXT NOT NULL,
+                status TEXT NOT NULL,
+                region TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                endpoint_hash TEXT NOT NULL,
+                credential_ref_hash TEXT NOT NULL,
+                metadata_json TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                updated_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(provider_type, provider_name)
+            )
+            """,
+        )
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_provider_configs_type_status ON provider_configs(provider_type, status, updated_at)")
+        self._execute(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS provider_events (
+                id TEXT PRIMARY KEY,
+                provider_type TEXT NOT NULL,
+                provider_name TEXT NOT NULL,
+                entity_type TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                request_hash TEXT NOT NULL,
+                response_json TEXT NOT NULL,
+                error TEXT NOT NULL,
+                cost_micros INTEGER NOT NULL,
+                latency_ms INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """,
+        )
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_provider_events_provider ON provider_events(provider_type, provider_name, created_at)")
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_provider_events_entity ON provider_events(entity_type, entity_id, created_at)")
+        self._execute(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS payout_transfers (
+                id TEXT PRIMARY KEY,
+                batch_id TEXT NOT NULL,
+                provider_name TEXT NOT NULL,
+                status TEXT NOT NULL,
+                amount_cents INTEGER NOT NULL,
+                external_reference TEXT NOT NULL,
+                request_json TEXT NOT NULL,
+                response_json TEXT NOT NULL,
+                error TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT,
+                FOREIGN KEY (batch_id) REFERENCES payout_batches(id)
+            )
+            """,
+        )
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_payout_transfers_batch_status ON payout_transfers(batch_id, status, created_at)")
+        self._execute(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS buyer_usage_reports (
+                id TEXT PRIMARY KEY,
+                grant_id TEXT NOT NULL,
+                order_id TEXT NOT NULL,
+                customer_id TEXT NOT NULL,
+                dataset_id TEXT NOT NULL,
+                external_event_id TEXT NOT NULL,
+                reported_case_count INTEGER NOT NULL,
+                purpose TEXT NOT NULL,
+                status TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(grant_id, external_event_id),
+                FOREIGN KEY (grant_id) REFERENCES dataset_delivery_grants(id)
+            )
+            """,
+        )
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_buyer_usage_reports_dataset ON buyer_usage_reports(dataset_id, created_at)")
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_buyer_usage_reports_grant ON buyer_usage_reports(grant_id, created_at)")
 
     def _ensure_model_invocation_tables(self, conn: Any) -> None:
         self._execute(
@@ -4575,6 +7494,306 @@ CREATE TABLE IF NOT EXISTS dispute_holds (
 );
 CREATE INDEX IF NOT EXISTS idx_dispute_holds_payout ON dispute_holds(payout_id);
 
+CREATE TABLE IF NOT EXISTS source_trust_profiles (
+    contributor_id TEXT PRIMARY KEY,
+    score REAL NOT NULL,
+    case_count INTEGER NOT NULL,
+    accepted_count INTEGER NOT NULL,
+    rejected_count INTEGER NOT NULL,
+    duplicate_count INTEGER NOT NULL,
+    dispute_count INTEGER NOT NULL,
+    payout_void_count INTEGER NOT NULL,
+    last_recalculated_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_source_trust_score ON source_trust_profiles(score, updated_at);
+
+CREATE TABLE IF NOT EXISTS review_samples (
+    id TEXT PRIMARY KEY,
+    case_id TEXT NOT NULL,
+    sample_type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    assigned_to TEXT NOT NULL,
+    blind INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    reviewer_id TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    score REAL NOT NULL,
+    notes TEXT NOT NULL,
+    FOREIGN KEY (case_id) REFERENCES cases(id)
+);
+CREATE INDEX IF NOT EXISTS idx_review_samples_status_created ON review_samples(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_review_samples_case_status ON review_samples(case_id, status);
+
+CREATE TABLE IF NOT EXISTS holdout_items (
+    id TEXT PRIMARY KEY,
+    case_id TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(case_id, purpose),
+    FOREIGN KEY (case_id) REFERENCES cases(id)
+);
+CREATE INDEX IF NOT EXISTS idx_holdout_items_purpose_created ON holdout_items(purpose, created_at);
+
+CREATE TABLE IF NOT EXISTS eval_runs (
+    id TEXT PRIMARY KEY,
+    dataset_id TEXT NOT NULL,
+    eval_type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    metrics_json TEXT NOT NULL,
+    findings_json TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (dataset_id) REFERENCES datasets(id)
+);
+CREATE INDEX IF NOT EXISTS idx_eval_runs_dataset_created ON eval_runs(dataset_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_eval_runs_status_created ON eval_runs(status, created_at);
+
+CREATE TABLE IF NOT EXISTS reconciliation_reports (
+    id TEXT PRIMARY KEY,
+    scope_type TEXT NOT NULL,
+    scope_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    summary_json TEXT NOT NULL,
+    anomalies_json TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reconciliation_reports_status_created ON reconciliation_reports(status, created_at);
+
+CREATE TABLE IF NOT EXISTS dsr_requests (
+    id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    request_type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    deleted_cases INTEGER NOT NULL,
+    deleted_assets INTEGER NOT NULL,
+    proof_path TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    completed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_dsr_requests_owner_status ON dsr_requests(owner_id, status, created_at);
+
+CREATE TABLE IF NOT EXISTS invoices (
+    id TEXT PRIMARY KEY,
+    order_id TEXT NOT NULL,
+    invoice_no_hash TEXT NOT NULL,
+    invoice_no_suffix TEXT NOT NULL,
+    status TEXT NOT NULL,
+    amount_cents INTEGER NOT NULL,
+    tax_cents INTEGER NOT NULL,
+    currency TEXT NOT NULL,
+    issued_at TEXT NOT NULL,
+    paid_at TEXT,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (order_id) REFERENCES enterprise_orders(id)
+);
+CREATE INDEX IF NOT EXISTS idx_invoices_order_status ON invoices(order_id, status);
+CREATE INDEX IF NOT EXISTS idx_invoices_status_created ON invoices(status, created_at);
+
+CREATE TABLE IF NOT EXISTS sso_provider_configs (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    provider_type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    issuer TEXT NOT NULL,
+    domain TEXT NOT NULL,
+    metadata_json TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    updated_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(tenant_id, provider_type)
+);
+CREATE INDEX IF NOT EXISTS idx_sso_provider_tenant_status ON sso_provider_configs(tenant_id, status);
+
+CREATE TABLE IF NOT EXISTS inboxes (
+    id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    address TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL,
+    allowed_uses_json TEXT NOT NULL,
+    authorization_snapshot_id TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (authorization_snapshot_id) REFERENCES authorization_snapshots(id)
+);
+CREATE INDEX IF NOT EXISTS idx_inboxes_owner_status ON inboxes(owner_id, status, created_at);
+
+CREATE TABLE IF NOT EXISTS inbound_messages (
+    id TEXT PRIMARY KEY,
+    inbox_id TEXT NOT NULL,
+    owner_id TEXT NOT NULL,
+    source_type TEXT NOT NULL,
+    external_id TEXT NOT NULL,
+    sender_hash TEXT NOT NULL,
+    sender_domain TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    status TEXT NOT NULL,
+    raw_path TEXT NOT NULL,
+    raw_hash TEXT NOT NULL,
+    parsed_json TEXT NOT NULL,
+    submission_id TEXT NOT NULL,
+    error TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    processed_at TEXT,
+    UNIQUE(inbox_id, external_id),
+    FOREIGN KEY (inbox_id) REFERENCES inboxes(id)
+);
+CREATE INDEX IF NOT EXISTS idx_inbound_messages_inbox_status ON inbound_messages(inbox_id, status, received_at);
+CREATE INDEX IF NOT EXISTS idx_inbound_messages_owner_status ON inbound_messages(owner_id, status, received_at);
+
+CREATE TABLE IF NOT EXISTS webhook_ingestions (
+    id TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    external_id TEXT NOT NULL,
+    owner_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    payload_hash TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    error TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    processed_at TEXT,
+    UNIQUE(source, external_id)
+);
+CREATE INDEX IF NOT EXISTS idx_webhook_ingestions_source_status ON webhook_ingestions(source, status, received_at);
+
+CREATE TABLE IF NOT EXISTS content_safety_results (
+    id TEXT PRIMARY KEY,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    risk_level TEXT NOT NULL,
+    action TEXT NOT NULL,
+    categories_json TEXT NOT NULL,
+    findings_json TEXT NOT NULL,
+    policy_version TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_content_safety_entity ON content_safety_results(entity_type, entity_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_content_safety_status ON content_safety_results(status, created_at);
+
+CREATE TABLE IF NOT EXISTS compliance_reviews (
+    id TEXT PRIMARY KEY,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    review_type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    risk_level TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    notes TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    assigned_to TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_compliance_reviews_status ON compliance_reviews(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_compliance_reviews_entity ON compliance_reviews(entity_type, entity_id, status);
+
+CREATE TABLE IF NOT EXISTS compliance_tasks (
+    id TEXT PRIMARY KEY,
+    task_type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL,
+    owner TEXT NOT NULL,
+    due_at TEXT NOT NULL,
+    evidence_ref TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_compliance_tasks_status ON compliance_tasks(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_compliance_tasks_type_status ON compliance_tasks(task_type, status);
+
+CREATE TABLE IF NOT EXISTS provider_configs (
+    id TEXT PRIMARY KEY,
+    provider_type TEXT NOT NULL,
+    provider_name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    region TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    endpoint_hash TEXT NOT NULL,
+    credential_ref_hash TEXT NOT NULL,
+    metadata_json TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    updated_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(provider_type, provider_name)
+);
+CREATE INDEX IF NOT EXISTS idx_provider_configs_type_status ON provider_configs(provider_type, status, updated_at);
+
+CREATE TABLE IF NOT EXISTS provider_events (
+    id TEXT PRIMARY KEY,
+    provider_type TEXT NOT NULL,
+    provider_name TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    response_json TEXT NOT NULL,
+    error TEXT NOT NULL,
+    cost_micros INTEGER NOT NULL,
+    latency_ms INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_provider_events_provider ON provider_events(provider_type, provider_name, created_at);
+CREATE INDEX IF NOT EXISTS idx_provider_events_entity ON provider_events(entity_type, entity_id, created_at);
+
+CREATE TABLE IF NOT EXISTS payout_transfers (
+    id TEXT PRIMARY KEY,
+    batch_id TEXT NOT NULL,
+    provider_name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    amount_cents INTEGER NOT NULL,
+    external_reference TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    response_json TEXT NOT NULL,
+    error TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    FOREIGN KEY (batch_id) REFERENCES payout_batches(id)
+);
+CREATE INDEX IF NOT EXISTS idx_payout_transfers_batch_status ON payout_transfers(batch_id, status, created_at);
+
+CREATE TABLE IF NOT EXISTS buyer_usage_reports (
+    id TEXT PRIMARY KEY,
+    grant_id TEXT NOT NULL,
+    order_id TEXT NOT NULL,
+    customer_id TEXT NOT NULL,
+    dataset_id TEXT NOT NULL,
+    external_event_id TEXT NOT NULL,
+    reported_case_count INTEGER NOT NULL,
+    purpose TEXT NOT NULL,
+    status TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(grant_id, external_event_id),
+    FOREIGN KEY (grant_id) REFERENCES dataset_delivery_grants(id)
+);
+CREATE INDEX IF NOT EXISTS idx_buyer_usage_reports_dataset ON buyer_usage_reports(dataset_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_buyer_usage_reports_grant ON buyer_usage_reports(grant_id, created_at);
+
 CREATE TABLE IF NOT EXISTS tenants (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -4801,7 +8020,7 @@ def _case_allowed_for_purpose(case: Dict[str, Any], purpose: str) -> bool:
     return purpose in allowed_uses or (purpose == "commercial_dataset" and "training" in allowed_uses)
 
 
-def _contribution_from_case(case: Dict[str, Any]) -> ContributionWeight:
+def _contribution_from_case(case: Dict[str, Any], source_trust_score: float = 1.0) -> ContributionWeight:
     duplicate_penalty = 0.2 if case["dedup"]["duplicate_status"] != "unique" else 1.0
     license_weight = 1.2 if "training" in case["quality_gate"]["allowed_uses"] else 1.0
     return ContributionWeight(
@@ -4809,12 +8028,71 @@ def _contribution_from_case(case: Dict[str, Any]) -> ContributionWeight:
         contributor_id=case["owner_id"],
         quality_score=case["annotation"]["quality_score"],
         novelty_score=case["dedup"]["novelty_score"],
-        source_trust_score=1.0,
+        source_trust_score=source_trust_score,
         license_weight=license_weight,
         usage_count=1,
         duplicate_penalty=duplicate_penalty,
         reviewed_level=DataReadinessLevel(case["quality_gate"]["drl"]),
     )
+
+
+def _source_trust_score_from_counts(
+    case_count: int,
+    accepted_count: int,
+    rejected_count: int,
+    duplicate_count: int,
+    dispute_count: int,
+    payout_void_count: int,
+) -> float:
+    if case_count <= 0:
+        return 1.0
+    accepted_ratio = accepted_count / max(case_count, 1)
+    rejected_ratio = rejected_count / max(case_count, 1)
+    duplicate_ratio = duplicate_count / max(case_count, 1)
+    score = 0.65 + accepted_ratio * 0.55
+    score -= rejected_ratio * 0.25
+    score -= duplicate_ratio * 0.18
+    score -= min(dispute_count, 5) * 0.04
+    score -= min(payout_void_count, 5) * 0.05
+    return round(max(0.25, min(score, 1.35)), 4)
+
+
+def _default_source_trust_profile(contributor_id: str) -> Dict[str, Any]:
+    return {
+        "contributor_id": contributor_id,
+        "score": 1.0,
+        "case_count": 0,
+        "accepted_count": 0,
+        "rejected_count": 0,
+        "duplicate_count": 0,
+        "dispute_count": 0,
+        "payout_void_count": 0,
+        "last_recalculated_at": "",
+        "created_at": "",
+        "updated_at": "",
+    }
+
+
+def _blind_case_snapshot(case: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "case_id": case["case_id"],
+        "status": case["status"],
+        "redacted_text": case["redacted_text"],
+        "annotation": case["annotation"],
+        "quality_gate": case["quality_gate"],
+        "dedup": {
+            "duplicate_status": case["dedup"].get("duplicate_status"),
+            "novelty_score": case["dedup"].get("novelty_score"),
+        },
+    }
+
+
+def _case_drl_distribution(cases: List[Dict[str, Any]]) -> Dict[str, int]:
+    distribution: Dict[str, int] = {}
+    for case in cases:
+        drl = case["quality_gate"].get("drl", "DRL0")
+        distribution[drl] = distribution.get(drl, 0) + 1
+    return distribution
 
 
 def _assert_review_claim(case: Dict[str, Any], reviewer_id: str) -> None:
@@ -4883,6 +8161,15 @@ def _dataset_artifact_descriptor(artifact: str) -> tuple[str, str, str]:
         raise ValueError("unsupported_dataset_artifact") from exc
 
 
+def _dataset_artifact_uris(dataset: Dict[str, Any]) -> List[str]:
+    uris: List[str] = []
+    for column_name, _, _ in DATASET_ARTIFACTS.values():
+        uri = dataset.get(column_name)
+        if uri:
+            uris.append(uri)
+    return uris
+
+
 def _simhash_from_dedup_json(value: Optional[str]) -> Optional[int]:
     if not value:
         return None
@@ -4921,6 +8208,178 @@ def _clean_dispute_entity_type(value: str) -> str:
     return clean
 
 
+def _clean_sample_type(value: str) -> str:
+    clean = (value or "").strip().lower()
+    allowed = {"random_audit", "risk_audit", "gold_audit", "buyer_dispute", "expert_shadow"}
+    if clean not in allowed:
+        raise ValueError("invalid_review_sample_type")
+    return clean
+
+
+def _clean_sample_decision(value: str) -> str:
+    clean = (value or "").strip().lower()
+    allowed = {"passed", "failed", "escalated"}
+    if clean not in allowed:
+        raise ValueError("invalid_review_sample_decision")
+    return clean
+
+
+def _clean_holdout_purpose(value: str) -> str:
+    clean = (value or "").strip().lower()
+    allowed = {"gold_eval", "training_holdout", "buyer_holdout", "regression"}
+    if clean not in allowed:
+        raise ValueError("invalid_holdout_purpose")
+    return clean
+
+
+def _clean_eval_type(value: str) -> str:
+    clean = (value or "").strip().lower()
+    allowed = {"quality_regression", "privacy_regression", "contract_check", "gold_eval_readiness"}
+    if clean not in allowed:
+        raise ValueError("invalid_eval_type")
+    return clean
+
+
+def _clean_reconciliation_scope(value: str) -> str:
+    clean = (value or "").strip().lower()
+    allowed = {"all", "dataset", "enterprise_order", "payout_batch"}
+    if clean not in allowed:
+        raise ValueError("invalid_reconciliation_scope")
+    return clean
+
+
+def _clean_dsr_request_type(value: str) -> str:
+    clean = (value or "").strip().lower()
+    allowed = {"delete", "restrict", "export"}
+    if clean not in allowed:
+        raise ValueError("invalid_dsr_request_type")
+    return clean
+
+
+def _clean_sso_provider_type(value: str) -> str:
+    clean = (value or "").strip().lower()
+    allowed = {"oidc", "saml", "cas"}
+    if clean not in allowed:
+        raise ValueError("invalid_sso_provider_type")
+    return clean
+
+
+def _clean_sso_status(value: str) -> str:
+    clean = (value or "").strip().lower()
+    allowed = {"active", "disabled", "testing"}
+    if clean not in allowed:
+        raise ValueError("invalid_sso_status")
+    return clean
+
+
+def _clean_domain(value: str) -> str:
+    clean = (value or "").strip().lower().rstrip(".")
+    if "://" in clean or "/" in clean or any(char.isspace() for char in clean):
+        raise ValueError("invalid_domain")
+    labels = clean.split(".")
+    if len(labels) < 2 or any(not label or not label.replace("-", "").isalnum() for label in labels):
+        raise ValueError("invalid_domain")
+    return clean[:160]
+
+
+def _clean_compliance_entity_type(value: str) -> str:
+    clean = (value or "").strip().lower()
+    allowed = {"case", "asset", "dataset", "inbound_message", "enterprise_order", "payout_batch"}
+    if clean not in allowed:
+        raise ValueError("invalid_compliance_entity_type")
+    return clean
+
+
+def _clean_review_type(value: str) -> str:
+    clean = (value or "").strip().lower()
+    allowed = {"content_safety", "privacy", "important_data", "legal", "security", "tax"}
+    if clean not in allowed:
+        raise ValueError("invalid_compliance_review_type")
+    return clean
+
+
+def _clean_risk_level(value: str) -> str:
+    clean = (value or "").strip().lower()
+    allowed = {"low", "medium", "high", "critical"}
+    if clean not in allowed:
+        raise ValueError("invalid_risk_level")
+    return clean
+
+
+def _clean_compliance_decision(value: str) -> str:
+    clean = (value or "").strip().lower()
+    allowed = {"approved", "rejected"}
+    if clean not in allowed:
+        raise ValueError("invalid_compliance_decision")
+    return clean
+
+
+def _clean_provider_type(value: str) -> str:
+    clean = (value or "").strip().lower()
+    allowed = {"llm", "ocr", "asr", "document_parser", "object_storage", "payment", "invoice", "sms", "email", "monitoring"}
+    if clean not in allowed:
+        raise ValueError("invalid_provider_type")
+    return clean
+
+
+def _clean_provider_status(value: str) -> str:
+    clean = (value or "").strip().lower()
+    allowed = {"active", "testing", "disabled"}
+    if clean not in allowed:
+        raise ValueError("invalid_provider_status")
+    return clean
+
+
+def _clean_provider_name(value: str) -> str:
+    clean = (value or "").strip().lower().replace("-", "_")
+    if not clean or not clean.replace("_", "").isalnum() or len(clean) > 80:
+        raise ValueError("invalid_provider_name")
+    return clean
+
+
+def _provider_region_allowed(platform_region: str, provider_region: str) -> bool:
+    platform = (platform_region or "CN").strip().upper().replace("_", "-")
+    provider = (provider_region or "").strip().upper().replace("_", "-")
+    if platform not in {"CN", "CHINA", "MAINLAND-CHINA"} and not platform.startswith("CN-"):
+        return True
+    if not provider:
+        return False
+    return provider in {"CN", "CHINA", "MAINLAND-CHINA"} or provider.startswith("CN-")
+
+
+def _clean_transfer_status(value: str) -> str:
+    clean = (value or "").strip().lower()
+    allowed = {"submitted", "succeeded", "failed"}
+    if clean not in allowed:
+        raise ValueError("invalid_payout_transfer_status")
+    return clean
+
+
+def _clean_compliance_task_type(value: str) -> str:
+    clean = (value or "").strip().lower()
+    allowed = {
+        "icp_filing",
+        "mlps_leveling",
+        "mlps_assessment",
+        "pipl_assessment",
+        "content_safety_policy",
+        "important_data_assessment",
+        "vendor_dpa",
+        "incident_response_drill",
+    }
+    if clean not in allowed:
+        raise ValueError("invalid_compliance_task_type")
+    return clean
+
+
+def _clean_compliance_task_status(value: str) -> str:
+    clean = (value or "").strip().lower()
+    allowed = {"open", "in_progress", "completed", "blocked", "waived"}
+    if clean not in allowed:
+        raise ValueError("invalid_compliance_task_status")
+    return clean
+
+
 def _payout_profile_status(kyc_status: str, tax_status: str, risk_status: str) -> str:
     if _payout_profile_ready(
         {
@@ -4945,10 +8404,70 @@ def _payout_profile_ready(profile: Dict[str, Any]) -> bool:
     )
 
 
+def _reviewer_review_counts(conn: Any, store: LodiaStore, reviewer_id: str) -> Dict[str, int]:
+    rows = store._execute(
+        conn,
+        """
+        SELECT review_type || ':' || decision AS key, COUNT(*) AS value
+        FROM reviews
+        WHERE reviewer_id = ?
+        GROUP BY review_type, decision
+        """,
+        (reviewer_id,),
+    )
+    result = {"total": 0}
+    for row in rows:
+        value = int(row["value"] or 0)
+        result[str(row["key"])] = value
+        result["total"] += value
+    return result
+
+
+def _reviewer_sample_counts(conn: Any, store: LodiaStore, reviewer_id: str) -> Dict[str, int]:
+    rows = store._execute(
+        conn,
+        """
+        SELECT decision AS key, COUNT(*) AS value
+        FROM review_samples
+        WHERE reviewer_id = ? AND status = ?
+        GROUP BY decision
+        """,
+        (reviewer_id, "completed"),
+    )
+    result = {"completed": 0, "passed": 0, "failed": 0, "escalated": 0}
+    for row in rows:
+        key = str(row["key"] or "unknown")
+        value = int(row["value"] or 0)
+        result[key] = value
+        result["completed"] += value
+    return result
+
+
+def _ratio(numerator: int, denominator: int) -> float:
+    return round(float(numerator) / max(int(denominator), 1), 4)
+
+
+def _suffix(value: str, length: int = 6) -> str:
+    clean = (value or "").strip()
+    return clean[-length:] if clean else ""
+
+
 def _single_count(conn: Any, store: LodiaStore, table_name: str) -> int:
     table_name = _safe_metric_identifier(table_name)
     row = store._get_one(conn, f"SELECT COUNT(*) AS value FROM {table_name}")
     return int(row["value"]) if row else 0
+
+
+def _single_count_where(conn: Any, store: LodiaStore, table_name: str, where_column: str, where_value: str) -> int:
+    table_name = _safe_metric_identifier(table_name)
+    where_column = _safe_metric_identifier(where_column)
+    row = store._get_one(conn, f"SELECT COUNT(*) AS value FROM {table_name} WHERE {where_column} = ?", (where_value,))
+    return int(row["value"]) if row else 0
+
+
+def _count_custom(conn: Any, store: LodiaStore, query: str, params: tuple[Any, ...] = ()) -> int:
+    row = store._get_one(conn, query, params)
+    return int(row["value"] or 0) if row else 0
 
 
 def _sum_where(conn: Any, store: LodiaStore, table_name: str, amount_column: str, where_column: str, where_value: str) -> int:
@@ -4976,6 +8495,111 @@ def _count_grouped(conn: Any, store: LodiaStore, table_name: str, columns: List[
         key = ":".join(str(row[column]) for column in safe_columns)
         result[key] = int(row["count"])
     return result
+
+
+def _operational_alert(code: str, severity: str, message: str, **details: Any) -> Dict[str, Any]:
+    return {
+        "code": code,
+        "severity": severity,
+        "message": message,
+        "details": details,
+    }
+
+
+def _review_summary_for_cases(conn: Any, store: LodiaStore, case_ids: List[str]) -> Dict[str, Dict[str, int]]:
+    if not case_ids:
+        return {}
+    placeholders = ",".join("?" for _ in case_ids)
+    rows = store._execute(
+        conn,
+        f"""
+        SELECT case_id, review_type, decision, COUNT(*) AS value
+        FROM reviews
+        WHERE case_id IN ({placeholders})
+        GROUP BY case_id, review_type, decision
+        """,
+        tuple(case_ids),
+    )
+    result: Dict[str, Dict[str, int]] = {case_id: {} for case_id in case_ids}
+    for row in rows:
+        key = f"{row['review_type']}:{row['decision']}"
+        result[row["case_id"]][key] = int(row["value"] or 0)
+    return result
+
+
+def _content_safety_summary_for_cases(conn: Any, store: LodiaStore, case_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+    if not case_ids:
+        return {}
+    placeholders = ",".join("?" for _ in case_ids)
+    rows = store._execute(
+        conn,
+        f"""
+        SELECT entity_id, status, risk_level, action, categories_json, created_at
+        FROM content_safety_results
+        WHERE entity_type = ? AND entity_id IN ({placeholders})
+        ORDER BY created_at DESC
+        """,
+        ("case", *case_ids),
+    )
+    result: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        if row["entity_id"] in result:
+            continue
+        result[row["entity_id"]] = {
+            "status": row["status"],
+            "risk_level": row["risk_level"],
+            "action": row["action"],
+            "categories": loads(row["categories_json"] or "[]"),
+            "created_at": row["created_at"],
+        }
+    return result
+
+
+def _usage_summary_for_dataset(conn: Any, store: LodiaStore, dataset_id: str) -> Dict[str, Any]:
+    row = store._get_one(
+        conn,
+        """
+        SELECT
+          COUNT(*) AS usage_event_count,
+          COALESCE(SUM(gross_revenue_cents), 0) AS gross_revenue_cents,
+          COALESCE(SUM(direct_cost_cents), 0) AS direct_cost_cents
+        FROM usage_events
+        WHERE dataset_id = ?
+        """,
+        (dataset_id,),
+    )
+    gross = int(row["gross_revenue_cents"] or 0) if row else 0
+    costs = int(row["direct_cost_cents"] or 0) if row else 0
+    return {
+        "usage_event_count": int(row["usage_event_count"] or 0) if row else 0,
+        "gross_revenue_cents": gross,
+        "direct_cost_cents": costs,
+        "net_margin_cents": max(gross - costs, 0),
+    }
+
+
+def _payout_summary_for_dataset(conn: Any, store: LodiaStore, dataset_id: str) -> Dict[str, Any]:
+    rows = store._execute(
+        conn,
+        """
+        SELECT p.status, COUNT(*) AS count, COALESCE(SUM(p.amount_cents), 0) AS amount_cents
+        FROM payout_events p
+        JOIN usage_events u ON u.id = p.usage_event_id
+        WHERE u.dataset_id = ?
+        GROUP BY p.status
+        """,
+        (dataset_id,),
+    )
+    by_status: Dict[str, Dict[str, int]] = {}
+    total = 0
+    for row in rows:
+        amount = int(row["amount_cents"] or 0)
+        by_status[row["status"]] = {"count": int(row["count"] or 0), "amount_cents": amount}
+        total += amount
+    return {
+        "contributor_pool_cents": total,
+        "by_status": by_status,
+    }
 
 
 def _safe_metric_identifier(value: str) -> str:

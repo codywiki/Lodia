@@ -21,6 +21,8 @@ def process_one(store: Optional[LodiaStore] = None, queue_name: str = "ingestion
             active_store.process_asset(job["payload"]["asset_id"], actor_id=worker_id)
         elif job["job_type"] == "extract_asset":
             active_store.process_asset_extraction(job["payload"]["asset_id"], actor_id=worker_id)
+        elif job["job_type"] == "run_maintenance":
+            active_store.run_maintenance(limit=int(job["payload"].get("limit", 100)), actor_id=worker_id)
         else:
             raise ValueError(f"unsupported_job_type:{job['job_type']}")
         active_store.complete_job(job["id"], worker_id=worker_id)

@@ -164,6 +164,7 @@ type ContributorDashboard = {
     total_cents: number;
     payout_count: number;
   };
+  source_trust?: SourceTrustProfile;
 };
 
 type EnterpriseCustomer = {
@@ -233,6 +234,169 @@ type Dispute = {
   held_payout_count: number;
 };
 
+type SourceTrustProfile = {
+  contributor_id: string;
+  score: number;
+  case_count: number;
+  accepted_count: number;
+  rejected_count: number;
+  duplicate_count: number;
+};
+
+type ReviewSample = {
+  id: string;
+  case_id: string;
+  sample_type: string;
+  status: string;
+  blind: boolean;
+  decision: string;
+  score: number;
+};
+
+type EvalRun = {
+  id: string;
+  dataset_id: string;
+  status: string;
+  metrics: { case_count: number; holdout_overlap_count: number; duplicate_count: number };
+  findings: Array<{ code: string; severity: string }>;
+};
+
+type ReconciliationReport = {
+  id: string;
+  status: string;
+  summary: { anomaly_count: number };
+  anomalies: Array<{ code: string }>;
+};
+
+type DsrRequest = {
+  id: string;
+  owner_id: string;
+  request_type: string;
+  status: string;
+  deleted_cases: number;
+  deleted_assets: number;
+};
+
+type Invoice = {
+  id: string;
+  order_id: string;
+  invoice_no_suffix: string;
+  status: string;
+  amount_cents: number;
+  tax_cents: number;
+};
+
+type SsoProviderConfig = {
+  id: string;
+  tenant_id: string;
+  provider_type: string;
+  status: string;
+  domain: string;
+};
+
+type Inbox = {
+  id: string;
+  owner_id: string;
+  address: string;
+  status: string;
+};
+
+type InboundMessage = {
+  id: string;
+  inbox_id: string;
+  owner_id: string;
+  status: string;
+  subject: string;
+  submission_id: string;
+};
+
+type WebhookIngestion = {
+  id: string;
+  source: string;
+  owner_id: string;
+  status: string;
+};
+
+type ContentSafetyResult = {
+  id: string;
+  entity_type: string;
+  entity_id: string;
+  status: string;
+  risk_level: string;
+  action: string;
+  categories: string[];
+};
+
+type ComplianceTask = {
+  id: string;
+  task_type: string;
+  status: string;
+  title: string;
+};
+
+type LaunchReadiness = {
+  ready: boolean;
+  blockers: Array<{ code: string; count?: number; items?: Array<string | Record<string, unknown>> }>;
+  signals?: {
+    schema_migrations_ok?: boolean;
+    schema_migrations_applied?: number;
+    schema_migrations_expected?: number;
+  };
+};
+
+type MigrationStatus = {
+  ok: boolean;
+  latest_expected: string;
+  latest_applied: string;
+  missing_versions: string[];
+};
+
+type ProviderConfig = {
+  id: string;
+  provider_type: string;
+  provider_name: string;
+  status: string;
+  mode: string;
+};
+
+type PayoutTransfer = {
+  id: string;
+  batch_id: string;
+  provider_name: string;
+  status: string;
+  amount_cents: number;
+};
+
+type BuyerUsageReport = {
+  id: string;
+  grant_id: string;
+  status: string;
+  reported_case_count: number;
+};
+
+type OperationalAlerts = {
+  ok: boolean;
+  alert_count: number;
+  critical_count: number;
+};
+
+type MaintenanceResult = {
+  status: string;
+  raw: { purged_count: number };
+  upload_sessions: { expired_count: number };
+  remaining_critical_count: number;
+};
+
+type CommercialProof = {
+  dataset_id: string;
+  proof_hash: string;
+  case_count: number;
+  commercial_checks: {
+    all_authorizations_active: boolean;
+    artifact_hashes_present: boolean;
+  };
+};
+
 const metrics = [
   { label: "Raw 隔离", value: "100%", icon: LockKeyhole },
   { label: "自动处理", value: "92%", icon: Sparkles },
@@ -277,6 +441,26 @@ function App() {
   const [tenantQuota, setTenantQuota] = useState<TenantQuota | null>(null);
   const [dispute, setDispute] = useState<Dispute | null>(null);
   const [payoutProfile, setPayoutProfile] = useState<PayoutProfile | null>(null);
+  const [sourceTrust, setSourceTrust] = useState<SourceTrustProfile | null>(null);
+  const [reviewSamples, setReviewSamples] = useState<ReviewSample[]>([]);
+  const [evalRun, setEvalRun] = useState<EvalRun | null>(null);
+  const [reconciliation, setReconciliation] = useState<ReconciliationReport | null>(null);
+  const [dsrRequest, setDsrRequest] = useState<DsrRequest | null>(null);
+  const [invoice, setInvoice] = useState<Invoice | null>(null);
+  const [ssoProvider, setSsoProvider] = useState<SsoProviderConfig | null>(null);
+  const [inbox, setInbox] = useState<Inbox | null>(null);
+  const [inboundMessage, setInboundMessage] = useState<InboundMessage | null>(null);
+  const [webhookIngestion, setWebhookIngestion] = useState<WebhookIngestion | null>(null);
+  const [contentSafety, setContentSafety] = useState<ContentSafetyResult | null>(null);
+  const [complianceTask, setComplianceTask] = useState<ComplianceTask | null>(null);
+  const [launchReadiness, setLaunchReadiness] = useState<LaunchReadiness | null>(null);
+  const [migrationStatus, setMigrationStatus] = useState<MigrationStatus | null>(null);
+  const [providerConfig, setProviderConfig] = useState<ProviderConfig | null>(null);
+  const [payoutTransfer, setPayoutTransfer] = useState<PayoutTransfer | null>(null);
+  const [buyerUsageReport, setBuyerUsageReport] = useState<BuyerUsageReport | null>(null);
+  const [operationalAlerts, setOperationalAlerts] = useState<OperationalAlerts | null>(null);
+  const [maintenanceResult, setMaintenanceResult] = useState<MaintenanceResult | null>(null);
+  const [commercialProof, setCommercialProof] = useState<CommercialProof | null>(null);
   const [apiToken, setApiToken] = useState("");
   const [loginEmail, setLoginEmail] = useState("contributor@lodia.local");
   const [loginPassword, setLoginPassword] = useState("");
@@ -783,6 +967,337 @@ function App() {
         }),
       });
       setDispute(await response.json());
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function refreshCurrentSourceTrust() {
+    const contributorId = caseItem?.owner_id || contributorDashboard?.contributor_id || "demo_contributor";
+    setLoading(true);
+    try {
+      const response = await fetch(apiUrl(`/api/admin/source-trust/${contributorId}/refresh`), {
+        method: "POST",
+        headers: requestHeaders(apiToken, false),
+      });
+      setSourceTrust(await response.json());
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function scheduleReviewSamples() {
+    setLoading(true);
+    try {
+      const response = await fetch(apiUrl("/api/admin/review-samples/schedule"), {
+        method: "POST",
+        headers: requestHeaders(apiToken),
+        body: JSON.stringify({ sample_type: "random_audit", limit: 5, min_drl: "DRL3", reason: "Console audit" }),
+      });
+      const payload = await response.json();
+      setReviewSamples(payload.items || []);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function completeFirstReviewSample() {
+    const sample = reviewSamples[0];
+    if (!sample) return;
+    setLoading(true);
+    try {
+      const response = await fetch(apiUrl(`/api/review-samples/${sample.id}/complete`), {
+        method: "POST",
+        headers: requestHeaders(apiToken),
+        body: JSON.stringify({ decision: "passed", score: 0.95, notes: "Console sample accepted" }),
+      });
+      const completed = await response.json();
+      setReviewSamples([completed, ...reviewSamples.slice(1)]);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function runCurrentDatasetEvaluation() {
+    if (!dataset) return;
+    setLoading(true);
+    try {
+      const response = await fetch(apiUrl(`/api/admin/datasets/${dataset.id}/evaluate`), {
+        method: "POST",
+        headers: requestHeaders(apiToken),
+        body: JSON.stringify({ eval_type: "quality_regression" }),
+      });
+      setEvalRun(await response.json());
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function runCurrentReconciliation() {
+    setLoading(true);
+    try {
+      const response = await fetch(apiUrl("/api/admin/reconciliation"), {
+        method: "POST",
+        headers: requestHeaders(apiToken),
+        body: JSON.stringify({ scope_type: enterpriseOrder ? "enterprise_order" : "all", scope_id: enterpriseOrder?.id || "" }),
+      });
+      setReconciliation(await response.json());
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function createAndFulfillDsr() {
+    const ownerId = caseItem?.owner_id || "demo_contributor";
+    setLoading(true);
+    try {
+      const created = await fetch(apiUrl("/api/admin/dsr"), {
+        method: "POST",
+        headers: requestHeaders(apiToken),
+        body: JSON.stringify({ owner_id: ownerId, request_type: "restrict", reason: "Console DSR drill" }),
+      });
+      const request = await created.json();
+      const fulfilled = await fetch(apiUrl(`/api/admin/dsr/${request.id}/fulfill`), {
+        method: "POST",
+        headers: requestHeaders(apiToken, false),
+      });
+      setDsrRequest(await fulfilled.json());
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function issueAndPayInvoice() {
+    if (!enterpriseOrder) return;
+    setLoading(true);
+    try {
+      const created = await fetch(apiUrl("/api/admin/invoices"), {
+        method: "POST",
+        headers: requestHeaders(apiToken),
+        body: JSON.stringify({
+          order_id: enterpriseOrder.id,
+          invoice_no: `INV-${Date.now()}`,
+          amount_cents: enterpriseOrder.gross_revenue_cents,
+          tax_cents: Math.round(enterpriseOrder.gross_revenue_cents * 0.06),
+        }),
+      });
+      const createdInvoice = await created.json();
+      const paid = await fetch(apiUrl(`/api/admin/invoices/${createdInvoice.id}/paid`), {
+        method: "POST",
+        headers: requestHeaders(apiToken, false),
+      });
+      setInvoice(await paid.json());
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function upsertDemoSsoProvider() {
+    setLoading(true);
+    try {
+      const tenantId = enterpriseCustomers[0]?.tenant_id || "default";
+      const response = await fetch(apiUrl("/api/admin/sso-providers"), {
+        method: "POST",
+        headers: requestHeaders(apiToken),
+        body: JSON.stringify({
+          tenant_id: tenantId,
+          provider_type: "oidc",
+          issuer: "https://sso.example.com",
+          domain: "example.com",
+          metadata: { client_id_ref: "hash-only" },
+          status: "testing",
+        }),
+      });
+      setSsoProvider(await response.json());
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function createInboxAndReceiveCase() {
+    setLoading(true);
+    try {
+      const created = await fetch(apiUrl("/api/admin/inboxes"), {
+        method: "POST",
+        headers: requestHeaders(apiToken),
+        body: JSON.stringify({
+          owner_id: caseItem?.owner_id || "demo_contributor",
+          allowed_uses: ["private_library", "candidate_pool", "commercial_dataset", "training"],
+        }),
+      });
+      const createdInbox = await created.json();
+      setInbox(createdInbox);
+      const received = await fetch(apiUrl("/api/admin/inbound/messages"), {
+        method: "POST",
+        headers: requestHeaders(apiToken),
+        body: JSON.stringify({
+          recipient: createdInbox.address,
+          message_id: `<console-${Date.now()}@lodia.local>`,
+          sender: "contributor@example.com",
+          subject: "Console inbound case",
+          body_text: text,
+          enqueue: false,
+        }),
+      });
+      setInboundMessage(await received.json());
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function ingestWebhookCase() {
+    setLoading(true);
+    try {
+      const response = await fetch(apiUrl("/api/admin/webhook-cases"), {
+        method: "POST",
+        headers: requestHeaders(apiToken),
+        body: JSON.stringify({
+          source: "console",
+          external_id: `console-${Date.now()}`,
+          owner_id: "demo_contributor",
+          text,
+          allowed_uses: ["private_library", "candidate_pool", "commercial_dataset", "training"],
+          enqueue: false,
+        }),
+      });
+      setWebhookIngestion(await response.json());
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function runCurrentContentSafety() {
+    if (!caseItem) return;
+    setLoading(true);
+    try {
+      const response = await fetch(apiUrl(`/api/admin/content-safety/case/${caseItem.case_id}/run`), {
+        method: "POST",
+        headers: requestHeaders(apiToken, false),
+      });
+      setContentSafety(await response.json());
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function configureP0Readiness() {
+    setLoading(true);
+    try {
+      const providerTypes = ["llm", "ocr", "asr", "object_storage", "payment", "invoice"];
+      let lastProvider: ProviderConfig | null = null;
+      for (const providerType of providerTypes) {
+        const response = await fetch(apiUrl("/api/admin/provider-configs"), {
+          method: "POST",
+          headers: requestHeaders(apiToken),
+          body: JSON.stringify({
+            provider_type: providerType,
+            provider_name: `mock_${providerType}`,
+            status: "active",
+            mode: "mock",
+            metadata: { console_configured: true },
+          }),
+        });
+        lastProvider = await response.json();
+      }
+      if (lastProvider) setProviderConfig(lastProvider);
+      const taskTypes = ["icp_filing", "mlps_leveling", "pipl_assessment", "content_safety_policy"];
+      let lastTask: ComplianceTask | null = null;
+      for (const taskType of taskTypes) {
+        const created = await fetch(apiUrl("/api/admin/compliance-tasks"), {
+          method: "POST",
+          headers: requestHeaders(apiToken),
+          body: JSON.stringify({ task_type: taskType, title: `${taskType} evidence`, evidence_ref: `audit://${taskType}` }),
+        });
+        const task = await created.json();
+        const completed = await fetch(apiUrl(`/api/admin/compliance-tasks/${task.id}`), {
+          method: "POST",
+          headers: requestHeaders(apiToken),
+          body: JSON.stringify({ status: "completed", evidence_ref: `audit://${taskType}` }),
+        });
+        lastTask = await completed.json();
+      }
+      if (lastTask) setComplianceTask(lastTask);
+      const migrations = await fetch(apiUrl("/api/admin/migrations/status"), { headers: requestHeaders(apiToken, false) });
+      setMigrationStatus(await migrations.json());
+      const readiness = await fetch(apiUrl("/api/admin/launch-readiness"), { headers: requestHeaders(apiToken, false) });
+      setLaunchReadiness(await readiness.json());
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function loadOperationalAlerts() {
+    setLoading(true);
+    try {
+      const response = await fetch(apiUrl("/api/admin/operational-alerts"), { headers: requestHeaders(apiToken, false) });
+      setOperationalAlerts(await response.json());
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function runMaintenance() {
+    setLoading(true);
+    try {
+      const response = await fetch(apiUrl("/api/admin/maintenance/run?limit=100"), {
+        method: "POST",
+        headers: requestHeaders(apiToken, false),
+      });
+      setMaintenanceResult(await response.json());
+      const alerts = await fetch(apiUrl("/api/admin/operational-alerts"), { headers: requestHeaders(apiToken, false) });
+      setOperationalAlerts(await alerts.json());
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function loadCommercialProof() {
+    if (!dataset) return;
+    setLoading(true);
+    try {
+      const response = await fetch(apiUrl(`/api/admin/datasets/${dataset.id}/commercial-proof`), { headers: requestHeaders(apiToken, false) });
+      setCommercialProof(await response.json());
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function submitAndConfirmPayoutTransfer() {
+    if (!payoutBatch) return;
+    setLoading(true);
+    try {
+      const submitted = await fetch(apiUrl("/api/admin/payout-transfers"), {
+        method: "POST",
+        headers: requestHeaders(apiToken),
+        body: JSON.stringify({ batch_id: payoutBatch.id, provider_name: "mock_payout" }),
+      });
+      const transfer = await submitted.json();
+      const confirmed = await fetch(apiUrl(`/api/admin/payout-transfers/${transfer.id}/confirm`), {
+        method: "POST",
+        headers: requestHeaders(apiToken),
+        body: JSON.stringify({ status: "succeeded", external_reference: `PAY-${Date.now()}`, response: { receipt: "ok" } }),
+      });
+      setPayoutTransfer(await confirmed.json());
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function recordBuyerUsageReport() {
+    if (!deliveryGrant || !dataset) return;
+    setLoading(true);
+    try {
+      const response = await fetch(apiUrl("/api/admin/buyer-usage-reports"), {
+        method: "POST",
+        headers: requestHeaders(apiToken),
+        body: JSON.stringify({
+          grant_id: deliveryGrant.id,
+          external_event_id: `usage-${Date.now()}`,
+          reported_case_count: dataset.case_ids.length,
+          payload: { source: "console" },
+        }),
+      });
+      setBuyerUsageReport(await response.json());
     } finally {
       setLoading(false);
     }
@@ -1339,6 +1854,237 @@ function App() {
                   </div>
                 ) : null}
               </div>
+            ) : null}
+          </div>
+        </section>
+
+        <section className="split lower-split">
+          <div className="panel">
+            <div className="panel-heading">
+              <Activity size={18} />
+              <h2>P0 入口</h2>
+            </div>
+            <div className="action-row">
+              <button className="secondary-action" onClick={createInboxAndReceiveCase} disabled={loading}>
+                收件箱入库
+              </button>
+              <button className="secondary-action" onClick={ingestWebhookCase} disabled={loading}>
+                Webhook 入库
+              </button>
+              <button className="secondary-action" onClick={runCurrentContentSafety} disabled={loading || !caseItem}>
+                内容安全
+              </button>
+            </div>
+            <div className="result-stack">
+              {inbox ? (
+                <div className="result-row">
+                  <span>Inbox</span>
+                  <strong>{inbox.status} · {inbox.address}</strong>
+                </div>
+              ) : null}
+              {inboundMessage ? (
+                <div className="result-row">
+                  <span>Inbound</span>
+                  <strong>{inboundMessage.status} · {inboundMessage.submission_id || inboundMessage.subject}</strong>
+                </div>
+              ) : null}
+              {webhookIngestion ? (
+                <div className="result-row">
+                  <span>Webhook</span>
+                  <strong>{webhookIngestion.status} · {webhookIngestion.source}</strong>
+                </div>
+              ) : null}
+              {contentSafety ? (
+                <div className="result-row">
+                  <span>Safety</span>
+                  <strong>{contentSafety.status} · {contentSafety.action}</strong>
+                </div>
+              ) : null}
+            </div>
+            {!inbox && !inboundMessage && !webhookIngestion && !contentSafety ? (
+              <p className="empty-state">邮件、Webhook 和内容安全结果会绑定 Case、审计和后续合规复核。</p>
+            ) : null}
+          </div>
+
+          <div className="panel">
+            <div className="panel-heading">
+              <ShieldCheck size={18} />
+              <h2>P0 准入</h2>
+            </div>
+            <div className="action-row">
+              <button className="secondary-action" onClick={configureP0Readiness} disabled={loading}>
+                准入检查
+              </button>
+              <button className="secondary-action" onClick={submitAndConfirmPayoutTransfer} disabled={loading || !payoutBatch}>
+                转账回单
+              </button>
+              <button className="secondary-action" onClick={recordBuyerUsageReport} disabled={loading || !deliveryGrant || !dataset}>
+                使用回传
+              </button>
+              <button className="secondary-action" onClick={loadOperationalAlerts} disabled={loading}>
+                运营告警
+              </button>
+              <button className="secondary-action" onClick={runMaintenance} disabled={loading}>
+                维护任务
+              </button>
+              <button className="secondary-action" onClick={loadCommercialProof} disabled={loading || !dataset}>
+                商用证明
+              </button>
+            </div>
+            <div className="result-stack">
+              {launchReadiness ? (
+                <div className="result-row">
+                  <span>Launch</span>
+                  <strong>{launchReadiness.ready ? "ready" : `${launchReadiness.blockers.length} blockers`}</strong>
+                </div>
+              ) : null}
+              {migrationStatus ? (
+                <div className="result-row">
+                  <span>Schema</span>
+                  <strong>{migrationStatus.ok ? "current" : `${migrationStatus.missing_versions.length} missing`}</strong>
+                </div>
+              ) : null}
+              {providerConfig ? (
+                <div className="result-row">
+                  <span>Provider</span>
+                  <strong>{providerConfig.status} · {providerConfig.provider_type}</strong>
+                </div>
+              ) : null}
+              {complianceTask ? (
+                <div className="result-row">
+                  <span>Task</span>
+                  <strong>{complianceTask.status} · {complianceTask.task_type}</strong>
+                </div>
+              ) : null}
+              {payoutTransfer ? (
+                <div className="result-row">
+                  <span>Transfer</span>
+                  <strong>{payoutTransfer.status} · {formatMoney(payoutTransfer.amount_cents)}</strong>
+                </div>
+              ) : null}
+              {buyerUsageReport ? (
+                <div className="result-row">
+                  <span>Usage</span>
+                  <strong>{buyerUsageReport.status} · {buyerUsageReport.reported_case_count} cases</strong>
+                </div>
+              ) : null}
+              {operationalAlerts ? (
+                <div className="result-row">
+                  <span>Alerts</span>
+                  <strong>{operationalAlerts.critical_count} critical · {operationalAlerts.alert_count} total</strong>
+                </div>
+              ) : null}
+              {maintenanceResult ? (
+                <div className="result-row">
+                  <span>Maintenance</span>
+                  <strong>{maintenanceResult.status} · raw {maintenanceResult.raw.purged_count} · upload {maintenanceResult.upload_sessions.expired_count}</strong>
+                </div>
+              ) : null}
+              {commercialProof ? (
+                <div className="result-row">
+                  <span>Proof</span>
+                  <strong>{commercialProof.case_count} cases · {commercialProof.proof_hash.slice(0, 10)}</strong>
+                </div>
+              ) : null}
+            </div>
+            {!launchReadiness && !migrationStatus && !providerConfig && !payoutTransfer && !buyerUsageReport && !operationalAlerts && !maintenanceResult && !commercialProof ? (
+              <p className="empty-state">迁移状态、供应商、备案任务、支付回单、运营告警、维护任务和商用证明共同构成上线前准入证据。</p>
+            ) : null}
+          </div>
+        </section>
+
+        <section className="split lower-split">
+          <div className="panel">
+            <div className="panel-heading">
+              <ShieldCheck size={18} />
+              <h2>质量运营</h2>
+            </div>
+            <div className="action-row">
+              <button className="secondary-action" onClick={refreshCurrentSourceTrust} disabled={loading}>
+                来源可信度
+              </button>
+              <button className="secondary-action" onClick={scheduleReviewSamples} disabled={loading}>
+                抽检排队
+              </button>
+              <button className="secondary-action" onClick={completeFirstReviewSample} disabled={loading || !reviewSamples.length}>
+                完成抽检
+              </button>
+              <button className="secondary-action" onClick={runCurrentDatasetEvaluation} disabled={loading || !dataset}>
+                数据评测
+              </button>
+              <button className="secondary-action" onClick={runCurrentReconciliation} disabled={loading}>
+                对账
+              </button>
+            </div>
+            <div className="result-stack">
+              {sourceTrust ? (
+                <div className="result-row">
+                  <span>可信度</span>
+                  <strong>{sourceTrust.score.toFixed(2)} · {sourceTrust.accepted_count}/{sourceTrust.case_count}</strong>
+                </div>
+              ) : null}
+              {reviewSamples.length ? (
+                <div className="result-row">
+                  <span>抽检</span>
+                  <strong>{reviewSamples[0].status} · {reviewSamples[0].sample_type}</strong>
+                </div>
+              ) : null}
+              {evalRun ? (
+                <div className="result-row">
+                  <span>评测</span>
+                  <strong>{evalRun.status} · {evalRun.findings.length} findings</strong>
+                </div>
+              ) : null}
+              {reconciliation ? (
+                <div className="result-row">
+                  <span>对账</span>
+                  <strong>{reconciliation.status} · {reconciliation.summary.anomaly_count} anomalies</strong>
+                </div>
+              ) : null}
+            </div>
+            {!sourceTrust && !reviewSamples.length && !evalRun && !reconciliation ? (
+              <p className="empty-state">抽检、盲审、来源可信度、数据评测和订单分账对账共同决定数据是否能稳定商用。</p>
+            ) : null}
+          </div>
+
+          <div className="panel">
+            <div className="panel-heading">
+              <LockKeyhole size={18} />
+              <h2>合规运营</h2>
+            </div>
+            <div className="action-row">
+              <button className="secondary-action" onClick={createAndFulfillDsr} disabled={loading}>
+                DSR 演练
+              </button>
+              <button className="secondary-action" onClick={issueAndPayInvoice} disabled={loading || !enterpriseOrder}>
+                发票回款
+              </button>
+              <button className="secondary-action" onClick={upsertDemoSsoProvider} disabled={loading}>
+                SSO 配置
+              </button>
+            </div>
+            <div className="result-stack">
+              {dsrRequest ? (
+                <div className="result-row">
+                  <span>DSR</span>
+                  <strong>{dsrRequest.status} · cases {dsrRequest.deleted_cases}</strong>
+                </div>
+              ) : null}
+              {invoice ? (
+                <div className="result-row">
+                  <span>发票</span>
+                  <strong>{invoice.status} · {formatMoney(invoice.amount_cents + invoice.tax_cents)}</strong>
+                </div>
+              ) : null}
+              {ssoProvider ? (
+                <div className="result-row">
+                  <span>SSO</span>
+                  <strong>{ssoProvider.status} · {ssoProvider.provider_type} · {ssoProvider.domain}</strong>
+                </div>
+              ) : null}
+            </div>
+            {!dsrRequest && !invoice && !ssoProvider ? (
+              <p className="empty-state">中国区独立运营需要把数据主体权利、发票税务、企业身份接入都沉到审计链路里。</p>
             ) : null}
           </div>
         </section>

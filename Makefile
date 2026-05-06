@@ -1,4 +1,4 @@
-.PHONY: api-install api-test api-dev web-dev up
+.PHONY: api-install api-test api-dev api-manage web-dev up
 
 .venv:
 	python3 -m venv .venv
@@ -11,6 +11,9 @@ api-test: api-install
 
 api-dev: api-install
 	cd apps/api && ../../.venv/bin/uvicorn main:app --reload --host 0.0.0.0 --port 8000
+
+api-manage: api-install
+	cd apps/api && ../../.venv/bin/python manage.py
 
 web-dev:
 	cd apps/web && npm install && npm run dev

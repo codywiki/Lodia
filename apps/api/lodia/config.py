@@ -61,6 +61,9 @@ class LodiaSettings:
     dataset_max_cases: int
     delivery_grant_ttl_hours: int
     require_payout_profile_for_settlement: bool
+    inbound_domain: str
+    inbound_gateway_token: Optional[str]
+    provider_adapter_mode: str
 
     @classmethod
     def from_env(cls, data_dir: Optional[str] = None) -> "LodiaSettings":
@@ -112,6 +115,9 @@ class LodiaSettings:
                 os.environ.get("LODIA_REQUIRE_PAYOUT_PROFILE_FOR_SETTLEMENT"),
                 default=env.lower() == "production",
             ),
+            inbound_domain=os.environ.get("LODIA_INBOUND_DOMAIN", "inbox.lodia.local").strip().lower(),
+            inbound_gateway_token=os.environ.get("LODIA_INBOUND_GATEWAY_TOKEN"),
+            provider_adapter_mode=os.environ.get("LODIA_PROVIDER_ADAPTER_MODE", "mock").strip().lower(),
         )
 
     @property
