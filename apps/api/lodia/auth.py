@@ -14,6 +14,7 @@ class AuthContext:
     subject_id: str
     roles: Set[str]
     auth_mode: str
+    tenant_id: str = "default"
 
     def has_any_role(self, required_roles: Iterable[str]) -> bool:
         required = set(required_roles)
@@ -25,6 +26,7 @@ class TokenPrincipal:
     subject_id: str
     roles: Set[str]
     token_id: Optional[str] = None
+    tenant_id: str = "default"
 
 
 class AuthManager:
@@ -48,6 +50,7 @@ class AuthManager:
                 subject_id="demo_actor",
                 roles={"admin", "reviewer", "contributor"},
                 auth_mode="development",
+                tenant_id="default",
             )
 
         token = _extract_bearer_token(authorization)
@@ -58,7 +61,7 @@ class AuthManager:
         if not principal:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_bearer_token")
 
-        context = AuthContext(subject_id=principal.subject_id, roles=principal.roles, auth_mode="token")
+        context = AuthContext(subject_id=principal.subject_id, roles=principal.roles, auth_mode="token", tenant_id=principal.tenant_id)
         if not context.has_any_role(required_roles):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="insufficient_role")
         return context
@@ -74,6 +77,7 @@ class AuthManager:
                     subject_id=resolved["subject_id"],
                     roles=set(resolved["roles"]),
                     token_id=resolved.get("token_id"),
+                    tenant_id=resolved.get("tenant_id", "default"),
                 )
         return None
 
@@ -87,8 +91,9 @@ def _parse_token_specs(specs: Iterable[str]) -> Dict[str, TokenPrincipal]:
         token = parts[0].strip()
         roles = {role.strip() for role in parts[1].split(",") if role.strip()}
         subject_id = parts[2].strip() if len(parts) >= 3 and parts[2].strip() else "service_account"
+        tenant_id = parts[3].strip() if len(parts) >= 4 and parts[3].strip() else "default"
         if token and roles:
-            tokens[token] = TokenPrincipal(subject_id=subject_id, roles=roles)
+            tokens[token] = TokenPrincipal(subject_id=subject_id, roles=roles, tenant_id=tenant_id)
     return tokens
 
 

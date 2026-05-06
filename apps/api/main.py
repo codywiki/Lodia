@@ -7,7 +7,7 @@ from typing import List, Optional, Tuple
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 from starlette.requests import Request
 
@@ -46,6 +46,16 @@ class ConsentWithdrawRequest(BaseModel):
     reason: str = Field(default="", max_length=2_000)
 
 
+class AssetUploadSessionRequest(BaseModel):
+    owner_id: str = Field(default="demo_contributor", max_length=128)
+    filename: str = Field(min_length=1, max_length=240)
+    media_type: str = Field(default="application/octet-stream", max_length=160)
+    byte_size: int = Field(gt=0, le=10_000_000_000)
+    allowed_uses: List[str] = Field(default_factory=lambda: ["private_library", "candidate_pool"])
+    authorization_snapshot_id: Optional[str] = Field(default=None, max_length=128)
+    expires_in_seconds: Optional[int] = Field(default=None, ge=60, le=86_400)
+
+
 class ReviewRequest(BaseModel):
     reviewer_id: str = Field(default="reviewer_demo", max_length=128)
     notes: str = Field(default="", max_length=2_000)
@@ -72,10 +82,16 @@ class LoginRequest(BaseModel):
 
 
 class UserCreateRequest(BaseModel):
+    tenant_id: str = Field(default="default", max_length=80)
     email: str = Field(min_length=3, max_length=255)
     password: str = Field(min_length=10, max_length=256)
     display_name: str = Field(default="", max_length=120)
     roles: List[str] = Field(default_factory=lambda: ["contributor"])
+
+
+class TenantCreateRequest(BaseModel):
+    id: str = Field(min_length=1, max_length=80)
+    name: str = Field(min_length=1, max_length=160)
 
 
 class TokenCreateRequest(BaseModel):
@@ -240,7 +256,7 @@ async def login(payload: LoginRequest):
 
 @app.get("/api/auth/me")
 async def me(actor: AuthContext = Depends(require_contributor)):
-    return {"subject_id": actor.subject_id, "roles": sorted(actor.roles), "auth_mode": actor.auth_mode}
+    return {"subject_id": actor.subject_id, "tenant_id": actor.tenant_id, "roles": sorted(actor.roles), "auth_mode": actor.auth_mode}
 
 
 @app.post("/api/admin/users")
@@ -251,6 +267,7 @@ async def create_user(payload: UserCreateRequest, actor: AuthContext = Depends(r
             password=payload.password,
             display_name=payload.display_name,
             roles=payload.roles,
+            tenant_id=payload.tenant_id,
             actor_id=actor.subject_id,
         )
     except ValueError as exc:
@@ -281,6 +298,24 @@ async def create_user_token(user_id: str, payload: TokenCreateRequest, actor: Au
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/admin/tenants")
+async def create_tenant(payload: TenantCreateRequest, actor: AuthContext = Depends(require_admin)):
+    try:
+        return store.create_tenant(payload.id, payload.name, actor_id=actor.subject_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/admin/tenants")
+async def list_tenants(
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    status: Optional[str] = Query(default=None, max_length=40),
+    actor: AuthContext = Depends(require_admin),
+):
+    return _page(store.list_tenants(limit=limit, offset=offset, status=status), limit, offset)
 
 
 @app.post("/api/admin/tokens/{token_id}/revoke")
@@ -335,6 +370,40 @@ async def upload_asset(
             authorization_snapshot_id=authorization_snapshot_id,
         )
         return {**result, "asset": _public_asset(result["asset"])}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/assets/upload-sessions")
+async def create_asset_upload_session(payload: AssetUploadSessionRequest, actor: AuthContext = Depends(require_contributor)):
+    try:
+        result = store.create_asset_upload_session(
+            owner_id=_owner_id(payload.owner_id, actor),
+            filename=payload.filename,
+            media_type=payload.media_type,
+            byte_size=payload.byte_size,
+            allowed_uses=payload.allowed_uses,
+            actor_id=actor.subject_id,
+            authorization_snapshot_id=payload.authorization_snapshot_id,
+            expires_in_seconds=payload.expires_in_seconds,
+        )
+        return {
+            "session": _public_upload_session(result["session"]),
+            "upload": _public_upload_instruction(result["upload"]),
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/assets/upload-sessions/{session_id}/complete")
+async def complete_asset_upload_session(session_id: str, actor: AuthContext = Depends(require_contributor)):
+    try:
+        session = store.get_asset_upload_session(session_id)
+        _assert_readable_owner(session["owner_id"], actor)
+        result = store.complete_asset_upload_session(session_id, actor_id=actor.subject_id)
+        return {**result, "asset": _public_asset(result["asset"])}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -664,6 +733,22 @@ async def list_model_invocations(
     return _page(store.list_model_invocations(limit=limit, offset=offset, entity_id=entity_id, status=status), limit, offset)
 
 
+@app.get("/api/admin/vendor-processing")
+async def list_vendor_processing(
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    entity_id: Optional[str] = Query(default=None, max_length=160),
+    provider: Optional[str] = Query(default=None, max_length=80),
+    actor: AuthContext = Depends(require_admin),
+):
+    return _page(store.list_vendor_processing_records(limit=limit, offset=offset, entity_id=entity_id, provider=provider), limit, offset)
+
+
+@app.get("/api/admin/metrics/prometheus")
+async def prometheus_metrics(actor: AuthContext = Depends(require_admin)):
+    return PlainTextResponse(store.prometheus_metrics(), media_type="text/plain; version=0.0.4")
+
+
 @app.post("/api/admin/approvals")
 async def create_approval(payload: ApprovalRequestPayload, actor: AuthContext = Depends(require_admin)):
     return store.create_approval_request(
@@ -730,6 +815,14 @@ def _parse_allowed_uses(value: str) -> List[str]:
 
 def _public_asset(asset: dict) -> dict:
     return {key: value for key, value in asset.items() if key not in {"raw_path", "extracted_text_path"}}
+
+
+def _public_upload_session(session: dict) -> dict:
+    return {key: value for key, value in session.items() if key not in {"object_key", "object_uri"}}
+
+
+def _public_upload_instruction(upload: dict) -> dict:
+    return {key: value for key, value in upload.items() if key not in {"object_key", "object_uri"}}
 
 
 def _exceeds_body_limit(content_length: str) -> bool:

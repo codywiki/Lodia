@@ -30,6 +30,12 @@ class ObjectStorage(Protocol):
     def delete(self, uri: str) -> None:
         ...
 
+    def object_uri(self, key: str) -> str:
+        ...
+
+    def presign_put(self, key: str, content_type: str, expires_in_seconds: int) -> Dict[str, Any]:
+        ...
+
     def health_check(self) -> Dict[str, Any]:
         ...
 
@@ -59,6 +65,20 @@ class LocalObjectStorage:
         path = self._path_for_uri(uri)
         if path.exists():
             path.unlink()
+
+    def object_uri(self, key: str) -> str:
+        return str(self._path_for_key(key))
+
+    def presign_put(self, key: str, content_type: str, expires_in_seconds: int) -> Dict[str, Any]:
+        return {
+            "method": "PUT",
+            "url": "",
+            "headers": {"Content-Type": content_type},
+            "expires_in_seconds": expires_in_seconds,
+            "direct_upload_supported": False,
+            "object_uri": self.object_uri(key),
+            "object_key": _clean_key(key),
+        }
 
     def health_check(self) -> Dict[str, Any]:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -125,6 +145,36 @@ class S3ObjectStorage:
     def delete(self, uri: str) -> None:
         key = self._key_from_uri(uri)
         self.client.delete_object(Bucket=self.bucket, Key=key)
+
+    def object_uri(self, key: str) -> str:
+        clean = _clean_key(key)
+        object_key = f"{self.prefix}/{clean}" if self.prefix else clean
+        return f"s3://{self.bucket}/{object_key}"
+
+    def presign_put(self, key: str, content_type: str, expires_in_seconds: int) -> Dict[str, Any]:
+        clean = _clean_key(key)
+        object_key = f"{self.prefix}/{clean}" if self.prefix else clean
+        params = {"Bucket": self.bucket, "Key": object_key, "ContentType": content_type}
+        headers = {"Content-Type": content_type}
+        if self.sse_algorithm:
+            params["ServerSideEncryption"] = self.sse_algorithm
+            headers["x-amz-server-side-encryption"] = self.sse_algorithm
+            if self.sse_algorithm == "aws:kms" and self.kms_key_id:
+                params["SSEKMSKeyId"] = self.kms_key_id
+                headers["x-amz-server-side-encryption-aws-kms-key-id"] = self.kms_key_id
+        return {
+            "method": "PUT",
+            "url": self.client.generate_presigned_url(
+                "put_object",
+                Params=params,
+                ExpiresIn=expires_in_seconds,
+            ),
+            "headers": headers,
+            "expires_in_seconds": expires_in_seconds,
+            "direct_upload_supported": True,
+            "object_uri": f"s3://{self.bucket}/{object_key}",
+            "object_key": object_key,
+        }
 
     def health_check(self) -> Dict[str, Any]:
         self.client.head_bucket(Bucket=self.bucket)
