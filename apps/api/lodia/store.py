@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import uuid
 from contextlib import contextmanager
@@ -28,6 +29,13 @@ DRL_ORDER = {
     "DRL3": 3,
     "DRL4": 4,
     "DRL5": 5,
+}
+
+DATASET_ARTIFACTS = {
+    "manifest": ("manifest_path", "application/json", "manifest.json"),
+    "quality_report": ("quality_report_path", "application/json", "quality_report.json"),
+    "data_contract": ("data_contract_path", "application/json", "data_contract.json"),
+    "data": ("data_path", "application/x-ndjson", "data.jsonl"),
 }
 
 
@@ -959,13 +967,23 @@ class LodiaStore:
                 self._audit(conn, actor_id, "case.process_skipped", "case", existing_case["id"], {"reason": "already_processed"})
                 return self._case_from_row(existing_case)
             raw_text = self.objects.read_text(submission["raw_path"])
-            known_hashes = [row["canonical_hash"] for row in self._execute(conn, "SELECT canonical_hash FROM cases")]
+            existing_fingerprints = [
+                row_to_dict(row)
+                for row in self._execute(conn, "SELECT canonical_hash, dedup_json FROM cases")
+            ]
+            known_hashes = [row["canonical_hash"] for row in existing_fingerprints]
+            known_simhashes = [
+                simhash
+                for row in existing_fingerprints
+                if (simhash := _simhash_from_dedup_json(row.get("dedup_json"))) is not None
+            ]
             allowed_uses = loads(submission["allowed_uses_json"])
             processed = process_text_case(
                 raw_text=raw_text,
                 owner_id=submission["owner_id"],
                 allowed_uses=allowed_uses,
                 known_hashes=known_hashes,
+                known_simhashes=known_simhashes,
             )
             case = to_jsonable(processed.case)
             now = _now()
@@ -1036,6 +1054,62 @@ class LodiaStore:
                 )
             ]
 
+    def contributor_dashboard(self, contributor_id: str, limit: int = 10) -> Dict[str, Any]:
+        limit = _bounded_limit(limit, self.settings.max_page_limit)
+        with self._session() as conn:
+            recent_cases = [
+                self._case_from_row(row)
+                for row in self._execute(
+                    conn,
+                    """
+                    SELECT * FROM cases
+                    WHERE owner_id = ?
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (contributor_id, limit),
+                )
+            ]
+            recent_payouts = [
+                row_to_dict(row)
+                for row in self._execute(
+                    conn,
+                    """
+                    SELECT * FROM payout_events
+                    WHERE contributor_id = ?
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (contributor_id, self.settings.max_page_limit),
+                )
+            ]
+            payout_totals = _payout_totals_by_status(conn, self, contributor_id)
+            return {
+                "contributor_id": contributor_id,
+                "cases": {
+                    "total": _owner_count(conn, self, "cases", contributor_id),
+                    "by_status": _owner_count_grouped(conn, self, "cases", "status", contributor_id),
+                    "by_drl": _owner_count_grouped(conn, self, "cases", "drl", contributor_id),
+                    "recent": recent_cases,
+                },
+                "assets": {
+                    "total": _owner_count(conn, self, "assets", contributor_id),
+                    "by_status": _owner_count_grouped(conn, self, "assets", "status", contributor_id),
+                },
+                "authorizations": {
+                    "total": _owner_count(conn, self, "authorization_snapshots", contributor_id),
+                    "by_status": _owner_count_grouped(conn, self, "authorization_snapshots", "status", contributor_id),
+                },
+                "ledger": {
+                    "pending_cents": payout_totals["amounts"].get("pending", 0),
+                    "batched_cents": payout_totals["amounts"].get("batched", 0),
+                    "settled_cents": payout_totals["amounts"].get("settled", 0),
+                    "total_cents": sum(payout_totals["amounts"].values()),
+                    "payout_count": payout_totals["total_count"],
+                    "recent": recent_payouts[:limit],
+                },
+            }
+
     def get_case(self, case_id: str, conn: Optional[Any] = None) -> Dict[str, Any]:
         if conn is None:
             with self._session() as active:
@@ -1050,6 +1124,9 @@ class LodiaStore:
             case = self.get_case(case_id, conn=conn)
             if case["status"] == "withdrawn":
                 raise ValueError("case_withdrawn")
+            if case["status"] == "rejected":
+                raise ValueError("case_rejected")
+            _assert_review_claim(case, reviewer_id)
             if not self._case_authorization_active(conn, case):
                 raise ValueError("authorization_not_active")
             gate = dict(case["quality_gate"])
@@ -1065,7 +1142,7 @@ class LodiaStore:
                 conn,
                 """
                 UPDATE cases
-                SET status = ?, drl = ?, quality_gate_json = ?, updated_at = ?
+                SET status = ?, drl = ?, quality_gate_json = ?, review_claimed_by = NULL, review_claimed_at = NULL, updated_at = ?
                 WHERE id = ?
                 """,
                 (status, "DRL3", dumps(gate), _now(), case_id),
@@ -1095,6 +1172,9 @@ class LodiaStore:
             case = self.get_case(case_id, conn=conn)
             if case["status"] == "withdrawn":
                 raise ValueError("case_withdrawn")
+            if case["status"] == "rejected":
+                raise ValueError("case_rejected")
+            _assert_review_claim(case, reviewer_id)
             if not self._case_authorization_active(conn, case):
                 raise ValueError("authorization_not_active")
             if DRL_ORDER.get(case["quality_gate"]["drl"], 0) < DRL_ORDER["DRL3"]:
@@ -1118,7 +1198,7 @@ class LodiaStore:
                 conn,
                 """
                 UPDATE cases
-                SET status = ?, drl = ?, quality_gate_json = ?, updated_at = ?
+                SET status = ?, drl = ?, quality_gate_json = ?, review_claimed_by = NULL, review_claimed_at = NULL, updated_at = ?
                 WHERE id = ?
                 """,
                 ("commercial_ready", "DRL4", dumps(gate), _now(), case_id),
@@ -1139,6 +1219,9 @@ class LodiaStore:
             case = self.get_case(case_id, conn=conn)
             if case["status"] == "withdrawn":
                 raise ValueError("case_withdrawn")
+            if case["status"] == "rejected":
+                raise ValueError("case_rejected")
+            _assert_review_claim(case, reviewer_id)
             if not self._case_authorization_active(conn, case):
                 raise ValueError("authorization_not_active")
             if "gold_eval" not in case["quality_gate"]["allowed_uses"]:
@@ -1186,7 +1269,7 @@ class LodiaStore:
                 conn,
                 """
                 UPDATE cases
-                SET status = ?, drl = ?, quality_gate_json = ?, updated_at = ?
+                SET status = ?, drl = ?, quality_gate_json = ?, review_claimed_by = NULL, review_claimed_at = NULL, updated_at = ?
                 WHERE id = ?
                 """,
                 ("commercial_ready", drl, dumps(gate), _now(), case_id),
@@ -1196,15 +1279,24 @@ class LodiaStore:
 
     def reject_case(self, case_id: str, reviewer_id: str, reason: str = "") -> Dict[str, Any]:
         with self._session() as conn:
-            self.get_case(case_id, conn=conn)
+            case = self.get_case(case_id, conn=conn)
+            if case["status"] == "withdrawn":
+                raise ValueError("case_withdrawn")
+            _assert_review_claim(case, reviewer_id)
+            gate = dict(case["quality_gate"])
+            required_actions = list(gate.get("required_actions") or [])
+            if "rejected" not in required_actions:
+                required_actions.append("rejected")
+            gate["required_actions"] = required_actions
+            gate["commercial_ready"] = False
             self._execute(
                 conn,
                 """
                 UPDATE cases
-                SET status = ?, updated_at = ?
+                SET status = ?, quality_gate_json = ?, review_claimed_by = NULL, review_claimed_at = NULL, updated_at = ?
                 WHERE id = ?
                 """,
-                ("rejected", _now(), case_id),
+                ("rejected", dumps(gate), _now(), case_id),
             )
             self._execute(
                 conn,
@@ -1268,6 +1360,96 @@ class LodiaStore:
                 )
             ]
 
+    def claim_review_case(self, reviewer_id: str, case_id: Optional[str] = None) -> Dict[str, Any]:
+        now = _now()
+        with self._session() as conn:
+            if case_id:
+                case = self.get_case(case_id, conn=conn)
+                if case["status"] not in {"review_pending", "privacy_review"}:
+                    raise ValueError("case_not_reviewable")
+                if case.get("review_claimed_by") and case["review_claimed_by"] != reviewer_id:
+                    raise ValueError("review_case_claimed_by_other")
+                cursor = self._execute(
+                    conn,
+                    """
+                    UPDATE cases
+                    SET review_claimed_by = ?, review_claimed_at = ?, updated_at = ?
+                    WHERE id = ? AND (review_claimed_by IS NULL OR review_claimed_by = ?)
+                    """,
+                    (reviewer_id, now, now, case_id, reviewer_id),
+                )
+                if cursor.rowcount == 0:
+                    raise ValueError("review_case_claimed_by_other")
+                self._audit(conn, reviewer_id, "review.claimed", "case", case_id, {})
+                return self.get_case(case_id, conn=conn)
+
+            if self.db.use_postgres:
+                row = self._get_one(
+                    conn,
+                    """
+                    UPDATE cases
+                    SET review_claimed_by = ?, review_claimed_at = ?, updated_at = ?
+                    WHERE id = (
+                        SELECT id FROM cases
+                        WHERE status IN (?, ?) AND review_claimed_by IS NULL
+                        ORDER BY quality_score DESC, created_at ASC, id ASC
+                        FOR UPDATE SKIP LOCKED
+                        LIMIT 1
+                    )
+                    RETURNING *
+                    """,
+                    (reviewer_id, now, now, "review_pending", "privacy_review"),
+                )
+                if not row:
+                    raise ValueError("no_review_cases_available")
+                case = self._case_from_row(row)
+                self._audit(conn, reviewer_id, "review.claimed", "case", case["case_id"], {})
+                return case
+
+            row = self._get_one(
+                conn,
+                """
+                SELECT * FROM cases
+                WHERE status IN (?, ?) AND review_claimed_by IS NULL
+                ORDER BY quality_score DESC, created_at ASC, id ASC
+                LIMIT 1
+                """,
+                ("review_pending", "privacy_review"),
+            )
+            if not row:
+                raise ValueError("no_review_cases_available")
+            case_id = row["id"]
+            cursor = self._execute(
+                conn,
+                """
+                UPDATE cases
+                SET review_claimed_by = ?, review_claimed_at = ?, updated_at = ?
+                WHERE id = ? AND review_claimed_by IS NULL
+                """,
+                (reviewer_id, now, now, case_id),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError("review_case_claimed_by_other")
+            self._audit(conn, reviewer_id, "review.claimed", "case", case_id, {})
+            return self.get_case(case_id, conn=conn)
+
+    def release_review_case(self, case_id: str, reviewer_id: str, force: bool = False) -> Dict[str, Any]:
+        with self._session() as conn:
+            case = self.get_case(case_id, conn=conn)
+            if case.get("review_claimed_by") != reviewer_id and not force:
+                raise ValueError("review_case_not_claimed_by_actor")
+            self._execute(
+                conn,
+                """
+                UPDATE cases
+                SET review_claimed_by = NULL, review_claimed_at = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (_now(), case_id),
+            )
+            self._audit(conn, reviewer_id, "review.released", "case", case_id, {"force": force})
+            return self.get_case(case_id, conn=conn)
+
     def create_dataset(
         self,
         name: str,
@@ -1292,11 +1474,11 @@ class LodiaStore:
                     conn,
                     """
                     SELECT * FROM cases
-                    WHERE drl >= ?
+                    WHERE status = ? AND drl >= ?
                     ORDER BY quality_score DESC, created_at ASC, id ASC
                     LIMIT ?
                     """,
-                    (min_drl, max_cases),
+                    ("commercial_ready", min_drl, max_cases),
                 )
                 if DRL_ORDER.get(loads(row["quality_gate_json"])["drl"], 0) >= DRL_ORDER[min_drl]
             ]
@@ -1453,6 +1635,758 @@ class LodiaStore:
         result["case_ids"] = case_ids
         return result
 
+    def list_datasets(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        purpose: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        limit, offset = _page_bounds(limit, offset, self.settings.max_page_limit)
+        filters: List[str] = []
+        params: List[Any] = []
+        if purpose:
+            filters.append("purpose = ?")
+            params.append(purpose)
+        if status:
+            filters.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        params.extend([limit, offset])
+        with self._session() as conn:
+            datasets = [
+                row_to_dict(row)
+                for row in self._execute(
+                    conn,
+                    f"""
+                    SELECT * FROM datasets
+                    {where}
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    tuple(params),
+                )
+            ]
+            for dataset in datasets:
+                dataset["case_ids"] = [
+                    item["case_id"]
+                    for item in self._execute(conn, "SELECT case_id FROM dataset_cases WHERE dataset_id = ?", (dataset["id"],))
+                ]
+            return datasets
+
+    def read_dataset_artifact(self, dataset_id: str, artifact: str, actor_id: str = "system") -> Dict[str, Any]:
+        column_name, media_type, filename = _dataset_artifact_descriptor(artifact)
+        dataset = self.get_dataset(dataset_id)
+        uri = dataset.get(column_name)
+        if not uri:
+            raise ValueError("dataset_artifact_missing")
+        content = self.objects.read_text(uri)
+        with self._session() as conn:
+            self._audit(conn, actor_id, "dataset.artifact_read", "dataset", dataset_id, {"artifact": artifact})
+        return {
+            "dataset_id": dataset_id,
+            "artifact": artifact,
+            "filename": filename,
+            "media_type": media_type,
+            "content": content,
+        }
+
+    def create_enterprise_customer(
+        self,
+        name: str,
+        contact_email: str,
+        tenant_id: str = "default",
+        actor_id: str = "system",
+    ) -> Dict[str, Any]:
+        customer_id = _id("cust")
+        clean_tenant_id = _clean_tenant_id(tenant_id)
+        email = normalize_email(contact_email)
+        if not _valid_contact_email(email):
+            raise ValueError("invalid_contact_email")
+        customer_name = (name or "").strip()
+        if not customer_name:
+            raise ValueError("enterprise_customer_name_required")
+        now = _now()
+        with self._session() as conn:
+            self._ensure_tenant(conn, clean_tenant_id, clean_tenant_id, actor_id=actor_id)
+            self._execute(
+                conn,
+                """
+                INSERT INTO enterprise_customers
+                (id, tenant_id, name, contact_email_hash, contact_email_domain, status, created_by, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    customer_id,
+                    clean_tenant_id,
+                    customer_name[:160],
+                    _sha256(email),
+                    _email_domain(email),
+                    "active",
+                    actor_id,
+                    now,
+                    now,
+                ),
+            )
+            self._audit(conn, actor_id, "enterprise_customer.created", "enterprise_customer", customer_id, {"tenant_id": clean_tenant_id})
+            return self.get_enterprise_customer(customer_id, conn=conn)
+
+    def get_enterprise_customer(self, customer_id: str, conn: Optional[Any] = None) -> Dict[str, Any]:
+        if conn is None:
+            with self._session() as active:
+                return self.get_enterprise_customer(customer_id, conn=active)
+        row = self._get_one(conn, "SELECT * FROM enterprise_customers WHERE id = ?", (customer_id,))
+        if not row:
+            raise KeyError("enterprise_customer_not_found")
+        return self._enterprise_customer_from_row(row)
+
+    def list_enterprise_customers(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        status: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        limit, offset = _page_bounds(limit, offset, self.settings.max_page_limit)
+        params: List[Any] = []
+        where = ""
+        if status:
+            where = "WHERE status = ?"
+            params.append(status)
+        params.extend([limit, offset])
+        with self._session() as conn:
+            return [
+                self._enterprise_customer_from_row(row)
+                for row in self._execute(
+                    conn,
+                    f"""
+                    SELECT * FROM enterprise_customers
+                    {where}
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    tuple(params),
+                )
+            ]
+
+    def create_enterprise_contract(
+        self,
+        customer_id: str,
+        terms_version: str = "enterprise-contract-2026-05",
+        terms: Optional[Dict[str, Any]] = None,
+        expires_at: Optional[str] = None,
+        actor_id: str = "system",
+    ) -> Dict[str, Any]:
+        contract_id = _id("ect")
+        now = _now()
+        expires_at_value = _normalize_expires_at(expires_at) or _future_hours(24 * 365)
+        with self._session() as conn:
+            customer = self.get_enterprise_customer(customer_id, conn=conn)
+            if customer["status"] != "active":
+                raise ValueError("enterprise_customer_not_active")
+            clean_terms = terms or {}
+            self._execute(
+                conn,
+                """
+                INSERT INTO enterprise_contracts
+                (id, tenant_id, customer_id, version, status, terms_json, effective_at,
+                 expires_at, signed_by, created_by, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    contract_id,
+                    customer["tenant_id"],
+                    customer_id,
+                    terms_version[:80] or "enterprise-contract-2026-05",
+                    "active",
+                    dumps(clean_terms),
+                    now,
+                    expires_at_value,
+                    actor_id,
+                    actor_id,
+                    now,
+                    now,
+                ),
+            )
+            self._audit(conn, actor_id, "enterprise_contract.created", "enterprise_contract", contract_id, {"customer_id": customer_id})
+            return self.get_enterprise_contract(contract_id, conn=conn)
+
+    def get_enterprise_contract(self, contract_id: str, conn: Optional[Any] = None) -> Dict[str, Any]:
+        if conn is None:
+            with self._session() as active:
+                return self.get_enterprise_contract(contract_id, conn=active)
+        row = self._get_one(conn, "SELECT * FROM enterprise_contracts WHERE id = ?", (contract_id,))
+        if not row:
+            raise KeyError("enterprise_contract_not_found")
+        return self._enterprise_contract_from_row(row)
+
+    def list_enterprise_contracts(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        customer_id: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        limit, offset = _page_bounds(limit, offset, self.settings.max_page_limit)
+        filters: List[str] = []
+        params: List[Any] = []
+        if customer_id:
+            filters.append("customer_id = ?")
+            params.append(customer_id)
+        if status:
+            filters.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        params.extend([limit, offset])
+        with self._session() as conn:
+            return [
+                self._enterprise_contract_from_row(row)
+                for row in self._execute(
+                    conn,
+                    f"""
+                    SELECT * FROM enterprise_contracts
+                    {where}
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    tuple(params),
+                )
+            ]
+
+    def create_enterprise_order(
+        self,
+        customer_id: str,
+        dataset_id: str,
+        contract_id: str,
+        gross_revenue_cents: int,
+        direct_cost_cents: int = 0,
+        currency: str = "CNY",
+        max_reads: int = 100,
+        actor_id: str = "system",
+    ) -> Dict[str, Any]:
+        order_id = _id("ord")
+        max_reads = _bounded_limit(max_reads, 10_000)
+        gross_revenue_cents = max(0, int(gross_revenue_cents))
+        direct_cost_cents = max(0, int(direct_cost_cents))
+        now = _now()
+        with self._session() as conn:
+            customer = self.get_enterprise_customer(customer_id, conn=conn)
+            if customer["status"] != "active":
+                raise ValueError("enterprise_customer_not_active")
+            contract = self.get_enterprise_contract(contract_id, conn=conn)
+            if contract["customer_id"] != customer_id or contract["tenant_id"] != customer["tenant_id"]:
+                raise ValueError("enterprise_contract_scope_mismatch")
+            if contract["status"] != "active" or _is_expired(contract["expires_at"]):
+                raise ValueError("enterprise_contract_not_active")
+            dataset = self.get_dataset(dataset_id, conn=conn)
+            if dataset["status"] != "ready":
+                raise ValueError("dataset_not_ready")
+            self._assert_tenant_order_quota(conn, customer["tenant_id"])
+            self._execute(
+                conn,
+                """
+                INSERT INTO enterprise_orders
+                (id, tenant_id, customer_id, dataset_id, contract_id, status, gross_revenue_cents,
+                 direct_cost_cents, currency, max_reads, usage_event_id, delivery_grant_id,
+                 created_by, created_at, updated_at, recognized_at, last_delivery_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    order_id,
+                    customer["tenant_id"],
+                    customer_id,
+                    dataset_id,
+                    contract_id,
+                    "ready",
+                    gross_revenue_cents,
+                    direct_cost_cents,
+                    currency[:12].upper() or "CNY",
+                    max_reads,
+                    "",
+                    "",
+                    actor_id,
+                    now,
+                    now,
+                    None,
+                    None,
+                ),
+            )
+            self._audit(conn, actor_id, "enterprise_order.created", "enterprise_order", order_id, {"dataset_id": dataset_id, "customer_id": customer_id})
+            return self.get_enterprise_order(order_id, conn=conn)
+
+    def get_enterprise_order(self, order_id: str, conn: Optional[Any] = None) -> Dict[str, Any]:
+        if conn is None:
+            with self._session() as active:
+                return self.get_enterprise_order(order_id, conn=active)
+        row = self._get_one(conn, "SELECT * FROM enterprise_orders WHERE id = ?", (order_id,))
+        if not row:
+            raise KeyError("enterprise_order_not_found")
+        return self._enterprise_order_from_row(row)
+
+    def list_enterprise_orders(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        customer_id: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        limit, offset = _page_bounds(limit, offset, self.settings.max_page_limit)
+        filters: List[str] = []
+        params: List[Any] = []
+        if customer_id:
+            filters.append("customer_id = ?")
+            params.append(customer_id)
+        if status:
+            filters.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        params.extend([limit, offset])
+        with self._session() as conn:
+            return [
+                self._enterprise_order_from_row(row)
+                for row in self._execute(
+                    conn,
+                    f"""
+                    SELECT * FROM enterprise_orders
+                    {where}
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    tuple(params),
+                )
+            ]
+
+    def recognize_enterprise_order_usage(self, order_id: str, actor_id: str = "system") -> Dict[str, Any]:
+        now = _now()
+        with self._session() as conn:
+            order = self.get_enterprise_order(order_id, conn=conn)
+            if order["usage_event_id"]:
+                return {**order, "payout": None}
+            if order["status"] in {"cancelled", "closed"}:
+                raise ValueError("enterprise_order_not_billable")
+            dataset = self.get_dataset(order["dataset_id"], conn=conn)
+            cases = [self.get_case(case_id, conn=conn) for case_id in dataset["case_ids"]]
+            for case in cases:
+                if not self._case_authorization_active(conn, case):
+                    raise ValueError("authorization_not_active")
+            usage_event_id = _id("use")
+            self._execute(
+                conn,
+                """
+                INSERT INTO usage_events
+                (id, event_type, dataset_id, gross_revenue_cents, direct_cost_cents, billable, payout_eligible, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    usage_event_id,
+                    "enterprise_order_recognized",
+                    order["dataset_id"],
+                    order["gross_revenue_cents"],
+                    order["direct_cost_cents"],
+                    1,
+                    1,
+                    now,
+                ),
+            )
+            for case in cases:
+                self._execute(conn, "INSERT INTO usage_event_cases (usage_event_id, case_id) VALUES (?, ?)", (usage_event_id, case["case_id"]))
+            payout = calculate_payout(
+                RevenueEvent(
+                    event_id=usage_event_id,
+                    gross_revenue_cents=order["gross_revenue_cents"],
+                    direct_cost_cents=order["direct_cost_cents"],
+                ),
+                [_contribution_from_case(case) for case in cases],
+            )
+            for allocation in payout.allocations:
+                self._execute(
+                    conn,
+                    """
+                    INSERT INTO payout_events
+                    (id, usage_event_id, contributor_id, case_id, amount_cents, weight, status, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (_id("pay"), usage_event_id, allocation.contributor_id, allocation.case_id, allocation.amount_cents, allocation.weight, allocation.status, now),
+                )
+            self._execute(
+                conn,
+                """
+                UPDATE enterprise_orders
+                SET status = ?, usage_event_id = ?, recognized_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                ("recognized", usage_event_id, now, now, order_id),
+            )
+            self._audit(conn, actor_id, "enterprise_order.recognized", "enterprise_order", order_id, {"usage_event_id": usage_event_id})
+            updated = self.get_enterprise_order(order_id, conn=conn)
+            updated["payout"] = to_jsonable(payout)
+            return updated
+
+    def create_dataset_delivery_grant(
+        self,
+        dataset_id: str,
+        customer_id: str,
+        purpose: str,
+        terms_version: str,
+        expires_at: Optional[str] = None,
+        max_reads: int = 100,
+        order_id: Optional[str] = None,
+        actor_id: str = "system",
+    ) -> Dict[str, Any]:
+        max_reads = _bounded_limit(max_reads, 10_000)
+        token = new_api_token()
+        grant_id = _id("dgrant")
+        now = _now()
+        expires_at_value = _normalize_expires_at(expires_at) or _future_hours(self.settings.delivery_grant_ttl_hours)
+        with self._session() as conn:
+            dataset = self.get_dataset(dataset_id, conn=conn)
+            if dataset["status"] != "ready":
+                raise ValueError("dataset_not_ready")
+            customer = self.get_enterprise_customer(customer_id, conn=conn)
+            if customer["status"] != "active":
+                raise ValueError("enterprise_customer_not_active")
+            order: Optional[Dict[str, Any]] = None
+            if order_id:
+                order = self.get_enterprise_order(order_id, conn=conn)
+                if order["dataset_id"] != dataset_id or order["customer_id"] != customer_id:
+                    raise ValueError("enterprise_order_scope_mismatch")
+                if order["status"] in {"cancelled", "closed"}:
+                    raise ValueError("enterprise_order_not_deliverable")
+                if max_reads > int(order["max_reads"]):
+                    raise ValueError("delivery_reads_exceed_order")
+            self._execute(
+                conn,
+                """
+                INSERT INTO dataset_delivery_grants
+                (id, order_id, dataset_id, customer_id, purpose, terms_version, status, token_hash, token_suffix,
+                 expires_at, max_reads, read_count, created_by, created_at, revoked_at, last_read_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    grant_id,
+                    order_id,
+                    dataset_id,
+                    customer_id,
+                    purpose[:80] or dataset["purpose"],
+                    terms_version[:80] or "enterprise-delivery-2026-05",
+                    "active",
+                    token_hash(token),
+                    token_suffix(token),
+                    expires_at_value,
+                    max_reads,
+                    0,
+                    actor_id,
+                    now,
+                    None,
+                    None,
+                ),
+            )
+            if order:
+                self._execute(
+                    conn,
+                    """
+                    UPDATE enterprise_orders
+                    SET status = CASE WHEN status = ? THEN ? ELSE status END,
+                        delivery_grant_id = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    ("ready", "delivering", grant_id, now, order_id),
+                )
+            self._audit(conn, actor_id, "delivery_grant.created", "delivery_grant", grant_id, {"dataset_id": dataset_id, "customer_id": customer_id})
+            grant = self.get_dataset_delivery_grant(grant_id, conn=conn)
+            grant["delivery_token"] = token
+            return grant
+
+    def get_dataset_delivery_grant(self, grant_id: str, conn: Optional[Any] = None) -> Dict[str, Any]:
+        if conn is None:
+            with self._session() as active:
+                return self.get_dataset_delivery_grant(grant_id, conn=active)
+        row = self._get_one(conn, "SELECT * FROM dataset_delivery_grants WHERE id = ?", (grant_id,))
+        if not row:
+            raise KeyError("delivery_grant_not_found")
+        return self._delivery_grant_from_row(row)
+
+    def list_dataset_delivery_grants(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        dataset_id: Optional[str] = None,
+        customer_id: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        limit, offset = _page_bounds(limit, offset, self.settings.max_page_limit)
+        filters: List[str] = []
+        params: List[Any] = []
+        if dataset_id:
+            filters.append("dataset_id = ?")
+            params.append(dataset_id)
+        if customer_id:
+            filters.append("customer_id = ?")
+            params.append(customer_id)
+        if status:
+            filters.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        params.extend([limit, offset])
+        with self._session() as conn:
+            return [
+                self._delivery_grant_from_row(row)
+                for row in self._execute(
+                    conn,
+                    f"""
+                    SELECT * FROM dataset_delivery_grants
+                    {where}
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    tuple(params),
+                )
+            ]
+
+    def revoke_dataset_delivery_grant(self, grant_id: str, actor_id: str = "system") -> Dict[str, Any]:
+        with self._session() as conn:
+            grant = self.get_dataset_delivery_grant(grant_id, conn=conn)
+            if grant["status"] == "revoked":
+                return grant
+            now = _now()
+            self._execute(
+                conn,
+                """
+                UPDATE dataset_delivery_grants
+                SET status = ?, revoked_at = ?
+                WHERE id = ?
+                """,
+                ("revoked", now, grant_id),
+            )
+            self._audit(conn, actor_id, "delivery_grant.revoked", "delivery_grant", grant_id, {})
+            return self.get_dataset_delivery_grant(grant_id, conn=conn)
+
+    def read_delivery_grant_artifact(self, grant_id: str, token: str, artifact: str) -> Dict[str, Any]:
+        hashed = token_hash(token)
+        now = _now()
+        with self._session() as conn:
+            row = self._get_one(conn, "SELECT * FROM dataset_delivery_grants WHERE id = ?", (grant_id,))
+            if not row:
+                raise KeyError("delivery_grant_not_found")
+            grant = self._delivery_grant_from_row(row)
+            if grant["status"] != "active" or grant["revoked_at"]:
+                raise ValueError("delivery_grant_not_active")
+            if grant["expires_at"] and _is_expired(grant["expires_at"]):
+                raise ValueError("delivery_grant_expired")
+            if not hmac.compare_digest(hashed, row["token_hash"]):
+                raise ValueError("invalid_delivery_token")
+            _dataset_artifact_descriptor(artifact)
+            if grant.get("order_id"):
+                order = self.get_enterprise_order(grant["order_id"], conn=conn)
+                if int(grant["read_count"]) >= int(order["max_reads"]):
+                    raise ValueError("delivery_grant_read_limit_exceeded")
+                self._assert_tenant_delivery_read_quota(conn, order["tenant_id"])
+            cursor = self._execute(
+                conn,
+                """
+                UPDATE dataset_delivery_grants
+                SET read_count = read_count + 1, last_read_at = ?
+                WHERE id = ? AND status = ? AND revoked_at IS NULL AND read_count < max_reads
+                """,
+                (now, grant_id, "active"),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError("delivery_grant_read_limit_exceeded")
+            if grant.get("order_id"):
+                self._execute(
+                    conn,
+                    "UPDATE enterprise_orders SET last_delivery_at = ?, updated_at = ? WHERE id = ?",
+                    (now, now, grant["order_id"]),
+                )
+            self._audit(conn, f"customer:{grant['customer_id']}", "delivery_grant.artifact_read", "delivery_grant", grant_id, {"artifact": artifact})
+        return self.read_dataset_artifact(grant["dataset_id"], artifact, actor_id=f"customer:{grant['customer_id']}")
+
+    def upsert_tenant_quota(
+        self,
+        tenant_id: str,
+        monthly_order_limit: int = 0,
+        monthly_delivery_read_limit: int = 0,
+        monthly_submission_limit: int = 0,
+        monthly_asset_bytes_limit: int = 0,
+        actor_id: str = "system",
+    ) -> Dict[str, Any]:
+        clean_tenant_id = _clean_tenant_id(tenant_id)
+        now = _now()
+        values = (
+            max(0, int(monthly_order_limit)),
+            max(0, int(monthly_delivery_read_limit)),
+            max(0, int(monthly_submission_limit)),
+            max(0, int(monthly_asset_bytes_limit)),
+        )
+        with self._session() as conn:
+            self._ensure_tenant(conn, clean_tenant_id, clean_tenant_id, actor_id=actor_id)
+            existing = self._get_one(conn, "SELECT tenant_id FROM tenant_quotas WHERE tenant_id = ?", (clean_tenant_id,))
+            if existing:
+                self._execute(
+                    conn,
+                    """
+                    UPDATE tenant_quotas
+                    SET monthly_order_limit = ?, monthly_delivery_read_limit = ?,
+                        monthly_submission_limit = ?, monthly_asset_bytes_limit = ?,
+                        updated_by = ?, updated_at = ?
+                    WHERE tenant_id = ?
+                    """,
+                    (*values, actor_id, now, clean_tenant_id),
+                )
+                event_type = "tenant_quota.updated"
+            else:
+                self._execute(
+                    conn,
+                    """
+                    INSERT INTO tenant_quotas
+                    (tenant_id, monthly_order_limit, monthly_delivery_read_limit,
+                     monthly_submission_limit, monthly_asset_bytes_limit,
+                     updated_by, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (clean_tenant_id, *values, actor_id, now, now),
+                )
+                event_type = "tenant_quota.created"
+            self._audit(conn, actor_id, event_type, "tenant_quota", clean_tenant_id, {})
+            return self.get_tenant_quota(clean_tenant_id, conn=conn)
+
+    def get_tenant_quota(self, tenant_id: str, conn: Optional[Any] = None) -> Dict[str, Any]:
+        clean_tenant_id = _clean_tenant_id(tenant_id)
+        if conn is None:
+            with self._session() as active:
+                return self.get_tenant_quota(clean_tenant_id, conn=active)
+        row = self._get_one(conn, "SELECT * FROM tenant_quotas WHERE tenant_id = ?", (clean_tenant_id,))
+        if not row:
+            return {
+                "tenant_id": clean_tenant_id,
+                "monthly_order_limit": 0,
+                "monthly_delivery_read_limit": 0,
+                "monthly_submission_limit": 0,
+                "monthly_asset_bytes_limit": 0,
+                "updated_by": "",
+                "created_at": "",
+                "updated_at": "",
+            }
+        return self._tenant_quota_from_row(row)
+
+    def list_tenant_quotas(self, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
+        limit, offset = _page_bounds(limit, offset, self.settings.max_page_limit)
+        with self._session() as conn:
+            return [
+                self._tenant_quota_from_row(row)
+                for row in self._execute(
+                    conn,
+                    """
+                    SELECT * FROM tenant_quotas
+                    ORDER BY updated_at DESC, tenant_id DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    (limit, offset),
+                )
+            ]
+
+    def create_dispute(
+        self,
+        entity_type: str,
+        entity_id: str,
+        reason: str,
+        hold_payouts: bool = True,
+        actor_id: str = "system",
+    ) -> Dict[str, Any]:
+        entity_type = _clean_dispute_entity_type(entity_type)
+        dispute_id = _id("dsp")
+        now = _now()
+        with self._session() as conn:
+            self._assert_dispute_entity_exists(conn, entity_type, entity_id)
+            self._execute(
+                conn,
+                """
+                INSERT INTO disputes
+                (id, entity_type, entity_id, status, reason, resolution, opened_by,
+                 resolved_by, hold_payouts, held_payout_count, created_at, resolved_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (dispute_id, entity_type, entity_id, "open", reason[:2000], "", actor_id, "", 1 if hold_payouts else 0, 0, now, None),
+            )
+            held_count = 0
+            if hold_payouts:
+                held_count = self._hold_payouts_for_dispute(conn, dispute_id, entity_type, entity_id)
+                self._execute(conn, "UPDATE disputes SET held_payout_count = ? WHERE id = ?", (held_count, dispute_id))
+            self._audit(conn, actor_id, "dispute.opened", "dispute", dispute_id, {"entity_type": entity_type, "entity_id": entity_id, "held_payout_count": held_count})
+            return self.get_dispute(dispute_id, conn=conn)
+
+    def get_dispute(self, dispute_id: str, conn: Optional[Any] = None) -> Dict[str, Any]:
+        if conn is None:
+            with self._session() as active:
+                return self.get_dispute(dispute_id, conn=active)
+        row = self._get_one(conn, "SELECT * FROM disputes WHERE id = ?", (dispute_id,))
+        if not row:
+            raise KeyError("dispute_not_found")
+        return self._dispute_from_row(row)
+
+    def list_disputes(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        status: Optional[str] = None,
+        entity_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        limit, offset = _page_bounds(limit, offset, self.settings.max_page_limit)
+        filters: List[str] = []
+        params: List[Any] = []
+        if status:
+            filters.append("status = ?")
+            params.append(status)
+        if entity_id:
+            filters.append("entity_id = ?")
+            params.append(entity_id)
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        params.extend([limit, offset])
+        with self._session() as conn:
+            return [
+                self._dispute_from_row(row)
+                for row in self._execute(
+                    conn,
+                    f"""
+                    SELECT * FROM disputes
+                    {where}
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    tuple(params),
+                )
+            ]
+
+    def resolve_dispute(self, dispute_id: str, decision: str, resolution: str, actor_id: str = "system") -> Dict[str, Any]:
+        decision = decision.strip().lower()
+        if decision not in {"release", "void"}:
+            raise ValueError("invalid_dispute_decision")
+        now = _now()
+        with self._session() as conn:
+            dispute = self.get_dispute(dispute_id, conn=conn)
+            if dispute["status"] != "open":
+                raise ValueError("dispute_already_resolved")
+            target_status = "pending" if decision == "release" else "voided"
+            hold_rows = self._execute(conn, "SELECT * FROM dispute_holds WHERE dispute_id = ?", (dispute_id,))
+            released_count = 0
+            for hold in hold_rows:
+                cursor = self._execute(
+                    conn,
+                    "UPDATE payout_events SET status = ? WHERE id = ? AND status = ?",
+                    (target_status if decision == "void" else hold["previous_status"], hold["payout_id"], "held"),
+                )
+                released_count += cursor.rowcount
+            self._execute(
+                conn,
+                """
+                UPDATE disputes
+                SET status = ?, resolution = ?, resolved_by = ?, resolved_at = ?
+                WHERE id = ?
+                """,
+                (f"resolved_{decision}", resolution[:2000], actor_id, now, dispute_id),
+            )
+            self._audit(conn, actor_id, f"dispute.resolved_{decision}", "dispute", dispute_id, {"payout_count": released_count})
+            return self.get_dispute(dispute_id, conn=conn)
+
     def list_usage_events(self, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
         limit, offset = _page_bounds(limit, offset, self.settings.max_page_limit)
         with self._session() as conn:
@@ -1492,6 +2426,125 @@ class LodiaStore:
                     SELECT * FROM payout_events
                     {where}
                     ORDER BY created_at DESC, id DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    tuple(params),
+                )
+            ]
+
+    def upsert_payout_profile(
+        self,
+        contributor_id: str,
+        country_region: str,
+        account_type: str,
+        account_reference: str,
+        kyc_status: str = "pending",
+        tax_status: str = "pending",
+        risk_status: str = "clear",
+        withholding_rate_bps: int = 0,
+        actor_id: str = "system",
+    ) -> Dict[str, Any]:
+        now = _now()
+        country_region = (country_region or "CN").strip().upper()[:40] or "CN"
+        account_type = (account_type or "bank").strip().lower()[:40] or "bank"
+        kyc_status = _clean_payout_status(kyc_status, {"pending", "verified", "rejected"}, "invalid_kyc_status")
+        tax_status = _clean_payout_status(tax_status, {"pending", "verified", "not_required", "rejected"}, "invalid_tax_status")
+        risk_status = _clean_payout_status(risk_status, {"clear", "review", "blocked", "rejected"}, "invalid_risk_status")
+        status = _payout_profile_status(kyc_status, tax_status, risk_status)
+        withholding_rate_bps = max(0, min(10_000, int(withholding_rate_bps)))
+        account_reference = str(account_reference or "").strip()
+        if len(account_reference) < 4:
+            raise ValueError("account_reference_required")
+        account_ref_hash = _sha256(account_reference)
+        account_ref_suffix = account_reference[-4:]
+        with self._session() as conn:
+            existing = self._get_one(conn, "SELECT contributor_id FROM payout_profiles WHERE contributor_id = ?", (contributor_id,))
+            if existing:
+                self._execute(
+                    conn,
+                    """
+                    UPDATE payout_profiles
+                    SET status = ?, country_region = ?, account_type = ?, account_ref_hash = ?, account_ref_suffix = ?,
+                        kyc_status = ?, tax_status = ?, risk_status = ?, withholding_rate_bps = ?,
+                        updated_by = ?, updated_at = ?
+                    WHERE contributor_id = ?
+                    """,
+                    (
+                        status,
+                        country_region,
+                        account_type,
+                        account_ref_hash,
+                        account_ref_suffix,
+                        kyc_status,
+                        tax_status,
+                        risk_status,
+                        withholding_rate_bps,
+                        actor_id,
+                        now,
+                        contributor_id,
+                    ),
+                )
+                event_type = "payout_profile.updated"
+            else:
+                self._execute(
+                    conn,
+                    """
+                    INSERT INTO payout_profiles
+                    (contributor_id, status, country_region, account_type, account_ref_hash, account_ref_suffix,
+                     kyc_status, tax_status, risk_status, withholding_rate_bps, updated_by, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        contributor_id,
+                        status,
+                        country_region,
+                        account_type,
+                        account_ref_hash,
+                        account_ref_suffix,
+                        kyc_status,
+                        tax_status,
+                        risk_status,
+                        withholding_rate_bps,
+                        actor_id,
+                        now,
+                        now,
+                    ),
+                )
+                event_type = "payout_profile.created"
+            self._audit(conn, actor_id, event_type, "payout_profile", contributor_id, {"status": status, "kyc_status": kyc_status, "tax_status": tax_status})
+            return self.get_payout_profile(contributor_id, conn=conn)
+
+    def get_payout_profile(self, contributor_id: str, conn: Optional[Any] = None) -> Dict[str, Any]:
+        if conn is None:
+            with self._session() as active:
+                return self.get_payout_profile(contributor_id, conn=active)
+        row = self._get_one(conn, "SELECT * FROM payout_profiles WHERE contributor_id = ?", (contributor_id,))
+        if not row:
+            raise KeyError("payout_profile_not_found")
+        return self._payout_profile_from_row(row)
+
+    def list_payout_profiles(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        status: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        limit, offset = _page_bounds(limit, offset, self.settings.max_page_limit)
+        params: List[Any] = []
+        where = ""
+        if status:
+            where = "WHERE status = ?"
+            params.append(status)
+        params.extend([limit, offset])
+        with self._session() as conn:
+            return [
+                self._payout_profile_from_row(row)
+                for row in self._execute(
+                    conn,
+                    f"""
+                    SELECT * FROM payout_profiles
+                    {where}
+                    ORDER BY updated_at DESC, contributor_id DESC
                     LIMIT ? OFFSET ?
                     """,
                     tuple(params),
@@ -1579,6 +2632,10 @@ class LodiaStore:
             batch = self.get_payout_batch(batch_id, conn=conn)
             if batch["status"] != "ready":
                 raise ValueError("payout_batch_not_ready")
+            if self.settings.require_payout_profile_for_settlement:
+                blockers = self._payout_profile_blockers(conn, batch_id)
+                if blockers:
+                    raise ValueError("payout_profile_not_ready")
             now = _now()
             self._execute(
                 conn,
@@ -1640,16 +2697,15 @@ class LodiaStore:
 
     def contributor_ledger(self, contributor_id: str) -> Dict[str, Any]:
         payouts = self.list_payout_events(limit=self.settings.max_page_limit, contributor_id=contributor_id)
-        pending = sum(item["amount_cents"] for item in payouts if item["status"] == "pending")
-        batched = sum(item["amount_cents"] for item in payouts if item["status"] == "batched")
-        settled = sum(item["amount_cents"] for item in payouts if item["status"] == "settled")
+        with self._session() as conn:
+            payout_totals = _payout_totals_by_status(conn, self, contributor_id)
         return {
             "contributor_id": contributor_id,
-            "pending_cents": pending,
-            "batched_cents": batched,
-            "settled_cents": settled,
-            "total_cents": pending + batched + settled,
-            "payout_count": len(payouts),
+            "pending_cents": payout_totals["amounts"].get("pending", 0),
+            "batched_cents": payout_totals["amounts"].get("batched", 0),
+            "settled_cents": payout_totals["amounts"].get("settled", 0),
+            "total_cents": sum(payout_totals["amounts"].values()),
+            "payout_count": payout_totals["total_count"],
             "items": payouts,
         }
 
@@ -1660,6 +2716,10 @@ class LodiaStore:
                 raise KeyError("payout_not_found")
             if row["status"] != "pending":
                 raise ValueError("payout_not_pending")
+            if self.settings.require_payout_profile_for_settlement:
+                profile = self._get_one(conn, "SELECT * FROM payout_profiles WHERE contributor_id = ?", (row["contributor_id"],))
+                if not profile or not _payout_profile_ready(row_to_dict(profile)):
+                    raise ValueError("payout_profile_not_ready")
             self._execute(conn, "UPDATE payout_events SET status = ?, settled_at = ? WHERE id = ?", ("settled", _now(), payout_id))
             self._audit(conn, actor_id, "payout.settled", "payout_event", payout_id, {"contributor_id": row["contributor_id"]})
             return row_to_dict(self._get_one(conn, "SELECT * FROM payout_events WHERE id = ?", (payout_id,)))
@@ -1726,6 +2786,8 @@ class LodiaStore:
                 "assets": _count_by(conn, self, "assets", "status"),
                 "jobs": _count_by(conn, self, "jobs", "status"),
                 "datasets": _single_count(conn, self, "datasets"),
+                "enterprise_orders": _count_by(conn, self, "enterprise_orders", "status"),
+                "disputes": _count_by(conn, self, "disputes", "status"),
                 "users": _count_by(conn, self, "users", "status"),
                 "authorizations": _count_by(conn, self, "authorization_snapshots", "status"),
                 "pending_payout_cents": _sum_where(conn, self, "payout_events", "amount_cents", "status", "pending"),
@@ -1742,6 +2804,8 @@ class LodiaStore:
                 "case_drl": _count_by(conn, self, "cases", "drl"),
                 "payouts": _count_by(conn, self, "payout_events", "status"),
                 "payout_batches": _count_by(conn, self, "payout_batches", "status"),
+                "enterprise_orders": _count_by(conn, self, "enterprise_orders", "status"),
+                "disputes": _count_by(conn, self, "disputes", "status"),
                 "reviews": _count_by(conn, self, "reviews", "review_type"),
                 "model_invocations": _count_by(conn, self, "model_invocations", "status"),
                 "queue_depth": _count_grouped(conn, self, "jobs", ["queue_name", "status"]),
@@ -1831,6 +2895,10 @@ class LodiaStore:
             lines.append(f'lodia_jobs_total{{queue="{_label_value(queue_name)}",status="{_label_value(status)}"}} {int(value)}')
         for status, value in snapshot["payouts"].items():
             lines.append(f'lodia_payout_events_total{{status="{_label_value(status)}"}} {int(value)}')
+        for status, value in snapshot["enterprise_orders"].items():
+            lines.append(f'lodia_enterprise_orders_total{{status="{_label_value(status)}"}} {int(value)}')
+        for status, value in snapshot["disputes"].items():
+            lines.append(f'lodia_disputes_total{{status="{_label_value(status)}"}} {int(value)}')
         for status, value in snapshot["model_invocations"].items():
             lines.append(f'lodia_model_invocations_total{{status="{_label_value(status)}"}} {int(value)}')
         lines.append(f"lodia_pending_payout_cents {int(snapshot['metrics'].get('pending_payout_cents', 0))}")
@@ -2299,6 +3367,8 @@ class LodiaStore:
             "dedup": loads(row["dedup_json"]),
             "quality_gate": loads(row["quality_gate_json"]),
             "authorization_snapshot_id": row["authorization_snapshot_id"] if "authorization_snapshot_id" in row.keys() else None,
+            "review_claimed_by": row["review_claimed_by"] if "review_claimed_by" in row.keys() else None,
+            "review_claimed_at": row["review_claimed_at"] if "review_claimed_at" in row.keys() else None,
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
@@ -2414,6 +3484,37 @@ class LodiaStore:
     def _vendor_processing_from_row(self, row: Any) -> Dict[str, Any]:
         return row_to_dict(row)
 
+    def _enterprise_customer_from_row(self, row: Any) -> Dict[str, Any]:
+        result = row_to_dict(row)
+        result.pop("contact_email_hash", None)
+        return result
+
+    def _enterprise_contract_from_row(self, row: Any) -> Dict[str, Any]:
+        result = row_to_dict(row)
+        result["terms"] = loads(result.pop("terms_json") or "{}")
+        return result
+
+    def _enterprise_order_from_row(self, row: Any) -> Dict[str, Any]:
+        return row_to_dict(row)
+
+    def _delivery_grant_from_row(self, row: Any) -> Dict[str, Any]:
+        result = row_to_dict(row)
+        result.pop("token_hash", None)
+        return result
+
+    def _payout_profile_from_row(self, row: Any) -> Dict[str, Any]:
+        result = row_to_dict(row)
+        result.pop("account_ref_hash", None)
+        return result
+
+    def _tenant_quota_from_row(self, row: Any) -> Dict[str, Any]:
+        return row_to_dict(row)
+
+    def _dispute_from_row(self, row: Any) -> Dict[str, Any]:
+        result = row_to_dict(row)
+        result["hold_payouts"] = bool(result["hold_payouts"])
+        return result
+
     @contextmanager
     def _session(self):
         with self.db.session() as conn:
@@ -2448,6 +3549,128 @@ class LodiaStore:
         checks["ok"] = all(item.get("ok") for key, item in checks.items() if key != "ok")
         return checks
 
+    def _payout_profile_blockers(self, conn: Any, batch_id: str) -> List[str]:
+        rows = self._execute(
+            conn,
+            """
+            SELECT DISTINCT p.contributor_id
+            FROM payout_events p
+            LEFT JOIN payout_profiles profile ON profile.contributor_id = p.contributor_id
+            WHERE p.settlement_batch_id = ? AND p.status = ?
+              AND (
+                profile.contributor_id IS NULL
+                OR profile.status != ?
+                OR profile.kyc_status != ?
+                OR profile.tax_status NOT IN (?, ?)
+                OR profile.risk_status != ?
+              )
+            """,
+            (batch_id, "batched", "active", "verified", "verified", "not_required", "clear"),
+        )
+        return [row["contributor_id"] for row in rows]
+
+    def _assert_tenant_order_quota(self, conn: Any, tenant_id: str) -> None:
+        quota = self.get_tenant_quota(tenant_id, conn=conn)
+        limit = int(quota.get("monthly_order_limit") or 0)
+        if limit <= 0:
+            return
+        row = self._get_one(
+            conn,
+            """
+            SELECT COUNT(*) AS value
+            FROM enterprise_orders
+            WHERE tenant_id = ? AND created_at >= ?
+            """,
+            (tenant_id, _month_start()),
+        )
+        if row and int(row["value"]) >= limit:
+            raise ValueError("tenant_order_quota_exceeded")
+
+    def _assert_tenant_delivery_read_quota(self, conn: Any, tenant_id: str) -> None:
+        quota = self.get_tenant_quota(tenant_id, conn=conn)
+        limit = int(quota.get("monthly_delivery_read_limit") or 0)
+        if limit <= 0:
+            return
+        row = self._get_one(
+            conn,
+            """
+            SELECT COALESCE(SUM(g.read_count), 0) AS value
+            FROM dataset_delivery_grants g
+            JOIN enterprise_customers c ON c.id = g.customer_id
+            WHERE c.tenant_id = ? AND g.created_at >= ?
+            """,
+            (tenant_id, _month_start()),
+        )
+        if row and int(row["value"]) >= limit:
+            raise ValueError("tenant_delivery_read_quota_exceeded")
+
+    def _assert_dispute_entity_exists(self, conn: Any, entity_type: str, entity_id: str) -> None:
+        if entity_type == "enterprise_order":
+            self.get_enterprise_order(entity_id, conn=conn)
+        elif entity_type == "dataset":
+            self.get_dataset(entity_id, conn=conn)
+        elif entity_type == "usage_event":
+            if not self._get_one(conn, "SELECT id FROM usage_events WHERE id = ?", (entity_id,)):
+                raise KeyError("usage_event_not_found")
+        elif entity_type == "payout_event":
+            if not self._get_one(conn, "SELECT id FROM payout_events WHERE id = ?", (entity_id,)):
+                raise KeyError("payout_not_found")
+        elif entity_type == "case":
+            self.get_case(entity_id, conn=conn)
+        elif entity_type == "delivery_grant":
+            self.get_dataset_delivery_grant(entity_id, conn=conn)
+        else:
+            raise ValueError("invalid_dispute_entity_type")
+
+    def _hold_payouts_for_dispute(self, conn: Any, dispute_id: str, entity_type: str, entity_id: str) -> int:
+        rows = self._payout_rows_for_dispute_entity(conn, entity_type, entity_id)
+        held = 0
+        for row in rows:
+            cursor = self._execute(conn, "UPDATE payout_events SET status = ? WHERE id = ? AND status = ?", ("held", row["id"], "pending"))
+            if cursor.rowcount:
+                self._execute(
+                    conn,
+                    "INSERT INTO dispute_holds (dispute_id, payout_id, previous_status, created_at) VALUES (?, ?, ?, ?)",
+                    (dispute_id, row["id"], row["status"], _now()),
+                )
+                held += 1
+        return held
+
+    def _payout_rows_for_dispute_entity(self, conn: Any, entity_type: str, entity_id: str) -> List[Dict[str, Any]]:
+        if entity_type == "payout_event":
+            row = self._get_one(conn, "SELECT * FROM payout_events WHERE id = ? AND status = ?", (entity_id, "pending"))
+            return [row_to_dict(row)] if row else []
+        if entity_type == "case":
+            rows = self._execute(conn, "SELECT * FROM payout_events WHERE case_id = ? AND status = ?", (entity_id, "pending"))
+            return [row_to_dict(row) for row in rows]
+
+        usage_event_ids: List[str] = []
+        if entity_type == "enterprise_order":
+            order = self.get_enterprise_order(entity_id, conn=conn)
+            if order.get("usage_event_id"):
+                usage_event_ids.append(order["usage_event_id"])
+        elif entity_type == "usage_event":
+            usage_event_ids.append(entity_id)
+        elif entity_type == "dataset":
+            usage_event_ids.extend(row["id"] for row in self._execute(conn, "SELECT id FROM usage_events WHERE dataset_id = ?", (entity_id,)))
+        elif entity_type == "delivery_grant":
+            grant = self.get_dataset_delivery_grant(entity_id, conn=conn)
+            if grant.get("order_id"):
+                order = self.get_enterprise_order(grant["order_id"], conn=conn)
+                if order.get("usage_event_id"):
+                    usage_event_ids.append(order["usage_event_id"])
+            else:
+                usage_event_ids.extend(row["id"] for row in self._execute(conn, "SELECT id FROM usage_events WHERE dataset_id = ?", (grant["dataset_id"],)))
+        if not usage_event_ids:
+            return []
+        placeholders = ",".join("?" for _ in usage_event_ids)
+        rows = self._execute(
+            conn,
+            f"SELECT * FROM payout_events WHERE status = ? AND usage_event_id IN ({placeholders})",
+            ("pending", *usage_event_ids),
+        )
+        return [row_to_dict(row) for row in rows]
+
     def _apply_versioned_migrations(self, conn: Any) -> None:
         self._execute(
             conn,
@@ -2467,6 +3690,9 @@ class LodiaStore:
         self._ensure_case_query_columns(conn)
         self._ensure_review_columns(conn)
         self._ensure_payout_tables(conn)
+        self._ensure_payout_profile_tables(conn)
+        self._ensure_enterprise_delivery_tables(conn)
+        self._ensure_commercial_ops_tables(conn)
         self._ensure_model_invocation_tables(conn)
         self._ensure_vendor_processing_tables(conn)
         self._backfill_authorization_snapshots(conn)
@@ -2505,6 +3731,33 @@ class LodiaStore:
             ON CONFLICT(version) DO NOTHING
             """,
             ("20260506_p3_upload_observability", _now()),
+        )
+        self._execute(
+            conn,
+            """
+            INSERT INTO schema_migrations (version, applied_at)
+            VALUES (?, ?)
+            ON CONFLICT(version) DO NOTHING
+            """,
+            ("20260506_p4_contributor_review_delivery", _now()),
+        )
+        self._execute(
+            conn,
+            """
+            INSERT INTO schema_migrations (version, applied_at)
+            VALUES (?, ?)
+            ON CONFLICT(version) DO NOTHING
+            """,
+            ("20260506_p5_enterprise_delivery_payout_profiles", _now()),
+        )
+        self._execute(
+            conn,
+            """
+            INSERT INTO schema_migrations (version, applied_at)
+            VALUES (?, ?)
+            ON CONFLICT(version) DO NOTHING
+            """,
+            ("20260506_p6_commercial_ops", _now()),
         )
 
     def _ensure_submission_columns(self, conn: Any) -> None:
@@ -2555,8 +3808,14 @@ class LodiaStore:
             self._execute(conn, "ALTER TABLE cases ADD COLUMN drl TEXT")
         if "quality_score" not in columns:
             self._execute(conn, "ALTER TABLE cases ADD COLUMN quality_score REAL")
+        if "review_claimed_by" not in columns:
+            self._execute(conn, "ALTER TABLE cases ADD COLUMN review_claimed_by TEXT")
+        if "review_claimed_at" not in columns:
+            self._execute(conn, "ALTER TABLE cases ADD COLUMN review_claimed_at TEXT")
         self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_cases_drl_quality ON cases(drl, quality_score)")
         self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_cases_authorization ON cases(authorization_snapshot_id)")
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_cases_review_claim ON cases(status, review_claimed_by, quality_score, created_at)")
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_cases_owner_status_created ON cases(owner_id, status, created_at)")
 
         rows = self._execute(
             conn,
@@ -2618,7 +3877,185 @@ class LodiaStore:
         )
         self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_payout_events_status_created ON payout_events(status, created_at)")
         self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_payout_events_batch ON payout_events(settlement_batch_id)")
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_payout_events_contributor_status ON payout_events(contributor_id, status)")
         self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_payout_batches_status_created ON payout_batches(status, created_at)")
+
+    def _ensure_payout_profile_tables(self, conn: Any) -> None:
+        self._execute(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS payout_profiles (
+                contributor_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                country_region TEXT NOT NULL,
+                account_type TEXT NOT NULL,
+                account_ref_hash TEXT NOT NULL,
+                account_ref_suffix TEXT NOT NULL,
+                kyc_status TEXT NOT NULL,
+                tax_status TEXT NOT NULL,
+                risk_status TEXT NOT NULL,
+                withholding_rate_bps INTEGER NOT NULL,
+                updated_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """,
+        )
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_payout_profiles_status_updated ON payout_profiles(status, updated_at)")
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_payout_profiles_kyc_tax ON payout_profiles(kyc_status, tax_status, risk_status)")
+
+    def _ensure_enterprise_delivery_tables(self, conn: Any) -> None:
+        self._execute(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS enterprise_customers (
+                id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                contact_email_hash TEXT NOT NULL,
+                contact_email_domain TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """,
+        )
+        self._execute(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS dataset_delivery_grants (
+                id TEXT PRIMARY KEY,
+                dataset_id TEXT NOT NULL,
+                customer_id TEXT NOT NULL,
+                purpose TEXT NOT NULL,
+                terms_version TEXT NOT NULL,
+                status TEXT NOT NULL,
+                token_hash TEXT NOT NULL UNIQUE,
+                token_suffix TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                max_reads INTEGER NOT NULL,
+                read_count INTEGER NOT NULL,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                revoked_at TEXT,
+                last_read_at TEXT,
+                FOREIGN KEY (dataset_id) REFERENCES datasets(id),
+                FOREIGN KEY (customer_id) REFERENCES enterprise_customers(id)
+            )
+            """,
+        )
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_enterprise_customers_status_created ON enterprise_customers(status, created_at)")
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_enterprise_customers_tenant ON enterprise_customers(tenant_id, status)")
+        grant_columns = self.db.column_names(conn, "dataset_delivery_grants")
+        if "order_id" not in grant_columns:
+            self._execute(conn, "ALTER TABLE dataset_delivery_grants ADD COLUMN order_id TEXT")
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_delivery_grants_dataset ON dataset_delivery_grants(dataset_id, status, created_at)")
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_delivery_grants_customer ON dataset_delivery_grants(customer_id, status, created_at)")
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_delivery_grants_order ON dataset_delivery_grants(order_id, status)")
+
+    def _ensure_commercial_ops_tables(self, conn: Any) -> None:
+        self._execute(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS enterprise_contracts (
+                id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                customer_id TEXT NOT NULL,
+                version TEXT NOT NULL,
+                status TEXT NOT NULL,
+                terms_json TEXT NOT NULL,
+                effective_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                signed_by TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (customer_id) REFERENCES enterprise_customers(id)
+            )
+            """,
+        )
+        self._execute(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS enterprise_orders (
+                id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                customer_id TEXT NOT NULL,
+                dataset_id TEXT NOT NULL,
+                contract_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                gross_revenue_cents INTEGER NOT NULL,
+                direct_cost_cents INTEGER NOT NULL,
+                currency TEXT NOT NULL,
+                max_reads INTEGER NOT NULL,
+                usage_event_id TEXT NOT NULL,
+                delivery_grant_id TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                recognized_at TEXT,
+                last_delivery_at TEXT,
+                FOREIGN KEY (customer_id) REFERENCES enterprise_customers(id),
+                FOREIGN KEY (dataset_id) REFERENCES datasets(id),
+                FOREIGN KEY (contract_id) REFERENCES enterprise_contracts(id)
+            )
+            """,
+        )
+        self._execute(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS tenant_quotas (
+                tenant_id TEXT PRIMARY KEY,
+                monthly_order_limit INTEGER NOT NULL,
+                monthly_delivery_read_limit INTEGER NOT NULL,
+                monthly_submission_limit INTEGER NOT NULL,
+                monthly_asset_bytes_limit INTEGER NOT NULL,
+                updated_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """,
+        )
+        self._execute(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS disputes (
+                id TEXT PRIMARY KEY,
+                entity_type TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                resolution TEXT NOT NULL,
+                opened_by TEXT NOT NULL,
+                resolved_by TEXT NOT NULL,
+                hold_payouts INTEGER NOT NULL,
+                held_payout_count INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                resolved_at TEXT
+            )
+            """,
+        )
+        self._execute(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS dispute_holds (
+                dispute_id TEXT NOT NULL,
+                payout_id TEXT NOT NULL,
+                previous_status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (dispute_id, payout_id),
+                FOREIGN KEY (dispute_id) REFERENCES disputes(id),
+                FOREIGN KEY (payout_id) REFERENCES payout_events(id)
+            )
+            """,
+        )
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_enterprise_contracts_customer_status ON enterprise_contracts(customer_id, status, created_at)")
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_enterprise_orders_customer_status ON enterprise_orders(customer_id, status, created_at)")
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_enterprise_orders_tenant_created ON enterprise_orders(tenant_id, created_at)")
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_disputes_status_created ON disputes(status, created_at)")
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_disputes_entity ON disputes(entity_type, entity_id, status)")
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_dispute_holds_payout ON dispute_holds(payout_id)")
 
     def _ensure_model_invocation_tables(self, conn: Any) -> None:
         self._execute(
@@ -2823,6 +4260,8 @@ CREATE TABLE IF NOT EXISTS cases (
     canonical_hash TEXT NOT NULL,
     drl TEXT,
     quality_score REAL,
+    review_claimed_by TEXT,
+    review_claimed_at TEXT,
     redaction_json TEXT NOT NULL,
     annotation_json TEXT NOT NULL,
     dedup_json TEXT NOT NULL,
@@ -2840,6 +4279,8 @@ CREATE INDEX IF NOT EXISTS idx_cases_status_created ON cases(status, created_at)
 CREATE INDEX IF NOT EXISTS idx_cases_owner_created ON cases(owner_id, created_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_cases_submission ON cases(submission_id);
 CREATE INDEX IF NOT EXISTS idx_cases_authorization ON cases(authorization_snapshot_id);
+CREATE INDEX IF NOT EXISTS idx_cases_review_claim ON cases(status, review_claimed_by, quality_score, created_at);
+CREATE INDEX IF NOT EXISTS idx_cases_owner_status_created ON cases(owner_id, status, created_at);
 
 CREATE TABLE IF NOT EXISTS authorization_snapshots (
     id TEXT PRIMARY KEY,
@@ -2979,6 +4420,7 @@ CREATE INDEX IF NOT EXISTS idx_payout_events_contributor_created ON payout_event
 CREATE INDEX IF NOT EXISTS idx_payout_events_usage ON payout_events(usage_event_id);
 CREATE INDEX IF NOT EXISTS idx_payout_events_status_created ON payout_events(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_payout_events_batch ON payout_events(settlement_batch_id);
+CREATE INDEX IF NOT EXISTS idx_payout_events_contributor_status ON payout_events(contributor_id, status);
 
 CREATE TABLE IF NOT EXISTS payout_batches (
     id TEXT PRIMARY KEY,
@@ -2995,6 +4437,143 @@ CREATE TABLE IF NOT EXISTS payout_batches (
     notes TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_payout_batches_status_created ON payout_batches(status, created_at);
+
+CREATE TABLE IF NOT EXISTS payout_profiles (
+    contributor_id TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    country_region TEXT NOT NULL,
+    account_type TEXT NOT NULL,
+    account_ref_hash TEXT NOT NULL,
+    account_ref_suffix TEXT NOT NULL,
+    kyc_status TEXT NOT NULL,
+    tax_status TEXT NOT NULL,
+    risk_status TEXT NOT NULL,
+    withholding_rate_bps INTEGER NOT NULL,
+    updated_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_payout_profiles_status_updated ON payout_profiles(status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_payout_profiles_kyc_tax ON payout_profiles(kyc_status, tax_status, risk_status);
+
+CREATE TABLE IF NOT EXISTS enterprise_customers (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    contact_email_hash TEXT NOT NULL,
+    contact_email_domain TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_enterprise_customers_status_created ON enterprise_customers(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_enterprise_customers_tenant ON enterprise_customers(tenant_id, status);
+
+CREATE TABLE IF NOT EXISTS dataset_delivery_grants (
+    id TEXT PRIMARY KEY,
+    order_id TEXT,
+    dataset_id TEXT NOT NULL,
+    customer_id TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    terms_version TEXT NOT NULL,
+    status TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    token_suffix TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    max_reads INTEGER NOT NULL,
+    read_count INTEGER NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    revoked_at TEXT,
+    last_read_at TEXT,
+    FOREIGN KEY (dataset_id) REFERENCES datasets(id),
+    FOREIGN KEY (customer_id) REFERENCES enterprise_customers(id)
+);
+CREATE INDEX IF NOT EXISTS idx_delivery_grants_dataset ON dataset_delivery_grants(dataset_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_delivery_grants_customer ON dataset_delivery_grants(customer_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_delivery_grants_order ON dataset_delivery_grants(order_id, status);
+
+CREATE TABLE IF NOT EXISTS enterprise_contracts (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    customer_id TEXT NOT NULL,
+    version TEXT NOT NULL,
+    status TEXT NOT NULL,
+    terms_json TEXT NOT NULL,
+    effective_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    signed_by TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (customer_id) REFERENCES enterprise_customers(id)
+);
+CREATE INDEX IF NOT EXISTS idx_enterprise_contracts_customer_status ON enterprise_contracts(customer_id, status, created_at);
+
+CREATE TABLE IF NOT EXISTS enterprise_orders (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    customer_id TEXT NOT NULL,
+    dataset_id TEXT NOT NULL,
+    contract_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    gross_revenue_cents INTEGER NOT NULL,
+    direct_cost_cents INTEGER NOT NULL,
+    currency TEXT NOT NULL,
+    max_reads INTEGER NOT NULL,
+    usage_event_id TEXT NOT NULL,
+    delivery_grant_id TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    recognized_at TEXT,
+    last_delivery_at TEXT,
+    FOREIGN KEY (customer_id) REFERENCES enterprise_customers(id),
+    FOREIGN KEY (dataset_id) REFERENCES datasets(id),
+    FOREIGN KEY (contract_id) REFERENCES enterprise_contracts(id)
+);
+CREATE INDEX IF NOT EXISTS idx_enterprise_orders_customer_status ON enterprise_orders(customer_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_enterprise_orders_tenant_created ON enterprise_orders(tenant_id, created_at);
+
+CREATE TABLE IF NOT EXISTS tenant_quotas (
+    tenant_id TEXT PRIMARY KEY,
+    monthly_order_limit INTEGER NOT NULL,
+    monthly_delivery_read_limit INTEGER NOT NULL,
+    monthly_submission_limit INTEGER NOT NULL,
+    monthly_asset_bytes_limit INTEGER NOT NULL,
+    updated_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS disputes (
+    id TEXT PRIMARY KEY,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    resolution TEXT NOT NULL,
+    opened_by TEXT NOT NULL,
+    resolved_by TEXT NOT NULL,
+    hold_payouts INTEGER NOT NULL,
+    held_payout_count INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    resolved_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_disputes_status_created ON disputes(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_disputes_entity ON disputes(entity_type, entity_id, status);
+
+CREATE TABLE IF NOT EXISTS dispute_holds (
+    dispute_id TEXT NOT NULL,
+    payout_id TEXT NOT NULL,
+    previous_status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (dispute_id, payout_id),
+    FOREIGN KEY (dispute_id) REFERENCES disputes(id),
+    FOREIGN KEY (payout_id) REFERENCES payout_events(id)
+);
+CREATE INDEX IF NOT EXISTS idx_dispute_holds_payout ON dispute_holds(payout_id);
 
 CREATE TABLE IF NOT EXISTS tenants (
     id TEXT PRIMARY KEY,
@@ -3183,6 +4762,8 @@ def _data_contract_violations(contract: Dict[str, Any], cases: List[Dict[str, An
     min_drl = contract["min_drl"]
     purpose = contract["purpose"]
     for case in cases:
+        if case["status"] != "commercial_ready":
+            violations.append("case_not_commercial_ready")
         if not case["redaction"]["passed"]:
             violations.append("redaction_not_passed")
         if DRL_ORDER.get(case["quality_gate"]["drl"], 0) < DRL_ORDER[min_drl]:
@@ -3204,7 +4785,7 @@ def _data_contract_violations(contract: Dict[str, Any], cases: List[Dict[str, An
 def _export_record(case: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "case_id": case["case_id"],
-        "owner_id": case["owner_id"],
+        "contributor_ref": _sha256(case["owner_id"])[:16],
         "drl": case["quality_gate"]["drl"],
         "redacted_turns": [{"role": "mixed", "content": case["redacted_text"]}],
         "annotation": case["annotation"],
@@ -3236,11 +4817,132 @@ def _contribution_from_case(case: Dict[str, Any]) -> ContributionWeight:
     )
 
 
+def _assert_review_claim(case: Dict[str, Any], reviewer_id: str) -> None:
+    claimed_by = case.get("review_claimed_by")
+    if claimed_by and claimed_by != reviewer_id:
+        raise ValueError("review_case_claimed_by_other")
+
+
 def _count_by(conn: Any, store: LodiaStore, table_name: str, column_name: str) -> Dict[str, int]:
     table_name = _safe_metric_identifier(table_name)
     column_name = _safe_metric_identifier(column_name)
     rows = store._execute(conn, f"SELECT {column_name} AS key, COUNT(*) AS value FROM {table_name} GROUP BY {column_name}")
     return {row["key"]: row["value"] for row in rows}
+
+
+def _owner_count(conn: Any, store: LodiaStore, table_name: str, owner_id: str) -> int:
+    table_name = _safe_metric_identifier(table_name)
+    row = store._get_one(conn, f"SELECT COUNT(*) AS value FROM {table_name} WHERE owner_id = ?", (owner_id,))
+    return int(row["value"]) if row else 0
+
+
+def _owner_count_grouped(conn: Any, store: LodiaStore, table_name: str, column_name: str, owner_id: str) -> Dict[str, int]:
+    table_name = _safe_metric_identifier(table_name)
+    column_name = _safe_metric_identifier(column_name)
+    rows = store._execute(
+        conn,
+        f"""
+        SELECT {column_name} AS key, COUNT(*) AS value
+        FROM {table_name}
+        WHERE owner_id = ?
+        GROUP BY {column_name}
+        """,
+        (owner_id,),
+    )
+    return {str(row["key"] or "unknown"): int(row["value"]) for row in rows}
+
+
+def _payout_totals_by_status(conn: Any, store: LodiaStore, contributor_id: str) -> Dict[str, Any]:
+    rows = store._execute(
+        conn,
+        """
+        SELECT status, COUNT(*) AS count, COALESCE(SUM(amount_cents), 0) AS amount
+        FROM payout_events
+        WHERE contributor_id = ?
+        GROUP BY status
+        """,
+        (contributor_id,),
+    )
+    amounts: Dict[str, int] = {}
+    counts: Dict[str, int] = {}
+    for row in rows:
+        status = str(row["status"] or "unknown")
+        amounts[status] = int(row["amount"] or 0)
+        counts[status] = int(row["count"] or 0)
+    return {
+        "amounts": amounts,
+        "counts": counts,
+        "total_count": sum(counts.values()),
+    }
+
+
+def _dataset_artifact_descriptor(artifact: str) -> tuple[str, str, str]:
+    try:
+        return DATASET_ARTIFACTS[artifact]
+    except KeyError as exc:
+        raise ValueError("unsupported_dataset_artifact") from exc
+
+
+def _simhash_from_dedup_json(value: Optional[str]) -> Optional[int]:
+    if not value:
+        return None
+    try:
+        simhash = loads(value).get("simhash")
+        return int(simhash) if simhash is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _email_domain(email: str) -> str:
+    if "@" not in email:
+        return "unknown"
+    return email.rsplit("@", 1)[1][:120] or "unknown"
+
+
+def _valid_contact_email(email: str) -> bool:
+    if not email or email.count("@") != 1 or any(char.isspace() for char in email):
+        return False
+    local, domain = email.rsplit("@", 1)
+    return bool(local and domain and "." in domain and not domain.startswith(".") and not domain.endswith("."))
+
+
+def _clean_payout_status(value: str, allowed: set[str], error_code: str) -> str:
+    clean = (value or "").strip().lower()
+    if clean not in allowed:
+        raise ValueError(error_code)
+    return clean
+
+
+def _clean_dispute_entity_type(value: str) -> str:
+    clean = (value or "").strip().lower()
+    allowed = {"enterprise_order", "dataset", "usage_event", "payout_event", "case", "delivery_grant"}
+    if clean not in allowed:
+        raise ValueError("invalid_dispute_entity_type")
+    return clean
+
+
+def _payout_profile_status(kyc_status: str, tax_status: str, risk_status: str) -> str:
+    if _payout_profile_ready(
+        {
+            "kyc_status": kyc_status,
+            "tax_status": tax_status,
+            "risk_status": risk_status,
+            "status": "active",
+        }
+    ):
+        return "active"
+    if kyc_status == "rejected" or tax_status == "rejected" or risk_status in {"blocked", "rejected"}:
+        return "blocked"
+    return "pending_review"
+
+
+def _payout_profile_ready(profile: Dict[str, Any]) -> bool:
+    return (
+        profile.get("status") == "active"
+        and profile.get("kyc_status") == "verified"
+        and profile.get("tax_status") in {"verified", "not_required"}
+        and profile.get("risk_status") == "clear"
+    )
 
 
 def _single_count(conn: Any, store: LodiaStore, table_name: str) -> int:
@@ -3365,6 +5067,11 @@ def _sha256_bytes(value: bytes) -> str:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _month_start() -> str:
+    now = datetime.now(timezone.utc)
+    return datetime(now.year, now.month, 1, tzinfo=timezone.utc).isoformat()
 
 
 def _normalize_expires_at(value: Optional[str]) -> Optional[str]:

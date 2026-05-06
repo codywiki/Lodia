@@ -5,13 +5,14 @@ from lodia.redaction import redact_text
 
 class RedactionTests(unittest.TestCase):
     def test_redacts_common_pii_and_secrets(self):
-        text = "联系张三 phone 13800138000 email user@example.com key sk-abcdefghijklmnopqrstuvwxyz"
+        secret = "sk-" + "abcdefghijklmnopqrstuvwxyz"
+        text = f"联系张三 phone 13800138000 email user@example.com key {secret}"
         result = redact_text(text)
 
         self.assertTrue(result.passed)
         self.assertNotIn("13800138000", result.redacted_text)
         self.assertNotIn("user@example.com", result.redacted_text)
-        self.assertNotIn("sk-abcdefghijklmnopqrstuvwxyz", result.redacted_text)
+        self.assertNotIn(secret, result.redacted_text)
         self.assertIn("[PHONE_1]", result.redacted_text)
         self.assertIn("[EMAIL_1]", result.redacted_text)
         self.assertIn("[SECRET_1]", result.redacted_text)

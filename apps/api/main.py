@@ -5,7 +5,7 @@ import json
 import uuid
 from typing import List, Optional, Tuple
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
@@ -21,6 +21,12 @@ from lodia.store import LodiaStore
 
 RATE_LIMIT_BYPASS_PATHS = {"/api/health", "/api/ready"}
 SIGNATURE_BYPASS_PATHS = {"/api/health", "/api/ready", "/api/auth/login"}
+DELIVERY_AUTH_FAILURES = {
+    "delivery_grant_not_found",
+    "delivery_grant_not_active",
+    "delivery_grant_expired",
+    "invalid_delivery_token",
+}
 
 
 class PreviewRequest(BaseModel):
@@ -76,6 +82,57 @@ class DatasetRequest(BaseModel):
     max_cases: Optional[int] = Field(default=None, ge=1, le=100_000)
 
 
+class EnterpriseCustomerCreateRequest(BaseModel):
+    tenant_id: str = Field(default="default", max_length=80)
+    name: str = Field(min_length=1, max_length=160)
+    contact_email: str = Field(min_length=3, max_length=255)
+
+
+class DeliveryGrantCreateRequest(BaseModel):
+    customer_id: str = Field(min_length=1, max_length=160)
+    order_id: Optional[str] = Field(default=None, max_length=160)
+    purpose: str = Field(default="commercial_dataset", max_length=80)
+    terms_version: str = Field(default="enterprise-delivery-2026-05", max_length=80)
+    expires_at: Optional[str] = Field(default=None, max_length=80)
+    max_reads: int = Field(default=100, ge=1, le=10_000)
+
+
+class EnterpriseContractCreateRequest(BaseModel):
+    customer_id: str = Field(min_length=1, max_length=160)
+    terms_version: str = Field(default="enterprise-contract-2026-05", max_length=80)
+    terms: dict = Field(default_factory=dict)
+    expires_at: Optional[str] = Field(default=None, max_length=80)
+
+
+class EnterpriseOrderCreateRequest(BaseModel):
+    customer_id: str = Field(min_length=1, max_length=160)
+    dataset_id: str = Field(min_length=1, max_length=160)
+    contract_id: str = Field(min_length=1, max_length=160)
+    gross_revenue_cents: int = Field(default=100_000, ge=0)
+    direct_cost_cents: int = Field(default=20_000, ge=0)
+    currency: str = Field(default="CNY", max_length=12)
+    max_reads: int = Field(default=100, ge=1, le=10_000)
+
+
+class TenantQuotaRequest(BaseModel):
+    monthly_order_limit: int = Field(default=0, ge=0)
+    monthly_delivery_read_limit: int = Field(default=0, ge=0)
+    monthly_submission_limit: int = Field(default=0, ge=0)
+    monthly_asset_bytes_limit: int = Field(default=0, ge=0)
+
+
+class DisputeCreateRequest(BaseModel):
+    entity_type: str = Field(min_length=1, max_length=80)
+    entity_id: str = Field(min_length=1, max_length=160)
+    reason: str = Field(default="", max_length=2_000)
+    hold_payouts: bool = True
+
+
+class DisputeResolveRequest(BaseModel):
+    decision: str = Field(pattern="^(release|void)$")
+    resolution: str = Field(default="", max_length=2_000)
+
+
 class LoginRequest(BaseModel):
     email: str = Field(min_length=3, max_length=255)
     password: str = Field(min_length=10, max_length=256)
@@ -104,8 +161,25 @@ class RejectRequest(BaseModel):
     reason: str = Field(default="", max_length=2_000)
 
 
+class ReviewClaimRequest(BaseModel):
+    case_id: Optional[str] = Field(default=None, max_length=160)
+
+
 class PayoutSettleRequest(BaseModel):
     notes: str = Field(default="", max_length=1_000)
+
+
+class ContributorPayoutProfileRequest(BaseModel):
+    country_region: str = Field(default="CN", max_length=40)
+    account_type: str = Field(default="bank", max_length=40)
+    account_reference: str = Field(min_length=4, max_length=255)
+
+
+class AdminPayoutProfileRequest(ContributorPayoutProfileRequest):
+    kyc_status: str = Field(default="pending", max_length=40)
+    tax_status: str = Field(default="pending", max_length=40)
+    risk_status: str = Field(default="clear", max_length=40)
+    withholding_rate_bps: int = Field(default=0, ge=0, le=10_000)
 
 
 class PayoutBatchCreateRequest(BaseModel):
@@ -161,6 +235,7 @@ app.add_middleware(
         "Idempotency-Key",
         "X-Lodia-Signature",
         "X-Lodia-Timestamp",
+        "X-Lodia-Delivery-Token",
         "X-Request-ID",
     ],
 )
@@ -259,6 +334,48 @@ async def me(actor: AuthContext = Depends(require_contributor)):
     return {"subject_id": actor.subject_id, "tenant_id": actor.tenant_id, "roles": sorted(actor.roles), "auth_mode": actor.auth_mode}
 
 
+@app.get("/api/contributor/dashboard")
+async def contributor_dashboard(actor: AuthContext = Depends(require_contributor)):
+    return store.contributor_dashboard(actor.subject_id)
+
+
+@app.get("/api/contributor/cases")
+async def contributor_cases(
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    status: Optional[str] = Query(default=None, max_length=80),
+    actor: AuthContext = Depends(require_contributor),
+):
+    return _page(store.list_cases(limit=limit, offset=offset, status=status, owner_id=actor.subject_id), limit, offset)
+
+
+@app.get("/api/contributor/ledger")
+async def contributor_self_ledger(actor: AuthContext = Depends(require_contributor)):
+    return store.contributor_ledger(actor.subject_id)
+
+
+@app.get("/api/contributor/payout-profile")
+async def contributor_payout_profile(actor: AuthContext = Depends(require_contributor)):
+    try:
+        return store.get_payout_profile(actor.subject_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/contributor/payout-profile")
+async def upsert_contributor_payout_profile(payload: ContributorPayoutProfileRequest, actor: AuthContext = Depends(require_contributor)):
+    try:
+        return store.upsert_payout_profile(
+            contributor_id=actor.subject_id,
+            country_region=payload.country_region,
+            account_type=payload.account_type,
+            account_reference=payload.account_reference,
+            actor_id=actor.subject_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/api/admin/users")
 async def create_user(payload: UserCreateRequest, actor: AuthContext = Depends(require_admin)):
     try:
@@ -316,6 +433,30 @@ async def list_tenants(
     actor: AuthContext = Depends(require_admin),
 ):
     return _page(store.list_tenants(limit=limit, offset=offset, status=status), limit, offset)
+
+
+@app.post("/api/admin/tenant-quotas/{tenant_id}")
+async def upsert_tenant_quota(tenant_id: str, payload: TenantQuotaRequest, actor: AuthContext = Depends(require_admin)):
+    try:
+        return store.upsert_tenant_quota(
+            tenant_id=tenant_id,
+            monthly_order_limit=payload.monthly_order_limit,
+            monthly_delivery_read_limit=payload.monthly_delivery_read_limit,
+            monthly_submission_limit=payload.monthly_submission_limit,
+            monthly_asset_bytes_limit=payload.monthly_asset_bytes_limit,
+            actor_id=actor.subject_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/admin/tenant-quotas")
+async def list_tenant_quotas(
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    actor: AuthContext = Depends(require_admin),
+):
+    return _page(store.list_tenant_quotas(limit=limit, offset=offset), limit, offset)
 
 
 @app.post("/api/admin/tokens/{token_id}/revoke")
@@ -558,6 +699,8 @@ async def reject_case(case_id: str, payload: RejectRequest, actor: AuthContext =
         return store.reject_case(case_id, actor.subject_id, payload.reason)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/reviews")
@@ -580,10 +723,28 @@ async def review_queue(
     return _page(store.list_review_queue(limit=limit, offset=offset), limit, offset)
 
 
+@app.post("/api/review/claim")
+async def claim_review(payload: ReviewClaimRequest, actor: AuthContext = Depends(require_reviewer)):
+    try:
+        return store.claim_review_case(actor.subject_id, case_id=payload.case_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/review/{case_id}/release")
+async def release_review(case_id: str, actor: AuthContext = Depends(require_reviewer)):
+    try:
+        return store.release_review_case(case_id, actor.subject_id, force="admin" in actor.roles)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/api/datasets")
 async def create_dataset(payload: DatasetRequest, actor: AuthContext = Depends(require_admin)):
     try:
-        return store.create_dataset(
+        return _public_dataset(store.create_dataset(
             name=payload.name,
             purpose=payload.purpose,
             min_drl=payload.min_drl,
@@ -591,17 +752,202 @@ async def create_dataset(payload: DatasetRequest, actor: AuthContext = Depends(r
             direct_cost_cents=payload.direct_cost_cents,
             actor_id=actor.subject_id,
             max_cases=payload.max_cases,
+        ))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/admin/enterprise/customers")
+async def create_enterprise_customer(payload: EnterpriseCustomerCreateRequest, actor: AuthContext = Depends(require_admin)):
+    try:
+        return store.create_enterprise_customer(
+            name=payload.name,
+            contact_email=payload.contact_email,
+            tenant_id=payload.tenant_id,
+            actor_id=actor.subject_id,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.get("/api/admin/enterprise/customers")
+async def list_enterprise_customers(
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    status: Optional[str] = Query(default=None, max_length=40),
+    actor: AuthContext = Depends(require_admin),
+):
+    return _page(store.list_enterprise_customers(limit=limit, offset=offset, status=status), limit, offset)
+
+
+@app.post("/api/admin/enterprise/contracts")
+async def create_enterprise_contract(payload: EnterpriseContractCreateRequest, actor: AuthContext = Depends(require_admin)):
+    try:
+        return store.create_enterprise_contract(
+            customer_id=payload.customer_id,
+            terms_version=payload.terms_version,
+            terms=payload.terms,
+            expires_at=payload.expires_at,
+            actor_id=actor.subject_id,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/admin/enterprise/contracts")
+async def list_enterprise_contracts(
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    customer_id: Optional[str] = Query(default=None, max_length=160),
+    status: Optional[str] = Query(default=None, max_length=40),
+    actor: AuthContext = Depends(require_admin),
+):
+    return _page(store.list_enterprise_contracts(limit=limit, offset=offset, customer_id=customer_id, status=status), limit, offset)
+
+
+@app.post("/api/admin/enterprise/orders")
+async def create_enterprise_order(payload: EnterpriseOrderCreateRequest, actor: AuthContext = Depends(require_admin)):
+    try:
+        return store.create_enterprise_order(
+            customer_id=payload.customer_id,
+            dataset_id=payload.dataset_id,
+            contract_id=payload.contract_id,
+            gross_revenue_cents=payload.gross_revenue_cents,
+            direct_cost_cents=payload.direct_cost_cents,
+            currency=payload.currency,
+            max_reads=payload.max_reads,
+            actor_id=actor.subject_id,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/admin/enterprise/orders")
+async def list_enterprise_orders(
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    customer_id: Optional[str] = Query(default=None, max_length=160),
+    status: Optional[str] = Query(default=None, max_length=40),
+    actor: AuthContext = Depends(require_admin),
+):
+    return _page(store.list_enterprise_orders(limit=limit, offset=offset, customer_id=customer_id, status=status), limit, offset)
+
+
+@app.post("/api/admin/enterprise/orders/{order_id}/recognize-usage")
+async def recognize_enterprise_order_usage(order_id: str, actor: AuthContext = Depends(require_admin)):
+    try:
+        return store.recognize_enterprise_order_usage(order_id, actor_id=actor.subject_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/admin/datasets/{dataset_id}/delivery-grants")
+async def create_delivery_grant(dataset_id: str, payload: DeliveryGrantCreateRequest, actor: AuthContext = Depends(require_admin)):
+    try:
+        return store.create_dataset_delivery_grant(
+            dataset_id=dataset_id,
+            customer_id=payload.customer_id,
+            purpose=payload.purpose,
+            terms_version=payload.terms_version,
+            expires_at=payload.expires_at,
+            max_reads=payload.max_reads,
+            order_id=payload.order_id,
+            actor_id=actor.subject_id,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/admin/delivery-grants")
+async def list_delivery_grants(
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    dataset_id: Optional[str] = Query(default=None, max_length=160),
+    customer_id: Optional[str] = Query(default=None, max_length=160),
+    status: Optional[str] = Query(default=None, max_length=40),
+    actor: AuthContext = Depends(require_admin),
+):
+    return _page(
+        store.list_dataset_delivery_grants(limit=limit, offset=offset, dataset_id=dataset_id, customer_id=customer_id, status=status),
+        limit,
+        offset,
+    )
+
+
+@app.post("/api/admin/delivery-grants/{grant_id}/revoke")
+async def revoke_delivery_grant(grant_id: str, actor: AuthContext = Depends(require_admin)):
+    try:
+        return store.revoke_dataset_delivery_grant(grant_id, actor_id=actor.subject_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/datasets")
+async def list_datasets(
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    purpose: Optional[str] = Query(default=None, max_length=80),
+    status: Optional[str] = Query(default=None, max_length=80),
+    actor: AuthContext = Depends(require_reviewer),
+):
+    return _page([_public_dataset(item) for item in store.list_datasets(limit=limit, offset=offset, purpose=purpose, status=status)], limit, offset)
+
+
 @app.get("/api/datasets/{dataset_id}")
 async def get_dataset(dataset_id: str, actor: AuthContext = Depends(require_reviewer)):
     try:
-        return store.get_dataset(dataset_id)
+        return _public_dataset(store.get_dataset(dataset_id))
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/datasets/{dataset_id}/artifacts/{artifact}")
+async def get_dataset_artifact(dataset_id: str, artifact: str, actor: AuthContext = Depends(require_admin)):
+    try:
+        payload = store.read_dataset_artifact(dataset_id, artifact, actor_id=actor.subject_id)
+        return PlainTextResponse(
+            payload["content"],
+            media_type=payload["media_type"],
+            headers={"Content-Disposition": f'attachment; filename="{payload["filename"]}"'},
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/delivery-grants/{grant_id}/artifacts/{artifact}")
+async def get_delivery_grant_artifact(
+    grant_id: str,
+    artifact: str,
+    delivery_token: Optional[str] = Header(default=None, alias="X-Lodia-Delivery-Token"),
+):
+    if not delivery_token:
+        raise HTTPException(status_code=401, detail="missing_delivery_token")
+    try:
+        payload = store.read_delivery_grant_artifact(grant_id, delivery_token, artifact)
+        return PlainTextResponse(
+            payload["content"],
+            media_type=payload["media_type"],
+            headers={"Content-Disposition": f'attachment; filename="{payload["filename"]}"'},
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=401, detail="invalid_delivery_token") from exc
+    except ValueError as exc:
+        reason = str(exc)
+        if reason in DELIVERY_AUTH_FAILURES:
+            raise HTTPException(status_code=401, detail="invalid_delivery_token") from exc
+        if reason == "delivery_grant_read_limit_exceeded":
+            raise HTTPException(status_code=429, detail=reason) from exc
+        raise HTTPException(status_code=400, detail=reason) from exc
 
 
 @app.get("/api/datasets/{dataset_id}/contract")
@@ -635,6 +981,34 @@ async def list_payout_events(
 @app.get("/api/ledger/contributors/{contributor_id}")
 async def contributor_ledger(contributor_id: str, actor: AuthContext = Depends(require_admin)):
     return store.contributor_ledger(contributor_id)
+
+
+@app.get("/api/admin/payout-profiles")
+async def list_payout_profiles(
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    status: Optional[str] = Query(default=None, max_length=40),
+    actor: AuthContext = Depends(require_admin),
+):
+    return _page(store.list_payout_profiles(limit=limit, offset=offset, status=status), limit, offset)
+
+
+@app.post("/api/admin/payout-profiles/{contributor_id}")
+async def upsert_admin_payout_profile(contributor_id: str, payload: AdminPayoutProfileRequest, actor: AuthContext = Depends(require_admin)):
+    try:
+        return store.upsert_payout_profile(
+            contributor_id=contributor_id,
+            country_region=payload.country_region,
+            account_type=payload.account_type,
+            account_reference=payload.account_reference,
+            kyc_status=payload.kyc_status,
+            tax_status=payload.tax_status,
+            risk_status=payload.risk_status,
+            withholding_rate_bps=payload.withholding_rate_bps,
+            actor_id=actor.subject_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/ledger/payout-batches")
@@ -781,6 +1155,43 @@ async def decide_approval(approval_id: str, payload: ApprovalDecisionRequest, ac
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.post("/api/admin/disputes")
+async def create_dispute(payload: DisputeCreateRequest, actor: AuthContext = Depends(require_admin)):
+    try:
+        return store.create_dispute(
+            entity_type=payload.entity_type,
+            entity_id=payload.entity_id,
+            reason=payload.reason,
+            hold_payouts=payload.hold_payouts,
+            actor_id=actor.subject_id,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/admin/disputes")
+async def list_disputes(
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    status: Optional[str] = Query(default=None, max_length=40),
+    entity_id: Optional[str] = Query(default=None, max_length=160),
+    actor: AuthContext = Depends(require_admin),
+):
+    return _page(store.list_disputes(limit=limit, offset=offset, status=status, entity_id=entity_id), limit, offset)
+
+
+@app.post("/api/admin/disputes/{dispute_id}/resolve")
+async def resolve_dispute(dispute_id: str, payload: DisputeResolveRequest, actor: AuthContext = Depends(require_admin)):
+    try:
+        return store.resolve_dispute(dispute_id, payload.decision, payload.resolution, actor_id=actor.subject_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 def _owner_id(requested_owner_id: str, actor: AuthContext) -> str:
     if auth_manager.enabled and "admin" not in actor.roles:
         return actor.subject_id
@@ -823,6 +1234,11 @@ def _public_upload_session(session: dict) -> dict:
 
 def _public_upload_instruction(upload: dict) -> dict:
     return {key: value for key, value in upload.items() if key not in {"object_key", "object_uri"}}
+
+
+def _public_dataset(dataset: dict) -> dict:
+    hidden = {"manifest_path", "quality_report_path", "data_path", "data_contract_path"}
+    return {key: value for key, value in dataset.items() if key not in hidden}
 
 
 def _exceeds_body_limit(content_length: str) -> bool:

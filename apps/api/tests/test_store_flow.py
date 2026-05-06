@@ -9,11 +9,12 @@ class StoreFlowTests(unittest.TestCase):
     def test_submission_review_dataset_and_payout_flow(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = LodiaStore(data_dir=tmp)
+            secret = "sk-" + "abcdefghijklmnopqrstuvwxyz"
             submitted = store.submit_text(
                 owner_id="contributor_1",
                 text=(
                     "请分析这个客服投诉案例，客户手机号 13800138000，"
-                    "API key sk-abcdefghijklmnopqrstuvwxyz。要求输出处理步骤、"
+                    f"API key {secret}。要求输出处理步骤、"
                     "验收结果和可复用规则。"
                 ),
                 allowed_uses=["private_library", "candidate_pool", "commercial_dataset", "training"],
@@ -22,7 +23,7 @@ class StoreFlowTests(unittest.TestCase):
 
             self.assertEqual(case["quality_gate"]["drl"], "DRL2")
             self.assertNotIn("13800138000", case["redacted_text"])
-            self.assertNotIn("sk-abcdefghijklmnopqrstuvwxyz", case["redacted_text"])
+            self.assertNotIn(secret, case["redacted_text"])
 
             raw_files = list(Path(tmp, "raw").glob("*.txt"))
             self.assertEqual(len(raw_files), 1)

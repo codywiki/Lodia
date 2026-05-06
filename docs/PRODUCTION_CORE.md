@@ -20,6 +20,13 @@
 - 直传会话：支持 `/api/assets/upload-sessions` 创建对象存储上传会话，上传完成后回调入库，避免大文件穿过 API。
 - 租户底座：支持 `tenants`、用户 `tenant_id` 和 token auth context，为企业租户、SSO 和配额隔离预留主键。
 - 操作审批：支持审批请求、审批/拒绝、审批审计，供高风险导出和结算接入。
+- 贡献者中心：支持自助 dashboard、个人 Case 列表和贡献者收益账本，API 层强制按认证主体收敛 owner scope。
+- 审核认领：支持 reviewer 认领/释放复核任务，已被他人认领的 Case 会阻断冲突审核动作。
+- 受控交付：支持数据集列表和 Manifest、Quality Report、Data Contract、JSONL artifact 读取，API 响应隐藏对象存储内部路径。
+- 企业交付授权：支持企业客户、数据集交付 grant、一次性 token 返回、token 哈希保存、读取次数上限、过期时间、撤销和读取审计。
+- 企业商业运营：支持企业合同、订单、订单收入确认、租户月度订单/交付读取配额、订单绑定交付 grant、争议开启后冻结 pending payout 并可释放或作废。
+- 收款资料门禁：支持贡献者收款资料、KYC/税务/风控状态、账号引用哈希留存；生产可强制 payout settle 前 profile active。
+- 价值与去重信号：自动标注记录 value_score/value_tier，去重链路增加 simhash 近重复聚类和新颖度折扣。
 - 生产护栏：API request id、请求体上限、单节点限流、请求签名开关、分页查询、`/api/ready` 就绪检查、`/api/admin/observability` 指标快照和 Prometheus 文本指标。
 - 查询性能：Case 增加 `drl`、`quality_score` 查询列和核心索引，数据集生成按 DRL/质量分筛选并限制批量大小。
 - Raw Quarantine：原始对象记录过期时间，支持 TTL purge，S3-compatible 存储支持 SSE/KMS 参数。
@@ -39,6 +46,8 @@ LODIA_REVIEWER_TOKEN=...
 LODIA_CONTRIBUTOR_TOKEN=...
 LODIA_PASSWORD_PEPPER=...
 LODIA_RAW_OBJECT_TTL_HOURS=24
+LODIA_DELIVERY_GRANT_TTL_HOURS=168
+LODIA_REQUIRE_PAYOUT_PROFILE_FOR_SETTLEMENT=true
 LODIA_DB_POOL_MIN_SIZE=1
 LODIA_DB_POOL_MAX_SIZE=10
 LODIA_MAX_ASSET_BYTES=1048576
@@ -107,7 +116,15 @@ SQLite 使用单进程安全的简单领取逻辑。Postgres 使用 `FOR UPDATE 
 
 自动化 worker 最高只生成 DRL2 候选。DRL3 必须人审通过；DRL4 必须在 DRL3 基础上完成专家验证且具备 training 授权；DRL5 必须具备 gold_eval 授权、DRL4 基础和两名不同 reviewer 的 gold review。`gold_eval` 数据集强制 `min_drl=DRL5`，Data Contract 会阻断仍存在 `gold_second_review` 等待办项的 Case。
 
-结算链路支持单个 payout settle，也支持先生成 `payout_batches`。批次会写入 manifest，对应 `payout_events` 从 `pending` 进入 `batched`，最终 settle 后统一进入 `settled` 并记录 `settled_at`、外部流水和审计事件。已经 settled 的批次不能重复结算。
+结算链路支持单个 payout settle，也支持先生成 `payout_batches`。批次会写入 manifest，对应 `payout_events` 从 `pending` 进入 `batched`，最终 settle 后统一进入 `settled` 并记录 `settled_at`、外部流水和审计事件。已经 settled 的批次不能重复结算。生产环境建议开启 `LODIA_REQUIRE_PAYOUT_PROFILE_FOR_SETTLEMENT=true`，只有贡献者 profile 达到 `active` 状态才允许 settle；profile 只返回账号后缀和状态，数据库保存账号引用哈希，不通过 API 暴露原始账号。
+
+## 企业数据交付
+
+企业客户记录只保存联系人邮箱哈希和域名，避免把原始商务联系人信息扩散到交付链路。管理员创建 dataset delivery grant 时，系统只在创建响应里返回一次 `delivery_token`，数据库保存 token hash 与 suffix。企业读取数据集 artifact 必须携带 `X-Lodia-Delivery-Token`，系统会校验 grant 状态、过期时间、最大读取次数和 token hash，并对每次读取写入审计日志。grant 可随时撤销，撤销后不再允许读取。
+
+## 企业商业运营
+
+企业合同、订单和交付授权已经进入同一条对账链路。管理员可先创建 `enterprise_contracts`，再围绕某个 ready dataset 创建 `enterprise_orders`。订单确认收入后会写入 `usage_events`，并根据 dataset 内 Case 权重生成 `payout_events`。订单可绑定 dataset delivery grant，grant 读取会反写订单最后交付时间。`tenant_quotas` 可限制租户月度订单数和交付读取量。发生买方质量争议或贡献者分账争议时，`disputes` 会记录争议对象，并通过 `dispute_holds` 冻结对应 pending payout；仲裁后可释放回 pending 或 void。
 
 ## 1w 日活生产口径
 
@@ -127,5 +144,5 @@ SQLite 使用单进程安全的简单领取逻辑。Postgres 使用 `FOR UPDATE 
 - 将审计日志、`/api/admin/metrics`、`/api/admin/observability` 和 `/api/admin/metrics/prometheus` 接入 SLS/Prometheus/Grafana。
 - 接入真实 OSS RAM 角色或 STS 临时凭据，补删除证明对象。
 - 接入真实 PaddleOCR/ASR/文档解析供应商，并将供应商调用落入 `model_invocations`。
-- 将 Reviewer Console 拆成独立路由和更完整的人审工作台。
-- 在当前租户底座上增加企业 SSO、订单合同、租户配额、真实提现通道和争议仲裁。
+- 将 Reviewer Console 拆成独立路由，补充盲审、抽检分派和复核绩效。
+- 在当前租户底座上增加企业 SSO、真实提现通道、发票税务和支付供应商对账。

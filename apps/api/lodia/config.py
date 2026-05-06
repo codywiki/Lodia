@@ -59,6 +59,8 @@ class LodiaSettings:
     request_signature_secret: Optional[str]
     max_page_limit: int
     dataset_max_cases: int
+    delivery_grant_ttl_hours: int
+    require_payout_profile_for_settlement: bool
 
     @classmethod
     def from_env(cls, data_dir: Optional[str] = None) -> "LodiaSettings":
@@ -105,6 +107,11 @@ class LodiaSettings:
             request_signature_secret=os.environ.get("LODIA_REQUEST_SIGNATURE_SECRET"),
             max_page_limit=_int(os.environ.get("LODIA_MAX_PAGE_LIMIT"), 500),
             dataset_max_cases=_int(os.environ.get("LODIA_DATASET_MAX_CASES"), 5_000),
+            delivery_grant_ttl_hours=_int(os.environ.get("LODIA_DELIVERY_GRANT_TTL_HOURS"), 168),
+            require_payout_profile_for_settlement=_bool(
+                os.environ.get("LODIA_REQUIRE_PAYOUT_PROFILE_FOR_SETTLEMENT"),
+                default=env.lower() == "production",
+            ),
         )
 
     @property

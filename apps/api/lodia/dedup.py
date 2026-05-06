@@ -10,14 +10,30 @@ from .domain import DedupResult
 TOKEN_RE = re.compile(r"[\w\u4e00-\u9fa5]+", re.UNICODE)
 
 
-def fingerprint(raw_text: str, redacted_text: str, known_hashes: Iterable[str] = ()) -> DedupResult:
+def fingerprint(
+    raw_text: str,
+    redacted_text: str,
+    known_hashes: Iterable[str] = (),
+    known_simhashes: Iterable[int] = (),
+) -> DedupResult:
     canonical = canonicalize(redacted_text)
     raw_hash = sha256_text(raw_text)
     canonical_hash = sha256_text(canonical)
     simhash_value = simhash(tokens(canonical))
     known: Set[str] = set(known_hashes)
     duplicate_status = "canonical_duplicate" if canonical_hash in known else "unique"
-    novelty_score = 0.2 if duplicate_status != "unique" else 1.0
+    novelty_score = 1.0
+    if duplicate_status == "canonical_duplicate":
+        novelty_score = 0.2
+    else:
+        distances = [hamming_distance(simhash_value, int(value)) for value in known_simhashes]
+        nearest = min(distances) if distances else None
+        if nearest is not None and nearest <= 5:
+            duplicate_status = "semantic_near_duplicate"
+            novelty_score = 0.45
+        elif nearest is not None and nearest <= 10:
+            duplicate_status = "semantic_clustered"
+            novelty_score = 0.7
     return DedupResult(
         raw_hash=raw_hash,
         canonical_hash=canonical_hash,
@@ -56,4 +72,4 @@ def simhash(items: Iterable[str], bits: int = 64) -> int:
 
 
 def hamming_distance(left: int, right: int) -> int:
-    return (left ^ right).bit_count()
+    return bin(left ^ right).count("1")

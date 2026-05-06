@@ -42,9 +42,12 @@ type PreviewResponse = {
 
 type CaseItem = {
   case_id: string;
+  owner_id: string;
   status: string;
   redacted_text: string;
   authorization_snapshot_id?: string | null;
+  review_claimed_by?: string | null;
+  review_claimed_at?: string | null;
   annotation: {
     quality_score: number;
     domain: string;
@@ -142,6 +145,94 @@ type AuthorizationSnapshot = {
   terms_version: string;
 };
 
+type ContributorDashboard = {
+  contributor_id: string;
+  cases: {
+    total: number;
+    by_status: Record<string, number>;
+    by_drl: Record<string, number>;
+    recent: CaseItem[];
+  };
+  assets: {
+    total: number;
+    by_status: Record<string, number>;
+  };
+  ledger: {
+    pending_cents: number;
+    batched_cents: number;
+    settled_cents: number;
+    total_cents: number;
+    payout_count: number;
+  };
+};
+
+type EnterpriseCustomer = {
+  id: string;
+  tenant_id: string;
+  name: string;
+  status: string;
+  contact_email_domain: string;
+};
+
+type EnterpriseContract = {
+  id: string;
+  customer_id: string;
+  status: string;
+  version: string;
+  expires_at: string;
+};
+
+type EnterpriseOrder = {
+  id: string;
+  customer_id: string;
+  dataset_id: string;
+  contract_id: string;
+  status: string;
+  gross_revenue_cents: number;
+  direct_cost_cents: number;
+  max_reads: number;
+  usage_event_id: string;
+  delivery_grant_id: string;
+};
+
+type DeliveryGrant = {
+  id: string;
+  order_id?: string;
+  dataset_id: string;
+  customer_id: string;
+  status: string;
+  token_suffix: string;
+  delivery_token?: string;
+  read_count: number;
+  max_reads: number;
+  expires_at: string;
+};
+
+type PayoutProfile = {
+  contributor_id: string;
+  status: string;
+  country_region: string;
+  account_type: string;
+  account_ref_suffix: string;
+  kyc_status: string;
+  tax_status: string;
+  risk_status: string;
+};
+
+type TenantQuota = {
+  tenant_id: string;
+  monthly_order_limit: number;
+  monthly_delivery_read_limit: number;
+};
+
+type Dispute = {
+  id: string;
+  entity_type: string;
+  entity_id: string;
+  status: string;
+  held_payout_count: number;
+};
+
 const metrics = [
   { label: "Raw 隔离", value: "100%", icon: LockKeyhole },
   { label: "自动处理", value: "92%", icon: Sparkles },
@@ -162,7 +253,7 @@ const apiUrl = (path: string) => path;
 
 function App() {
   const [text, setText] = useState(
-    "请分析这个客服投诉案例，客户手机号 13800138000，邮箱 user@example.com，API key sk-abcdefghijklmnopqrstuvwxyz。要求输出处理步骤、验收结果和可复用规则。"
+    "请分析这个客服投诉案例，客户手机号 13800138000，邮箱 user@example.com，包含一个测试密钥占位符。要求输出处理步骤、验收结果和可复用规则。"
   );
   const [preview, setPreview] = useState<PreviewResponse | null>(null);
   const [caseItem, setCaseItem] = useState<CaseItem | null>(null);
@@ -176,6 +267,16 @@ function App() {
   const [uploadedAsset, setUploadedAsset] = useState<AssetItem | null>(null);
   const [authorizations, setAuthorizations] = useState<AuthorizationSnapshot[]>([]);
   const [payoutBatch, setPayoutBatch] = useState<PayoutBatch | null>(null);
+  const [contributorDashboard, setContributorDashboard] = useState<ContributorDashboard | null>(null);
+  const [datasets, setDatasets] = useState<DatasetResult[]>([]);
+  const [datasetArtifact, setDatasetArtifact] = useState("");
+  const [enterpriseCustomers, setEnterpriseCustomers] = useState<EnterpriseCustomer[]>([]);
+  const [enterpriseContract, setEnterpriseContract] = useState<EnterpriseContract | null>(null);
+  const [enterpriseOrder, setEnterpriseOrder] = useState<EnterpriseOrder | null>(null);
+  const [deliveryGrant, setDeliveryGrant] = useState<DeliveryGrant | null>(null);
+  const [tenantQuota, setTenantQuota] = useState<TenantQuota | null>(null);
+  const [dispute, setDispute] = useState<Dispute | null>(null);
+  const [payoutProfile, setPayoutProfile] = useState<PayoutProfile | null>(null);
   const [apiToken, setApiToken] = useState("");
   const [loginEmail, setLoginEmail] = useState("contributor@lodia.local");
   const [loginPassword, setLoginPassword] = useState("");
@@ -339,6 +440,39 @@ function App() {
     }
   }
 
+  async function claimNextReview() {
+    setLoading(true);
+    try {
+      const response = await fetch(apiUrl("/api/review/claim"), {
+        method: "POST",
+        headers: requestHeaders(apiToken),
+        body: JSON.stringify({}),
+      });
+      const payload = await response.json();
+      if (payload.case_id) {
+        setCaseItem(payload);
+        await loadReviewQueue();
+      }
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function releaseCurrentReview() {
+    if (!caseItem) return;
+    setLoading(true);
+    try {
+      const response = await fetch(apiUrl(`/api/review/${caseItem.case_id}/release`), {
+        method: "POST",
+        headers: requestHeaders(apiToken),
+      });
+      setCaseItem(await response.json());
+      await loadReviewQueue();
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function rejectCurrentCase() {
     if (!caseItem) return;
     setLoading(true);
@@ -387,6 +521,32 @@ function App() {
         headers: requestHeaders(apiToken, false),
       });
       setDataContract(await response.json());
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function loadDatasets() {
+    setLoading(true);
+    try {
+      const response = await fetch(apiUrl("/api/datasets?limit=6"), {
+        headers: requestHeaders(apiToken, false),
+      });
+      const payload = await response.json();
+      setDatasets(payload.items || []);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function loadDatasetArtifact(artifact: "manifest" | "quality_report" | "data_contract" | "data") {
+    if (!dataset) return;
+    setLoading(true);
+    try {
+      const response = await fetch(apiUrl(`/api/datasets/${dataset.id}/artifacts/${artifact}`), {
+        headers: requestHeaders(apiToken, false),
+      });
+      setDatasetArtifact(await response.text());
     } finally {
       setLoading(false);
     }
@@ -466,6 +626,200 @@ function App() {
       });
       const payload = await response.json();
       setAuthorizations(payload.items || []);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function loadContributorDashboard() {
+    setLoading(true);
+    try {
+      const response = await fetch(apiUrl("/api/contributor/dashboard"), {
+        headers: requestHeaders(apiToken, false),
+      });
+      setContributorDashboard(await response.json());
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function createEnterpriseCustomer() {
+    setLoading(true);
+    try {
+      const response = await fetch(apiUrl("/api/admin/enterprise/customers"), {
+        method: "POST",
+        headers: requestHeaders(apiToken),
+        body: JSON.stringify({ name: "Demo Buyer", contact_email: "buyer@example.com" }),
+      });
+      const customer = await response.json();
+      if (customer.id) {
+        setEnterpriseCustomers([customer, ...enterpriseCustomers.filter((item) => item.id !== customer.id)]);
+      }
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function loadEnterpriseCustomers() {
+    setLoading(true);
+    try {
+      const response = await fetch(apiUrl("/api/admin/enterprise/customers?limit=6"), {
+        headers: requestHeaders(apiToken, false),
+      });
+      const payload = await response.json();
+      setEnterpriseCustomers(payload.items || []);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function ensureEnterpriseCustomer() {
+    let customer = enterpriseCustomers[0];
+    if (customer) return customer;
+    const created = await fetch(apiUrl("/api/admin/enterprise/customers"), {
+      method: "POST",
+      headers: requestHeaders(apiToken),
+      body: JSON.stringify({ name: "Demo Buyer", contact_email: "buyer@example.com" }),
+    });
+    customer = await created.json();
+    setEnterpriseCustomers([customer]);
+    return customer;
+  }
+
+  async function createEnterpriseContract() {
+    setLoading(true);
+    try {
+      const customer = await ensureEnterpriseCustomer();
+      const response = await fetch(apiUrl("/api/admin/enterprise/contracts"), {
+        method: "POST",
+        headers: requestHeaders(apiToken),
+        body: JSON.stringify({
+          customer_id: customer.id,
+          terms_version: "demo-contract",
+          terms: { allowed_use: "training", resale: false },
+        }),
+      });
+      setEnterpriseContract(await response.json());
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function createEnterpriseOrder() {
+    if (!dataset) return;
+    setLoading(true);
+    try {
+      const customer = await ensureEnterpriseCustomer();
+      let contract = enterpriseContract;
+      if (!contract) {
+        const created = await fetch(apiUrl("/api/admin/enterprise/contracts"), {
+          method: "POST",
+          headers: requestHeaders(apiToken),
+          body: JSON.stringify({ customer_id: customer.id, terms_version: "demo-contract" }),
+        });
+        contract = await created.json();
+        setEnterpriseContract(contract);
+      }
+      if (!contract?.id) return;
+      const response = await fetch(apiUrl("/api/admin/enterprise/orders"), {
+        method: "POST",
+        headers: requestHeaders(apiToken),
+        body: JSON.stringify({
+          customer_id: customer.id,
+          dataset_id: dataset.id,
+          contract_id: contract.id,
+          gross_revenue_cents: 100000,
+          direct_cost_cents: 20000,
+          max_reads: 20,
+        }),
+      });
+      setEnterpriseOrder(await response.json());
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function recognizeEnterpriseOrder() {
+    if (!enterpriseOrder) return;
+    setLoading(true);
+    try {
+      const response = await fetch(apiUrl(`/api/admin/enterprise/orders/${enterpriseOrder.id}/recognize-usage`), {
+        method: "POST",
+        headers: requestHeaders(apiToken, false),
+      });
+      setEnterpriseOrder(await response.json());
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function upsertDemoTenantQuota() {
+    setLoading(true);
+    try {
+      const tenantId = enterpriseCustomers[0]?.tenant_id || "default";
+      const response = await fetch(apiUrl(`/api/admin/tenant-quotas/${tenantId}`), {
+        method: "POST",
+        headers: requestHeaders(apiToken),
+        body: JSON.stringify({ monthly_order_limit: 50, monthly_delivery_read_limit: 500 }),
+      });
+      setTenantQuota(await response.json());
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function openEnterpriseDispute() {
+    if (!enterpriseOrder) return;
+    setLoading(true);
+    try {
+      const response = await fetch(apiUrl("/api/admin/disputes"), {
+        method: "POST",
+        headers: requestHeaders(apiToken),
+        body: JSON.stringify({
+          entity_type: "enterprise_order",
+          entity_id: enterpriseOrder.id,
+          reason: "Demo quality challenge",
+          hold_payouts: true,
+        }),
+      });
+      setDispute(await response.json());
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function createDeliveryGrant() {
+    if (!dataset) return;
+    setLoading(true);
+    try {
+      const customer = await ensureEnterpriseCustomer();
+      const response = await fetch(apiUrl(`/api/admin/datasets/${dataset.id}/delivery-grants`), {
+        method: "POST",
+        headers: requestHeaders(apiToken),
+        body: JSON.stringify({ customer_id: customer.id, order_id: enterpriseOrder?.id, max_reads: 20 }),
+      });
+      setDeliveryGrant(await response.json());
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function submitPayoutProfile(verified = false) {
+    setLoading(true);
+    try {
+      const contributorId = caseItem?.owner_id || contributorDashboard?.contributor_id || "demo_contributor";
+      const endpoint = verified ? `/api/admin/payout-profiles/${contributorId}` : "/api/contributor/payout-profile";
+      const response = await fetch(apiUrl(endpoint), {
+        method: "POST",
+        headers: requestHeaders(apiToken),
+        body: JSON.stringify({
+          country_region: "CN",
+          account_type: "bank",
+          account_reference: "6222000000000000",
+          ...(verified ? { kyc_status: "verified", tax_status: "verified", risk_status: "clear" } : {}),
+        }),
+      });
+      setPayoutProfile(await response.json());
     } finally {
       setLoading(false);
     }
@@ -578,6 +932,12 @@ function App() {
               <button className="secondary-action" onClick={loadReviewQueue} disabled={loading}>
                 审核队列
               </button>
+              <button className="secondary-action" onClick={claimNextReview} disabled={loading}>
+                认领复核
+              </button>
+              <button className="secondary-action" onClick={releaseCurrentReview} disabled={loading || !caseItem?.review_claimed_by}>
+                释放复核
+              </button>
               <button className="secondary-action" onClick={loadAuditLogs} disabled={loading}>
                 审计日志
               </button>
@@ -586,6 +946,9 @@ function App() {
               </button>
               <button className="secondary-action" onClick={loadObservability} disabled={loading}>
                 观测
+              </button>
+              <button className="secondary-action" onClick={loadContributorDashboard} disabled={loading}>
+                贡献者
               </button>
             </div>
           </div>
@@ -702,6 +1065,10 @@ function App() {
                   <strong>{caseItem.status}</strong>
                 </div>
                 <div className="result-row">
+                  <span>认领人</span>
+                  <strong>{caseItem.review_claimed_by || "-"}</strong>
+                </div>
+                <div className="result-row">
                   <span>DRL</span>
                   <strong>{caseItem.quality_gate.drl}</strong>
                 </div>
@@ -741,6 +1108,12 @@ function App() {
                 <button className="secondary-action" onClick={loadDataContract} disabled={loading}>
                   Data Contract
                 </button>
+                <button className="secondary-action" onClick={loadDatasets} disabled={loading}>
+                  数据集列表
+                </button>
+                <button className="secondary-action" onClick={() => loadDatasetArtifact("data")} disabled={loading}>
+                  导出预览
+                </button>
                 <button className="secondary-action" onClick={createPayoutBatch} disabled={loading}>
                   生成结算批次
                 </button>
@@ -752,6 +1125,9 @@ function App() {
                     <span>批次</span>
                     <strong>{payoutBatch.status} · {formatMoney(payoutBatch.total_amount_cents)}</strong>
                   </div>
+                ) : null}
+                {datasetArtifact ? (
+                  <pre className="artifact-preview">{datasetArtifact.slice(0, 900)}</pre>
                 ) : null}
               </div>
             ) : (
@@ -772,7 +1148,7 @@ function App() {
                   <div className="audit-row" key={item.case_id}>
                     <span>{item.status}</span>
                     <strong>{item.case_id}</strong>
-                    <small>{item.quality_gate.drl}</small>
+                    <small>{item.quality_gate.drl} · {item.review_claimed_by || "unclaimed"}</small>
                   </div>
                 ))}
               </div>
@@ -820,6 +1196,150 @@ function App() {
             ) : (
               <p className="empty-state">生产指标用于接入 SLS、Prometheus 和告警面板。</p>
             )}
+          </div>
+        </section>
+
+        <section className="split lower-split">
+          <div className="panel">
+            <div className="panel-heading">
+              <Scale size={18} />
+              <h2>贡献者中心</h2>
+            </div>
+            {contributorDashboard ? (
+              <div className="result-stack">
+                <div className="result-row">
+                  <span>Case 总数</span>
+                  <strong>{contributorDashboard.cases.total}</strong>
+                </div>
+                <div className="result-row">
+                  <span>待收益</span>
+                  <strong>{formatMoney(contributorDashboard.ledger.pending_cents)}</strong>
+                </div>
+                <div className="result-row">
+                  <span>已结算</span>
+                  <strong>{formatMoney(contributorDashboard.ledger.settled_cents)}</strong>
+                </div>
+                <div className="result-row">
+                  <span>DRL3+</span>
+                  <strong>{(contributorDashboard.cases.by_drl.DRL3 || 0) + (contributorDashboard.cases.by_drl.DRL4 || 0) + (contributorDashboard.cases.by_drl.DRL5 || 0)}</strong>
+                </div>
+                <div className="action-row">
+                  <button className="secondary-action" onClick={() => submitPayoutProfile(false)} disabled={loading}>
+                    提交收款资料
+                  </button>
+                  <button className="secondary-action" onClick={() => submitPayoutProfile(true)} disabled={loading}>
+                    验证资料
+                  </button>
+                </div>
+                {payoutProfile ? (
+                  <div className="result-row">
+                    <span>收款资料</span>
+                    <strong>{payoutProfile.status} · {payoutProfile.account_type} {payoutProfile.account_ref_suffix}</strong>
+                  </div>
+                ) : null}
+              </div>
+            ) : (
+              <p className="empty-state">贡献者可以查看 Case、授权状态和持续收益账本。</p>
+            )}
+          </div>
+
+          <div className="panel">
+            <div className="panel-heading">
+              <Database size={18} />
+              <h2>企业交付</h2>
+            </div>
+            <div className="action-row">
+              <button className="secondary-action" onClick={loadEnterpriseCustomers} disabled={loading}>
+                客户列表
+              </button>
+              <button className="secondary-action" onClick={createEnterpriseCustomer} disabled={loading}>
+                新建客户
+              </button>
+              <button className="secondary-action" onClick={createEnterpriseContract} disabled={loading}>
+                创建合同
+              </button>
+              <button className="secondary-action" onClick={createEnterpriseOrder} disabled={loading || !dataset}>
+                创建订单
+              </button>
+              <button className="secondary-action" onClick={createDeliveryGrant} disabled={loading || !dataset}>
+                创建交付授权
+              </button>
+              <button className="secondary-action" onClick={recognizeEnterpriseOrder} disabled={loading || !enterpriseOrder}>
+                确认收入
+              </button>
+              <button className="secondary-action" onClick={upsertDemoTenantQuota} disabled={loading}>
+                配额
+              </button>
+              <button className="secondary-action" onClick={openEnterpriseDispute} disabled={loading || !enterpriseOrder}>
+                争议
+              </button>
+            </div>
+            {datasets.length ? (
+              <div className="audit-list">
+                {datasets.map((item) => (
+                  <div className="audit-row" key={item.id}>
+                    <span>{item.status}</span>
+                    <strong>{item.name}</strong>
+                    <small>{item.case_ids.length} cases</small>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="empty-state">企业侧只拿到脱敏数据、Manifest、Quality Report 和 Data Contract。</p>
+            )}
+            {enterpriseCustomers.length ? (
+              <div className="audit-list">
+                {enterpriseCustomers.map((item) => (
+                  <div className="audit-row" key={item.id}>
+                    <span>{item.status}</span>
+                    <strong>{item.name}</strong>
+                    <small>{item.contact_email_domain}</small>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+            {enterpriseContract || enterpriseOrder || deliveryGrant || tenantQuota || dispute ? (
+              <div className="result-stack">
+                {enterpriseContract ? (
+                  <div className="result-row">
+                    <span>企业合同</span>
+                    <strong>{enterpriseContract.status} · {enterpriseContract.version}</strong>
+                  </div>
+                ) : null}
+                {enterpriseOrder ? (
+                  <div className="result-row">
+                    <span>企业订单</span>
+                    <strong>{enterpriseOrder.status} · {formatMoney(enterpriseOrder.gross_revenue_cents - enterpriseOrder.direct_cost_cents)}</strong>
+                  </div>
+                ) : null}
+                {deliveryGrant ? (
+                  <>
+                    <div className="result-row">
+                      <span>交付授权</span>
+                      <strong>{deliveryGrant.status} · {deliveryGrant.token_suffix} · {deliveryGrant.read_count}/{deliveryGrant.max_reads}</strong>
+                    </div>
+                    {deliveryGrant.delivery_token ? (
+                      <div className="result-row">
+                        <span>一次性 Token</span>
+                        <code className="secret-token">{deliveryGrant.delivery_token}</code>
+                      </div>
+                    ) : null}
+                  </>
+                ) : null}
+                {tenantQuota ? (
+                  <div className="result-row">
+                    <span>租户配额</span>
+                    <strong>{tenantQuota.tenant_id} · {tenantQuota.monthly_order_limit}/{tenantQuota.monthly_delivery_read_limit}</strong>
+                  </div>
+                ) : null}
+                {dispute ? (
+                  <div className="result-row">
+                    <span>争议</span>
+                    <strong>{dispute.status} · hold {dispute.held_payout_count}</strong>
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
           </div>
         </section>
 

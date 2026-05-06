@@ -22,10 +22,11 @@ def process_text_case(
     owner_id: str,
     allowed_uses: List[str],
     known_hashes: Optional[List[str]] = None,
+    known_simhashes: Optional[List[int]] = None,
     human_reviewed: bool = False,
 ) -> ProcessedCase:
     redaction = redact_text(raw_text)
-    dedup = fingerprint(raw_text, redaction.redacted_text, known_hashes or [])
+    dedup = fingerprint(raw_text, redaction.redacted_text, known_hashes or [], known_simhashes or [])
     annotation = annotate(redaction.redacted_text, redaction)
     quality_gate = run_quality_gate(
         redaction=redaction,

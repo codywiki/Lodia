@@ -27,6 +27,7 @@ def annotate(redacted_text: str, redaction: RedactionResult) -> AnnotationResult
     domain = _best_label(redacted_text, DOMAIN_KEYWORDS, "general_knowledge")
     task_type = _best_label(redacted_text, TASK_KEYWORDS, "qa_assistance")
     quality_score = score_quality(redacted_text, redaction)
+    value_score = score_case_value(redacted_text, domain, task_type, quality_score)
     difficulty = "advanced" if quality_score >= 0.82 else "intermediate" if quality_score >= 0.62 else "basic"
     reuse_types = _reuse_types(task_type, domain, quality_score)
     confidence = min(0.95, 0.45 + quality_score * 0.45 + (0.1 if domain != "general_knowledge" else 0))
@@ -37,7 +38,11 @@ def annotate(redacted_text: str, redaction: RedactionResult) -> AnnotationResult
         reuse_types=reuse_types,
         quality_score=round(quality_score, 4),
         confidence=round(confidence, 4),
-        labels={"language": "zh-CN" if re.search(r"[\u4e00-\u9fa5]", redacted_text) else "en"},
+        labels={
+            "language": "zh-CN" if re.search(r"[\u4e00-\u9fa5]", redacted_text) else "en",
+            "value_score": f"{value_score:.4f}",
+            "value_tier": _value_tier(value_score),
+        },
     )
 
 
@@ -57,6 +62,27 @@ def score_quality(redacted_text: str, redaction: RedactionResult) -> float:
         - risk_penalty
     )
     return max(0.0, min(score, 1.0))
+
+
+def score_case_value(redacted_text: str, domain: str, task_type: str, quality_score: float) -> float:
+    has_context = _contains_any(redacted_text, ("背景", "上下文", "约束", "目标", "输入", "限制"))
+    has_process = _contains_any(redacted_text, ("步骤", "过程", "调用", "工具", "trace", "执行"))
+    has_outcome = _contains_any(redacted_text, ("结果", "验收", "通过", "失败", "反馈", "修正"))
+    has_reuse = _contains_any(redacted_text, ("规则", "标准", "SOP", "可复用", "评测", "数据集"))
+    domain_weight = 0.1 if domain in {"software_engineering", "customer_service", "agent_trace"} else 0.04
+    task_weight = 0.08 if task_type in {"debugging", "evaluation", "workflow_execution"} else 0.03
+    score = quality_score * 0.48 + has_context * 0.12 + has_process * 0.12 + has_outcome * 0.12 + has_reuse * 0.08 + domain_weight + task_weight
+    return max(0.0, min(score, 1.0))
+
+
+def _value_tier(score: float) -> str:
+    if score >= 0.82:
+        return "A"
+    if score >= 0.66:
+        return "B"
+    if score >= 0.5:
+        return "C"
+    return "D"
 
 
 def _best_label(text: str, keyword_map: Dict[str, Iterable[str]], fallback: str) -> str:

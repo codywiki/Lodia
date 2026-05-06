@@ -242,6 +242,15 @@ textarea {
   color: #64748b;
 }
 
+.secret-token {
+  color: #0f172a;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+  max-width: 58%;
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+
 .redacted-output {
   background: #f8fafc;
   border: 1px solid #e2e8f0;
@@ -252,6 +261,20 @@ textarea {
   overflow: auto;
   padding: 12px;
   white-space: pre-wrap;
+}
+
+.artifact-preview {
+  background: #0f172a;
+  border-radius: 8px;
+  color: #e2e8f0;
+  font-size: 12px;
+  line-height: 1.6;
+  margin: 0;
+  max-height: 240px;
+  overflow: auto;
+  padding: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .empty-state {
