@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
+from .assets import inspect_asset
 from .config import LodiaSettings
 from .database import Database, row_to_dict
 from .domain import ContributionWeight, DataReadinessLevel, RevenueEvent
@@ -201,6 +202,125 @@ class LodiaStore:
                 "token_id": row["id"],
             }
 
+    def create_authorization_snapshot(
+        self,
+        owner_id: str,
+        allowed_uses: List[str],
+        policy_version: str = "cn-pipl-2026-05",
+        terms_version: str = "contributor-2026-05",
+        source: str = "api",
+        consent_text: str = "",
+        actor_id: Optional[str] = None,
+        conn: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        if conn is None:
+            with self._session() as active:
+                return self.create_authorization_snapshot(
+                    owner_id=owner_id,
+                    allowed_uses=allowed_uses,
+                    policy_version=policy_version,
+                    terms_version=terms_version,
+                    source=source,
+                    consent_text=consent_text,
+                    actor_id=actor_id,
+                    conn=active,
+                )
+
+        snapshot_id = _id("authz")
+        now = _now()
+        scope = _clean_allowed_uses(allowed_uses)
+        consent_text_hash = _sha256(consent_text) if consent_text else ""
+        self._execute(
+            conn,
+            """
+            INSERT INTO authorization_snapshots
+            (id, owner_id, status, allowed_uses_json, policy_version, terms_version,
+             consent_text_hash, source, created_at, withdrawn_at, withdrawal_reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (snapshot_id, owner_id, "active", dumps(scope), policy_version, terms_version, consent_text_hash, source, now, None, ""),
+        )
+        self._audit(conn, actor_id or owner_id, "authorization.created", "authorization_snapshot", snapshot_id, {"allowed_uses": scope})
+        return self.get_authorization_snapshot(snapshot_id, conn=conn)
+
+    def get_authorization_snapshot(self, snapshot_id: str, conn: Optional[Any] = None) -> Dict[str, Any]:
+        if conn is None:
+            with self._session() as active:
+                return self.get_authorization_snapshot(snapshot_id, conn=active)
+        row = self._get_one(conn, "SELECT * FROM authorization_snapshots WHERE id = ?", (snapshot_id,))
+        if not row:
+            raise KeyError("authorization_snapshot_not_found")
+        return self._authorization_from_row(row)
+
+    def list_authorization_snapshots(
+        self,
+        owner_id: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        limit, offset = _page_bounds(limit, offset, self.settings.max_page_limit)
+        filters: List[str] = []
+        params: List[Any] = []
+        if owner_id:
+            filters.append("owner_id = ?")
+            params.append(owner_id)
+        if status:
+            filters.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        params.extend([limit, offset])
+        with self._session() as conn:
+            return [
+                self._authorization_from_row(row)
+                for row in self._execute(
+                    conn,
+                    f"""
+                    SELECT * FROM authorization_snapshots
+                    {where}
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    tuple(params),
+                )
+            ]
+
+    def withdraw_authorization_snapshot(self, snapshot_id: str, reason: str = "", actor_id: str = "system") -> Dict[str, Any]:
+        with self._session() as conn:
+            snapshot = self.get_authorization_snapshot(snapshot_id, conn=conn)
+            if snapshot["status"] == "withdrawn":
+                return snapshot
+            now = _now()
+            self._execute(
+                conn,
+                """
+                UPDATE authorization_snapshots
+                SET status = ?, withdrawn_at = ?, withdrawal_reason = ?
+                WHERE id = ?
+                """,
+                ("withdrawn", now, reason, snapshot_id),
+            )
+            self._execute(
+                conn,
+                """
+                UPDATE cases
+                SET status = ?, updated_at = ?
+                WHERE authorization_snapshot_id = ? AND status != ?
+                """,
+                ("withdrawn", now, snapshot_id, "withdrawn"),
+            )
+            self._execute(
+                conn,
+                """
+                UPDATE assets
+                SET status = ?, updated_at = ?
+                WHERE authorization_snapshot_id = ? AND status != ?
+                """,
+                ("withdrawn", now, snapshot_id, "withdrawn"),
+            )
+            self._audit(conn, actor_id, "authorization.withdrawn", "authorization_snapshot", snapshot_id, {"reason": reason[:400]})
+            return self.get_authorization_snapshot(snapshot_id, conn=conn)
+
     def submit_text(
         self,
         owner_id: str,
@@ -208,49 +328,74 @@ class LodiaStore:
         allowed_uses: List[str],
         actor_id: Optional[str] = None,
         enqueue: Optional[bool] = None,
+        authorization_snapshot_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         submission_id = _id("sub")
         raw_hash = _sha256(text)
-        raw_ref = self.objects.put_text(f"raw/{submission_id}.txt", text)
         now = _now()
         raw_expires_at = _future_hours(self.settings.raw_object_ttl_hours)
-        with self._session() as conn:
-            self._execute(
-                conn,
-                """
-                INSERT INTO submissions
-                (id, owner_id, source_type, status, raw_path, raw_hash, allowed_uses_json,
-                 raw_expires_at, raw_deleted_at, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    submission_id,
-                    owner_id,
-                    "text",
-                    "quarantined",
-                    raw_ref.uri,
-                    raw_hash,
-                    json.dumps(allowed_uses, ensure_ascii=False),
-                    raw_expires_at,
-                    None,
-                    now,
-                ),
-            )
-            self._audit(conn, actor_id or owner_id, "submission.created", "submission", submission_id, {"source_type": "text"})
-
-            should_enqueue = self.settings.async_processing if enqueue is None else enqueue
-            if should_enqueue:
-                job_id = self._enqueue_job(
+        raw_ref = None
+        committed = False
+        try:
+            with self._session() as conn:
+                authorization = self._resolve_authorization(
                     conn,
-                    job_type="process_submission",
-                    payload={"submission_id": submission_id},
-                    queue_name="ingestion",
+                    owner_id=owner_id,
+                    allowed_uses=allowed_uses,
+                    authorization_snapshot_id=authorization_snapshot_id,
                     actor_id=actor_id or owner_id,
+                    source="text_submission",
                 )
-                queued = {"submission_id": submission_id, "status": "queued"}
-            else:
-                job_id = ""
-                queued = {}
+                raw_ref = self.objects.put_text(f"raw/{submission_id}.txt", text)
+                self._execute(
+                    conn,
+                    """
+                    INSERT INTO submissions
+                    (id, owner_id, source_type, status, raw_path, raw_hash, allowed_uses_json,
+                     authorization_snapshot_id, raw_expires_at, raw_deleted_at, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        submission_id,
+                        owner_id,
+                        "text",
+                        "quarantined",
+                        raw_ref.uri,
+                        raw_hash,
+                        dumps(authorization["allowed_uses"]),
+                        authorization["id"],
+                        raw_expires_at,
+                        None,
+                        now,
+                    ),
+                )
+                self._audit(
+                    conn,
+                    actor_id or owner_id,
+                    "submission.created",
+                    "submission",
+                    submission_id,
+                    {"source_type": "text", "authorization_snapshot_id": authorization["id"]},
+                )
+
+                should_enqueue = self.settings.async_processing if enqueue is None else enqueue
+                if should_enqueue:
+                    job_id = self._enqueue_job(
+                        conn,
+                        job_type="process_submission",
+                        payload={"submission_id": submission_id},
+                        queue_name="ingestion",
+                        actor_id=actor_id or owner_id,
+                    )
+                    queued = {"submission_id": submission_id, "status": "queued"}
+                else:
+                    job_id = ""
+                    queued = {}
+            committed = True
+        except Exception:
+            if raw_ref and not committed:
+                self._delete_object_quietly(raw_ref.uri)
+            raise
         if queued:
             self._publish_job("ingestion", job_id)
             return queued
@@ -258,11 +403,216 @@ class LodiaStore:
         processed = self.process_submission(submission_id, actor_id=actor_id or owner_id)
         return {"submission_id": submission_id, "case": processed}
 
+    def submit_asset(
+        self,
+        owner_id: str,
+        filename: str,
+        media_type: str,
+        content: bytes,
+        allowed_uses: List[str],
+        actor_id: Optional[str] = None,
+        enqueue: Optional[bool] = None,
+        authorization_snapshot_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if not content:
+            raise ValueError("asset_empty")
+        if len(content) > self.settings.max_asset_bytes:
+            raise ValueError("asset_too_large")
+        asset_id = _id("ast")
+        inspection = inspect_asset(filename, media_type, content)
+        now = _now()
+        raw_expires_at = _future_hours(self.settings.raw_object_ttl_hours)
+        raw_ref = None
+        committed = False
+        try:
+            with self._session() as conn:
+                authorization = self._resolve_authorization(
+                    conn,
+                    owner_id=owner_id,
+                    allowed_uses=allowed_uses,
+                    authorization_snapshot_id=authorization_snapshot_id,
+                    actor_id=actor_id or owner_id,
+                    source="asset_upload",
+                )
+                raw_ref = self.objects.put_bytes(
+                    f"raw/assets/{asset_id}/{inspection.filename}",
+                    content,
+                    inspection.media_type,
+                )
+                self._execute(
+                    conn,
+                    """
+                    INSERT INTO assets
+                    (id, owner_id, submission_id, authorization_snapshot_id, filename, media_type, asset_type,
+                     byte_size, sha256, status, raw_path, extracted_text_path, metadata_json, risk_json,
+                     redaction_json, raw_expires_at, raw_deleted_at, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        asset_id,
+                        owner_id,
+                        None,
+                        authorization["id"],
+                        inspection.filename,
+                        inspection.media_type,
+                        inspection.asset_type,
+                        inspection.byte_size,
+                        inspection.sha256,
+                        "quarantined",
+                        raw_ref.uri,
+                        None,
+                        dumps(inspection.metadata),
+                        dumps(inspection.risk),
+                        dumps(inspection.redaction or {}),
+                        raw_expires_at,
+                        None,
+                        now,
+                        now,
+                    ),
+                )
+                self._audit(
+                    conn,
+                    actor_id or owner_id,
+                    "asset.created",
+                    "asset",
+                    asset_id,
+                    {"asset_type": inspection.asset_type, "authorization_snapshot_id": authorization["id"]},
+                )
+                should_enqueue = self.settings.async_processing if enqueue is None else enqueue
+                if should_enqueue:
+                    job_id = self._enqueue_job(
+                        conn,
+                        job_type="process_asset",
+                        payload={"asset_id": asset_id},
+                        queue_name="ingestion",
+                        actor_id=actor_id or owner_id,
+                    )
+                    asset = self.get_asset(asset_id, conn=conn)
+                else:
+                    job_id = ""
+                    asset = self.get_asset(asset_id, conn=conn)
+            committed = True
+        except Exception:
+            if raw_ref and not committed:
+                self._delete_object_quietly(raw_ref.uri)
+            raise
+        if job_id:
+            self._publish_job("ingestion", job_id)
+            return {"asset": asset, "status": "queued"}
+        return {"asset": self.process_asset(asset_id, actor_id=actor_id or owner_id)}
+
+    def process_asset(self, asset_id: str, actor_id: str = "system") -> Dict[str, Any]:
+        with self._session() as conn:
+            asset_row = self._get_one(conn, "SELECT * FROM assets WHERE id = ?", (asset_id,))
+            if not asset_row:
+                raise KeyError("asset_not_found")
+            if asset_row["raw_deleted_at"]:
+                raise ValueError("raw_object_deleted")
+            authorization = self.get_authorization_snapshot(asset_row["authorization_snapshot_id"], conn=conn)
+            if authorization["status"] != "active":
+                raise ValueError("authorization_not_active")
+            content = self.objects.read_bytes(asset_row["raw_path"])
+            inspection = inspect_asset(asset_row["filename"], asset_row["media_type"], content)
+            extracted_ref = None
+            submission_id = asset_row["submission_id"]
+            if inspection.extracted_text:
+                extracted_text = inspection.redaction["redacted_text"] if inspection.redaction else inspection.extracted_text
+                extracted_ref = self.objects.put_text(f"evidence/assets/{asset_id}/redacted_text.txt", extracted_text)
+                if not submission_id and inspection.status == "evidence_ready":
+                    submission_id = self._create_submission_from_asset(
+                        conn,
+                        asset_id=asset_id,
+                        owner_id=asset_row["owner_id"],
+                        text=inspection.extracted_text,
+                        allowed_uses=authorization["allowed_uses"],
+                        authorization_snapshot_id=authorization["id"],
+                        actor_id=actor_id,
+                    )
+            now = _now()
+            self._execute(
+                conn,
+                """
+                UPDATE assets
+                SET submission_id = ?, asset_type = ?, byte_size = ?, sha256 = ?, status = ?,
+                    extracted_text_path = ?, metadata_json = ?, risk_json = ?, redaction_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    submission_id,
+                    inspection.asset_type,
+                    inspection.byte_size,
+                    inspection.sha256,
+                    inspection.status,
+                    extracted_ref.uri if extracted_ref else asset_row["extracted_text_path"],
+                    dumps(inspection.metadata),
+                    dumps(inspection.risk),
+                    dumps(inspection.redaction or {}),
+                    now,
+                    asset_id,
+                ),
+            )
+            self._audit(conn, actor_id, "asset.processed", "asset", asset_id, {"status": inspection.status})
+        if submission_id and inspection.status == "evidence_ready":
+            try:
+                self.process_submission(submission_id, actor_id=actor_id)
+            except ValueError as exc:
+                if str(exc) != "raw_object_deleted":
+                    raise
+        return self.get_asset(asset_id)
+
+    def get_asset(self, asset_id: str, conn: Optional[Any] = None) -> Dict[str, Any]:
+        if conn is None:
+            with self._session() as active:
+                return self.get_asset(asset_id, conn=active)
+        row = self._get_one(conn, "SELECT * FROM assets WHERE id = ?", (asset_id,))
+        if not row:
+            raise KeyError("asset_not_found")
+        return self._asset_from_row(row)
+
+    def list_assets(
+        self,
+        owner_id: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        limit, offset = _page_bounds(limit, offset, self.settings.max_page_limit)
+        filters: List[str] = []
+        params: List[Any] = []
+        if owner_id:
+            filters.append("owner_id = ?")
+            params.append(owner_id)
+        if status:
+            filters.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        params.extend([limit, offset])
+        with self._session() as conn:
+            return [
+                self._asset_from_row(row)
+                for row in self._execute(
+                    conn,
+                    f"""
+                    SELECT * FROM assets
+                    {where}
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    tuple(params),
+                )
+            ]
+
     def process_submission(self, submission_id: str, actor_id: str = "system") -> Dict[str, Any]:
         with self._session() as conn:
             submission = self._get_one(conn, "SELECT * FROM submissions WHERE id = ?", (submission_id,))
             if not submission:
                 raise KeyError("submission_not_found")
+            if submission["raw_deleted_at"]:
+                raise ValueError("raw_object_deleted")
+            if submission["authorization_snapshot_id"]:
+                authorization = self.get_authorization_snapshot(submission["authorization_snapshot_id"], conn=conn)
+                if authorization["status"] != "active":
+                    raise ValueError("authorization_not_active")
             existing_case = self._get_one(conn, "SELECT * FROM cases WHERE submission_id = ?", (submission_id,))
             if existing_case:
                 self._audit(conn, actor_id, "case.process_skipped", "case", existing_case["id"], {"reason": "already_processed"})
@@ -283,8 +633,9 @@ class LodiaStore:
                 """
                 INSERT INTO cases
                 (id, submission_id, owner_id, status, redacted_text, raw_hash, canonical_hash,
-                 drl, quality_score, redaction_json, annotation_json, dedup_json, quality_gate_json, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 drl, quality_score, redaction_json, annotation_json, dedup_json, quality_gate_json,
+                 authorization_snapshot_id, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     case["case_id"],
@@ -300,6 +651,7 @@ class LodiaStore:
                     dumps(case["annotation"]),
                     dumps(case["dedup"]),
                     dumps(case["quality_gate"]),
+                    submission["authorization_snapshot_id"],
                     now,
                     now,
                 ),
@@ -453,6 +805,7 @@ class LodiaStore:
                 if DRL_ORDER.get(loads(row["quality_gate_json"])["drl"], 0) >= DRL_ORDER[min_drl]
             ]
             eligible = [case for case in eligible if _case_allowed_for_purpose(case, purpose)]
+            eligible = [case for case in eligible if self._case_authorization_active(conn, case)]
             if not eligible:
                 raise ValueError("no_eligible_cases")
 
@@ -678,6 +1031,7 @@ class LodiaStore:
     def purge_expired_raw_objects(self, limit: int = 100, actor_id: str = "system") -> Dict[str, Any]:
         limit = _bounded_limit(limit, self.settings.max_page_limit)
         purged: List[str] = []
+        purged_assets: List[str] = []
         now = _now()
         with self._session() as conn:
             rows = self._execute(
@@ -696,15 +1050,39 @@ class LodiaStore:
                 self._execute(conn, "UPDATE submissions SET raw_deleted_at = ? WHERE id = ?", (now, row["id"]))
                 self._audit(conn, actor_id, "raw_object.purged", "submission", row["id"], {})
                 purged.append(row["id"])
-        return {"purged_count": len(purged), "submission_ids": purged}
+            remaining = max(0, limit - len(purged))
+            if remaining:
+                asset_rows = self._execute(
+                    conn,
+                    """
+                    SELECT id, raw_path
+                    FROM assets
+                    WHERE raw_deleted_at IS NULL AND raw_expires_at IS NOT NULL AND raw_expires_at <= ?
+                    ORDER BY raw_expires_at ASC
+                    LIMIT ?
+                    """,
+                    (now, remaining),
+                )
+                for row in asset_rows:
+                    self.objects.delete(row["raw_path"])
+                    self._execute(conn, "UPDATE assets SET raw_deleted_at = ?, updated_at = ? WHERE id = ?", (now, now, row["id"]))
+                    self._audit(conn, actor_id, "raw_asset.purged", "asset", row["id"], {})
+                    purged_assets.append(row["id"])
+        return {
+            "purged_count": len(purged) + len(purged_assets),
+            "submission_ids": purged,
+            "asset_ids": purged_assets,
+        }
 
     def metrics_snapshot(self) -> Dict[str, Any]:
         with self._session() as conn:
             return {
                 "cases": _count_by(conn, self, "cases", "status"),
+                "assets": _count_by(conn, self, "assets", "status"),
                 "jobs": _count_by(conn, self, "jobs", "status"),
                 "datasets": _single_count(conn, self, "datasets"),
                 "users": _count_by(conn, self, "users", "status"),
+                "authorizations": _count_by(conn, self, "authorization_snapshots", "status"),
                 "pending_payout_cents": _sum_where(conn, self, "payout_events", "amount_cents", "status", "pending"),
                 "audit_events": _single_count(conn, self, "audit_logs"),
             }
@@ -975,6 +1353,86 @@ class LodiaStore:
                 )
             ]
 
+    def _resolve_authorization(
+        self,
+        conn: Any,
+        owner_id: str,
+        allowed_uses: List[str],
+        authorization_snapshot_id: Optional[str],
+        actor_id: str,
+        source: str,
+    ) -> Dict[str, Any]:
+        if authorization_snapshot_id:
+            authorization = self.get_authorization_snapshot(authorization_snapshot_id, conn=conn)
+            if authorization["owner_id"] != owner_id:
+                raise ValueError("authorization_owner_mismatch")
+            if authorization["status"] != "active":
+                raise ValueError("authorization_not_active")
+            requested = set(_clean_allowed_uses(allowed_uses))
+            granted = set(authorization["allowed_uses"])
+            if not requested.issubset(granted):
+                raise ValueError("authorization_scope_exceeded")
+            return authorization
+        return self.create_authorization_snapshot(
+            owner_id=owner_id,
+            allowed_uses=allowed_uses,
+            source=source,
+            actor_id=actor_id,
+            conn=conn,
+        )
+
+    def _create_submission_from_asset(
+        self,
+        conn: Any,
+        asset_id: str,
+        owner_id: str,
+        text: str,
+        allowed_uses: List[str],
+        authorization_snapshot_id: str,
+        actor_id: str,
+    ) -> str:
+        submission_id = _id("sub")
+        raw_ref = self.objects.put_text(f"raw/{submission_id}.txt", text)
+        now = _now()
+        self._execute(
+            conn,
+            """
+            INSERT INTO submissions
+            (id, owner_id, source_type, status, raw_path, raw_hash, allowed_uses_json,
+             authorization_snapshot_id, raw_expires_at, raw_deleted_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                submission_id,
+                owner_id,
+                "asset_text",
+                "quarantined",
+                raw_ref.uri,
+                _sha256(text),
+                dumps(_clean_allowed_uses(allowed_uses)),
+                authorization_snapshot_id,
+                _future_hours(self.settings.raw_object_ttl_hours),
+                None,
+                now,
+            ),
+        )
+        self._audit(
+            conn,
+            actor_id,
+            "submission.created_from_asset",
+            "submission",
+            submission_id,
+            {"asset_id": asset_id, "authorization_snapshot_id": authorization_snapshot_id},
+        )
+        return submission_id
+
+    def _case_authorization_active(self, conn: Any, case: Dict[str, Any]) -> bool:
+        snapshot_id = case.get("authorization_snapshot_id")
+        if not snapshot_id:
+            return False
+        row = self._get_one(conn, "SELECT status FROM authorization_snapshots WHERE id = ?", (snapshot_id,))
+        return bool(row and row["status"] == "active")
+
     def _enqueue_job(
         self,
         conn: Any,
@@ -1007,6 +1465,12 @@ class LodiaStore:
             # surface the queue health failure.
             return None
 
+    def _delete_object_quietly(self, uri: str) -> None:
+        try:
+            self.objects.delete(uri)
+        except Exception:
+            return None
+
     def _case_from_row(self, row: Any) -> Dict[str, Any]:
         return {
             "case_id": row["id"],
@@ -1020,6 +1484,7 @@ class LodiaStore:
             "annotation": loads(row["annotation_json"]),
             "dedup": loads(row["dedup_json"]),
             "quality_gate": loads(row["quality_gate_json"]),
+            "authorization_snapshot_id": row["authorization_snapshot_id"] if "authorization_snapshot_id" in row.keys() else None,
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
@@ -1047,6 +1512,44 @@ class LodiaStore:
             "revoked_at": row["revoked_at"],
             "created_at": row["created_at"],
             "last_used_at": row["last_used_at"],
+        }
+
+    def _authorization_from_row(self, row: Any) -> Dict[str, Any]:
+        return {
+            "id": row["id"],
+            "owner_id": row["owner_id"],
+            "status": row["status"],
+            "allowed_uses": loads(row["allowed_uses_json"]),
+            "policy_version": row["policy_version"],
+            "terms_version": row["terms_version"],
+            "consent_text_hash": row["consent_text_hash"],
+            "source": row["source"],
+            "created_at": row["created_at"],
+            "withdrawn_at": row["withdrawn_at"],
+            "withdrawal_reason": row["withdrawal_reason"],
+        }
+
+    def _asset_from_row(self, row: Any) -> Dict[str, Any]:
+        return {
+            "id": row["id"],
+            "owner_id": row["owner_id"],
+            "submission_id": row["submission_id"],
+            "authorization_snapshot_id": row["authorization_snapshot_id"],
+            "filename": row["filename"],
+            "media_type": row["media_type"],
+            "asset_type": row["asset_type"],
+            "byte_size": row["byte_size"],
+            "sha256": row["sha256"],
+            "status": row["status"],
+            "raw_path": row["raw_path"],
+            "extracted_text_path": row["extracted_text_path"],
+            "metadata": loads(row["metadata_json"]),
+            "risk": loads(row["risk_json"]),
+            "redaction": loads(row["redaction_json"]) if row["redaction_json"] else {},
+            "raw_expires_at": row["raw_expires_at"],
+            "raw_deleted_at": row["raw_deleted_at"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
         }
 
     def _job_from_row(self, row: Any) -> Dict[str, Any]:
@@ -1108,9 +1611,12 @@ class LodiaStore:
             )
             """,
         )
+        self._ensure_authorization_tables(conn)
+        self._ensure_asset_tables(conn)
         self._ensure_submission_columns(conn)
         self._ensure_dataset_columns(conn)
         self._ensure_case_query_columns(conn)
+        self._backfill_authorization_snapshots(conn)
         self._execute(
             conn,
             """
@@ -1120,14 +1626,26 @@ class LodiaStore:
             """,
             ("20260506_p0_foundation", _now()),
         )
+        self._execute(
+            conn,
+            """
+            INSERT INTO schema_migrations (version, applied_at)
+            VALUES (?, ?)
+            ON CONFLICT(version) DO NOTHING
+            """,
+            ("20260506_p1_assets_authorization", _now()),
+        )
 
     def _ensure_submission_columns(self, conn: Any) -> None:
         columns = self.db.column_names(conn, "submissions")
+        if "authorization_snapshot_id" not in columns:
+            self._execute(conn, "ALTER TABLE submissions ADD COLUMN authorization_snapshot_id TEXT")
         if "raw_expires_at" not in columns:
             self._execute(conn, "ALTER TABLE submissions ADD COLUMN raw_expires_at TEXT")
         if "raw_deleted_at" not in columns:
             self._execute(conn, "ALTER TABLE submissions ADD COLUMN raw_deleted_at TEXT")
         self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_submissions_raw_expiry ON submissions(raw_expires_at, raw_deleted_at)")
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_submissions_authorization ON submissions(authorization_snapshot_id)")
 
     def _ensure_dataset_columns(self, conn: Any) -> None:
         columns = self.db.column_names(conn, "datasets")
@@ -1138,11 +1656,14 @@ class LodiaStore:
 
     def _ensure_case_query_columns(self, conn: Any) -> None:
         columns = self.db.column_names(conn, "cases")
+        if "authorization_snapshot_id" not in columns:
+            self._execute(conn, "ALTER TABLE cases ADD COLUMN authorization_snapshot_id TEXT")
         if "drl" not in columns:
             self._execute(conn, "ALTER TABLE cases ADD COLUMN drl TEXT")
         if "quality_score" not in columns:
             self._execute(conn, "ALTER TABLE cases ADD COLUMN quality_score REAL")
         self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_cases_drl_quality ON cases(drl, quality_score)")
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_cases_authorization ON cases(authorization_snapshot_id)")
 
         rows = self._execute(
             conn,
@@ -1159,6 +1680,88 @@ class LodiaStore:
                 conn,
                 "UPDATE cases SET drl = ?, quality_score = ? WHERE id = ?",
                 (gate.get("drl", "DRL0"), float(annotation.get("quality_score", 0.0)), row["id"]),
+            )
+
+    def _ensure_authorization_tables(self, conn: Any) -> None:
+        self._execute(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS authorization_snapshots (
+                id TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                allowed_uses_json TEXT NOT NULL,
+                policy_version TEXT NOT NULL,
+                terms_version TEXT NOT NULL,
+                consent_text_hash TEXT NOT NULL,
+                source TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                withdrawn_at TEXT,
+                withdrawal_reason TEXT NOT NULL
+            )
+            """,
+        )
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_authorization_owner_status ON authorization_snapshots(owner_id, status, created_at)")
+
+    def _ensure_asset_tables(self, conn: Any) -> None:
+        self._execute(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS assets (
+                id TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL,
+                submission_id TEXT,
+                authorization_snapshot_id TEXT,
+                filename TEXT NOT NULL,
+                media_type TEXT NOT NULL,
+                asset_type TEXT NOT NULL,
+                byte_size INTEGER NOT NULL,
+                sha256 TEXT NOT NULL,
+                status TEXT NOT NULL,
+                raw_path TEXT NOT NULL,
+                extracted_text_path TEXT,
+                metadata_json TEXT NOT NULL,
+                risk_json TEXT NOT NULL,
+                redaction_json TEXT NOT NULL,
+                raw_expires_at TEXT,
+                raw_deleted_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """,
+        )
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_assets_owner_status ON assets(owner_id, status, created_at)")
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_assets_sha256 ON assets(sha256)")
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_assets_submission ON assets(submission_id)")
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_assets_authorization ON assets(authorization_snapshot_id)")
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_assets_raw_expiry ON assets(raw_expires_at, raw_deleted_at)")
+
+    def _backfill_authorization_snapshots(self, conn: Any) -> None:
+        rows = self._execute(
+            conn,
+            """
+            SELECT id, owner_id, allowed_uses_json
+            FROM submissions
+            WHERE authorization_snapshot_id IS NULL
+            """,
+        )
+        for row in rows:
+            snapshot = self.create_authorization_snapshot(
+                owner_id=row["owner_id"],
+                allowed_uses=loads(row["allowed_uses_json"]),
+                source="migration_backfill",
+                actor_id="migration",
+                conn=conn,
+            )
+            self._execute(
+                conn,
+                "UPDATE submissions SET authorization_snapshot_id = ? WHERE id = ?",
+                (snapshot["id"], row["id"]),
+            )
+            self._execute(
+                conn,
+                "UPDATE cases SET authorization_snapshot_id = ? WHERE submission_id = ? AND authorization_snapshot_id IS NULL",
+                (snapshot["id"], row["id"]),
             )
 
     def _audit(
@@ -1193,11 +1796,13 @@ CREATE TABLE IF NOT EXISTS submissions (
     raw_path TEXT NOT NULL,
     raw_hash TEXT NOT NULL,
     allowed_uses_json TEXT NOT NULL,
+    authorization_snapshot_id TEXT,
     raw_expires_at TEXT,
     raw_deleted_at TEXT,
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_submissions_raw_expiry ON submissions(raw_expires_at, raw_deleted_at);
+CREATE INDEX IF NOT EXISTS idx_submissions_authorization ON submissions(authorization_snapshot_id);
 
 CREATE TABLE IF NOT EXISTS cases (
     id TEXT PRIMARY KEY,
@@ -1213,6 +1818,7 @@ CREATE TABLE IF NOT EXISTS cases (
     annotation_json TEXT NOT NULL,
     dedup_json TEXT NOT NULL,
     quality_gate_json TEXT NOT NULL,
+    authorization_snapshot_id TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     FOREIGN KEY (submission_id) REFERENCES submissions(id)
@@ -1224,6 +1830,51 @@ CREATE INDEX IF NOT EXISTS idx_cases_canonical_hash ON cases(canonical_hash);
 CREATE INDEX IF NOT EXISTS idx_cases_status_created ON cases(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_cases_owner_created ON cases(owner_id, created_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_cases_submission ON cases(submission_id);
+CREATE INDEX IF NOT EXISTS idx_cases_authorization ON cases(authorization_snapshot_id);
+
+CREATE TABLE IF NOT EXISTS authorization_snapshots (
+    id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    allowed_uses_json TEXT NOT NULL,
+    policy_version TEXT NOT NULL,
+    terms_version TEXT NOT NULL,
+    consent_text_hash TEXT NOT NULL,
+    source TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    withdrawn_at TEXT,
+    withdrawal_reason TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_authorization_owner_status ON authorization_snapshots(owner_id, status, created_at);
+
+CREATE TABLE IF NOT EXISTS assets (
+    id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    submission_id TEXT,
+    authorization_snapshot_id TEXT,
+    filename TEXT NOT NULL,
+    media_type TEXT NOT NULL,
+    asset_type TEXT NOT NULL,
+    byte_size INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    status TEXT NOT NULL,
+    raw_path TEXT NOT NULL,
+    extracted_text_path TEXT,
+    metadata_json TEXT NOT NULL,
+    risk_json TEXT NOT NULL,
+    redaction_json TEXT NOT NULL,
+    raw_expires_at TEXT,
+    raw_deleted_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (submission_id) REFERENCES submissions(id),
+    FOREIGN KEY (authorization_snapshot_id) REFERENCES authorization_snapshots(id)
+);
+CREATE INDEX IF NOT EXISTS idx_assets_owner_status ON assets(owner_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_assets_sha256 ON assets(sha256);
+CREATE INDEX IF NOT EXISTS idx_assets_submission ON assets(submission_id);
+CREATE INDEX IF NOT EXISTS idx_assets_authorization ON assets(authorization_snapshot_id);
+CREATE INDEX IF NOT EXISTS idx_assets_raw_expiry ON assets(raw_expires_at, raw_deleted_at);
 
 CREATE TABLE IF NOT EXISTS reviews (
     id TEXT PRIMARY KEY,
@@ -1405,17 +2056,19 @@ def _quality_report(dataset_id: str, cases: List[Dict[str, Any]]) -> Dict[str, A
 def _data_contract(dataset_id: str, name: str, purpose: str, min_drl: str, cases: List[Dict[str, Any]], now: str) -> Dict[str, Any]:
     return {
         "contract_id": _id("dc"),
-        "version": "2026-05-06.p0",
+        "version": "2026-05-06.p1",
         "dataset_id": dataset_id,
         "name": name,
         "purpose": purpose,
         "min_drl": min_drl,
         "case_count": len(cases),
         "case_ids": [case["case_id"] for case in cases],
+        "authorization_snapshot_ids": sorted({case.get("authorization_snapshot_id") for case in cases if case.get("authorization_snapshot_id")}),
         "rules": {
             "contains_raw_data": False,
             "requires_redaction_passed": True,
             "requires_purpose_authorized": True,
+            "requires_active_authorization_snapshot": True,
             "requires_no_required_actions": True,
             "requires_human_review_for_drl3_plus": True,
         },
@@ -1434,6 +2087,8 @@ def _data_contract_violations(contract: Dict[str, Any], cases: List[Dict[str, An
             violations.append("drl_below_minimum")
         if not _case_allowed_for_purpose(case, purpose):
             violations.append("purpose_not_authorized")
+        if not case.get("authorization_snapshot_id"):
+            violations.append("authorization_snapshot_missing")
         if case["quality_gate"].get("required_actions"):
             violations.append("required_actions_open")
     return sorted(set(violations))
@@ -1446,7 +2101,10 @@ def _export_record(case: Dict[str, Any]) -> Dict[str, Any]:
         "drl": case["quality_gate"]["drl"],
         "redacted_turns": [{"role": "mixed", "content": case["redacted_text"]}],
         "annotation": case["annotation"],
-        "license": {"allowed_uses": case["quality_gate"]["allowed_uses"]},
+        "license": {
+            "allowed_uses": case["quality_gate"]["allowed_uses"],
+            "authorization_snapshot_id": case.get("authorization_snapshot_id"),
+        },
     }
 
 
@@ -1503,6 +2161,20 @@ def _clean_roles(roles: List[str]) -> List[str]:
     clean = sorted({role for role in roles if role in allowed})
     if not clean:
         raise ValueError("roles_required")
+    return clean
+
+
+def _clean_allowed_uses(allowed_uses: List[str]) -> List[str]:
+    allowed = {
+        "private_library",
+        "candidate_pool",
+        "commercial_dataset",
+        "training",
+        "gold_eval",
+    }
+    clean = sorted({use for use in allowed_uses if use in allowed})
+    if not clean:
+        raise ValueError("allowed_uses_required")
     return clean
 
 

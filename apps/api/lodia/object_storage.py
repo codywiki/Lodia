@@ -18,7 +18,13 @@ class ObjectStorage(Protocol):
     def put_text(self, key: str, value: str) -> ObjectRef:
         ...
 
+    def put_bytes(self, key: str, value: bytes, content_type: str = "application/octet-stream") -> ObjectRef:
+        ...
+
     def read_text(self, uri: str) -> str:
+        ...
+
+    def read_bytes(self, uri: str) -> bytes:
         ...
 
     def delete(self, uri: str) -> None:
@@ -30,21 +36,27 @@ class ObjectStorage(Protocol):
 
 class LocalObjectStorage:
     def __init__(self, root: Path):
-        self.root = root
+        self.root = root.resolve()
         self.root.mkdir(parents=True, exist_ok=True)
 
     def put_text(self, key: str, value: str) -> ObjectRef:
-        path = self.root / _clean_key(key)
+        return self.put_bytes(key, value.encode("utf-8"), "text/plain; charset=utf-8")
+
+    def put_bytes(self, key: str, value: bytes, content_type: str = "application/octet-stream") -> ObjectRef:
+        path = self._path_for_key(key)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(value, encoding="utf-8")
+        path.write_bytes(value)
         path.chmod(0o600)
         return ObjectRef(uri=str(path), key=key)
 
     def read_text(self, uri: str) -> str:
-        return Path(uri).read_text(encoding="utf-8")
+        return self.read_bytes(uri).decode("utf-8")
+
+    def read_bytes(self, uri: str) -> bytes:
+        return self._path_for_uri(uri).read_bytes()
 
     def delete(self, uri: str) -> None:
-        path = Path(uri)
+        path = self._path_for_uri(uri)
         if path.exists():
             path.unlink()
 
@@ -55,6 +67,14 @@ class LocalObjectStorage:
             "backend": "local",
             "root": str(self.root),
         }
+
+    def _path_for_key(self, key: str) -> Path:
+        path = (self.root / _clean_key(key)).resolve()
+        return _ensure_under_root(self.root, path)
+
+    def _path_for_uri(self, uri: str) -> Path:
+        path = Path(uri).resolve()
+        return _ensure_under_root(self.root, path)
 
 
 class S3ObjectStorage:
@@ -76,13 +96,16 @@ class S3ObjectStorage:
         )
 
     def put_text(self, key: str, value: str) -> ObjectRef:
+        return self.put_bytes(key, value.encode("utf-8"), "text/plain; charset=utf-8")
+
+    def put_bytes(self, key: str, value: bytes, content_type: str = "application/octet-stream") -> ObjectRef:
         clean = _clean_key(key)
         object_key = f"{self.prefix}/{clean}" if self.prefix else clean
         put_kwargs = {
             "Bucket": self.bucket,
             "Key": object_key,
-            "Body": value.encode("utf-8"),
-            "ContentType": "text/plain; charset=utf-8",
+            "Body": value,
+            "ContentType": content_type,
         }
         if self.sse_algorithm:
             put_kwargs["ServerSideEncryption"] = self.sse_algorithm
@@ -92,18 +115,15 @@ class S3ObjectStorage:
         return ObjectRef(uri=f"s3://{self.bucket}/{object_key}", key=object_key)
 
     def read_text(self, uri: str) -> str:
-        prefix = f"s3://{self.bucket}/"
-        if not uri.startswith(prefix):
-            raise ValueError("unsupported_s3_uri")
-        key = uri[len(prefix) :]
+        return self.read_bytes(uri).decode("utf-8")
+
+    def read_bytes(self, uri: str) -> bytes:
+        key = self._key_from_uri(uri)
         response = self.client.get_object(Bucket=self.bucket, Key=key)
-        return response["Body"].read().decode("utf-8")
+        return response["Body"].read()
 
     def delete(self, uri: str) -> None:
-        prefix = f"s3://{self.bucket}/"
-        if not uri.startswith(prefix):
-            raise ValueError("unsupported_s3_uri")
-        key = uri[len(prefix) :]
+        key = self._key_from_uri(uri)
         self.client.delete_object(Bucket=self.bucket, Key=key)
 
     def health_check(self) -> Dict[str, Any]:
@@ -116,6 +136,15 @@ class S3ObjectStorage:
             "sse": self.sse_algorithm,
         }
 
+    def _key_from_uri(self, uri: str) -> str:
+        prefix = f"s3://{self.bucket}/"
+        if not uri.startswith(prefix):
+            raise ValueError("unsupported_s3_uri")
+        key = uri[len(prefix) :]
+        if self.prefix and not (key == self.prefix or key.startswith(f"{self.prefix}/")):
+            raise ValueError("s3_key_outside_prefix")
+        return key
+
 
 def create_object_storage(settings: LodiaSettings) -> ObjectStorage:
     if settings.object_storage_backend == "s3":
@@ -124,4 +153,13 @@ def create_object_storage(settings: LodiaSettings) -> ObjectStorage:
 
 
 def _clean_key(key: str) -> str:
-    return "/".join(part for part in key.split("/") if part not in {"", ".", ".."})
+    clean = "/".join(part for part in key.split("/") if part not in {"", ".", ".."})
+    return clean or "object.bin"
+
+
+def _ensure_under_root(root: Path, path: Path) -> Path:
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("local_object_outside_root") from exc
+    return path

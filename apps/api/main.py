@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+import json
 import uuid
 from typing import List, Optional, Tuple
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -29,7 +30,20 @@ class PreviewRequest(BaseModel):
 
 
 class SubmissionRequest(PreviewRequest):
-    pass
+    authorization_snapshot_id: Optional[str] = Field(default=None, max_length=128)
+
+
+class ConsentCreateRequest(BaseModel):
+    owner_id: str = Field(default="demo_contributor", max_length=128)
+    allowed_uses: List[str] = Field(default_factory=lambda: ["private_library", "candidate_pool"])
+    policy_version: str = Field(default="cn-pipl-2026-05", max_length=80)
+    terms_version: str = Field(default="contributor-2026-05", max_length=80)
+    source: str = Field(default="api", max_length=80)
+    consent_text: str = Field(default="", max_length=10_000)
+
+
+class ConsentWithdrawRequest(BaseModel):
+    reason: str = Field(default="", max_length=2_000)
 
 
 class ReviewRequest(BaseModel):
@@ -278,9 +292,99 @@ async def submit_text(payload: SubmissionRequest, actor: AuthContext = Depends(r
             text=payload.text,
             allowed_uses=payload.allowed_uses,
             actor_id=actor.subject_id,
+            authorization_snapshot_id=payload.authorization_snapshot_id,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/assets")
+async def upload_asset(
+    file: UploadFile = File(...),
+    owner_id: str = Form(default="demo_contributor", max_length=128),
+    allowed_uses: str = Form(default='["private_library","candidate_pool"]'),
+    authorization_snapshot_id: Optional[str] = Form(default=None, max_length=128),
+    actor: AuthContext = Depends(require_contributor),
+):
+    content = await file.read(settings.max_asset_bytes + 1)
+    try:
+        result = store.submit_asset(
+            owner_id=_owner_id(owner_id, actor),
+            filename=file.filename or "asset.bin",
+            media_type=file.content_type or "application/octet-stream",
+            content=content,
+            allowed_uses=_parse_allowed_uses(allowed_uses),
+            actor_id=actor.subject_id,
+            authorization_snapshot_id=authorization_snapshot_id,
+        )
+        return {**result, "asset": _public_asset(result["asset"])}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/assets")
+async def list_assets(
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    owner_id: Optional[str] = Query(default=None, max_length=128),
+    status: Optional[str] = Query(default=None, max_length=80),
+    actor: AuthContext = Depends(require_contributor),
+):
+    scoped_owner = _scoped_owner_id(owner_id, actor)
+    items = [_public_asset(item) for item in store.list_assets(owner_id=scoped_owner, status=status, limit=limit, offset=offset)]
+    return _page(items, limit, offset)
+
+
+@app.get("/api/assets/{asset_id}")
+async def get_asset(asset_id: str, actor: AuthContext = Depends(require_contributor)):
+    try:
+        asset = store.get_asset(asset_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    _assert_readable_owner(asset["owner_id"], actor)
+    return _public_asset(asset)
+
+
+@app.post("/api/authorizations")
+async def create_authorization(payload: ConsentCreateRequest, actor: AuthContext = Depends(require_contributor)):
+    try:
+        return store.create_authorization_snapshot(
+            owner_id=_owner_id(payload.owner_id, actor),
+            allowed_uses=payload.allowed_uses,
+            policy_version=payload.policy_version,
+            terms_version=payload.terms_version,
+            source=payload.source,
+            consent_text=payload.consent_text,
+            actor_id=actor.subject_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/authorizations")
+async def list_authorizations(
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    owner_id: Optional[str] = Query(default=None, max_length=128),
+    status: Optional[str] = Query(default=None, max_length=80),
+    actor: AuthContext = Depends(require_contributor),
+):
+    scoped_owner = _scoped_owner_id(owner_id, actor)
+    return _page(store.list_authorization_snapshots(owner_id=scoped_owner, status=status, limit=limit, offset=offset), limit, offset)
+
+
+@app.post("/api/authorizations/{authorization_id}/withdraw")
+async def withdraw_authorization(
+    authorization_id: str,
+    payload: ConsentWithdrawRequest,
+    actor: AuthContext = Depends(require_contributor),
+):
+    try:
+        authorization = store.get_authorization_snapshot(authorization_id)
+        _assert_writable_owner(authorization["owner_id"], actor)
+        return store.withdraw_authorization_snapshot(authorization_id, reason=payload.reason, actor_id=actor.subject_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.get("/api/cases")
@@ -465,6 +569,36 @@ def _owner_id(requested_owner_id: str, actor: AuthContext) -> str:
     return requested_owner_id
 
 
+def _scoped_owner_id(requested_owner_id: Optional[str], actor: AuthContext) -> Optional[str]:
+    if auth_manager.enabled and not actor.roles.intersection({"admin", "reviewer"}):
+        return actor.subject_id
+    return requested_owner_id
+
+
+def _assert_readable_owner(owner_id: str, actor: AuthContext) -> None:
+    if auth_manager.enabled and not actor.roles.intersection({"admin", "reviewer"}) and owner_id != actor.subject_id:
+        raise HTTPException(status_code=403, detail="insufficient_owner_scope")
+
+
+def _assert_writable_owner(owner_id: str, actor: AuthContext) -> None:
+    if auth_manager.enabled and "admin" not in actor.roles and owner_id != actor.subject_id:
+        raise HTTPException(status_code=403, detail="insufficient_owner_scope")
+
+
+def _parse_allowed_uses(value: str) -> List[str]:
+    try:
+        parsed = json.loads(value)
+        if isinstance(parsed, list):
+            return [str(item) for item in parsed]
+    except json.JSONDecodeError:
+        pass
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _public_asset(asset: dict) -> dict:
+    return {key: value for key, value in asset.items() if key not in {"raw_path", "extracted_text_path"}}
+
+
 def _exceeds_body_limit(content_length: str) -> bool:
     try:
         return int(content_length) > settings.max_request_body_bytes
@@ -486,8 +620,14 @@ def _should_read_body(request: Request, content_length: Optional[str]) -> bool:
 
 
 async def _read_limited_body(request: Request) -> Tuple[bytes, bool]:
-    body = await request.body()
-    return body, len(body) > settings.max_request_body_bytes
+    chunks = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > settings.max_request_body_bytes:
+            return b"", True
+        chunks.append(chunk)
+    return b"".join(chunks), False
 
 
 def _replay_body(request: Request, body: bytes) -> None:

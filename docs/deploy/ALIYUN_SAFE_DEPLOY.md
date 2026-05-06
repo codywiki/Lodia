@@ -12,6 +12,7 @@
 - 对象存储本地目录：`~/lodia/storage/prod/objects`
 - 不使用宿主机 `80/443/8000/5173/5432/6379`
 - 自动生成生产 `Admin/Reviewer/Contributor` Token、密码 pepper 和请求签名 secret，并写入远端 `~/lodia/.env.production`
+- 默认单个资产上传上限 `1MB`，内部测试可通过 `LODIA_MAX_ASSET_BYTES` 和 `LODIA_MAX_REQUEST_BODY_BYTES` 同步调大
 
 如果服务器上已有项目，先保持默认 `127.0.0.1:18080` 本机监听，通过 SSH 隧道验证；确认无冲突后再接入现有反向代理或开放公网高位端口。
 
