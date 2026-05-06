@@ -48,6 +48,7 @@ class LodiaSettings:
     auth_token_specs: List[str]
     password_pepper: str
     raw_object_ttl_hours: int
+    max_asset_bytes: int
     max_request_body_bytes: int
     rate_limit_enabled: bool
     rate_limit_requests: int
@@ -89,6 +90,7 @@ class LodiaSettings:
             auth_token_specs=_auth_token_specs(),
             password_pepper=os.environ.get("LODIA_PASSWORD_PEPPER", ""),
             raw_object_ttl_hours=_int(os.environ.get("LODIA_RAW_OBJECT_TTL_HOURS"), 24),
+            max_asset_bytes=_int(os.environ.get("LODIA_MAX_ASSET_BYTES"), 1_048_576),
             max_request_body_bytes=_int(os.environ.get("LODIA_MAX_REQUEST_BODY_BYTES"), 1_048_576),
             rate_limit_enabled=_bool(
                 os.environ.get("LODIA_RATE_LIMIT_ENABLED"),

@@ -13,6 +13,8 @@
 - Auth/RBAC：支持环境 Bootstrap Token、数据库用户、登录 Token、Token 撤销和 `admin`、`reviewer`、`contributor` 三类角色。
 - 审核后台：支持审核队列、DRL3 审核通过、驳回、审计日志和控制台查看。
 - 数据出厂：Dataset Builder 生成 `Data Contract`、Manifest、Quality Report 和 JSONL。
+- 多模态资产：支持资产上传、类型识别、危险文件拒收、文本/trace 证据抽取、图片/PDF/音视频待提取状态和专用 Worker 扩展点。
+- 授权快照：每次提交记录用途范围、协议版本和授权状态，撤回后同步阻断 Case、Asset 和未来数据集出厂。
 - Ledger：支持 UsageEvent、PayoutEvent、贡献者账本和 payout settle。
 - 操作审批：支持审批请求、审批/拒绝、审批审计，供高风险导出和结算接入。
 - 生产护栏：API request id、请求体上限、单节点限流、请求签名开关、分页查询、`/api/ready` 就绪检查。
@@ -36,6 +38,7 @@ LODIA_PASSWORD_PEPPER=...
 LODIA_RAW_OBJECT_TTL_HOURS=24
 LODIA_DB_POOL_MIN_SIZE=1
 LODIA_DB_POOL_MAX_SIZE=10
+LODIA_MAX_ASSET_BYTES=1048576
 LODIA_MAX_REQUEST_BODY_BYTES=1048576
 LODIA_RATE_LIMIT_ENABLED=true
 LODIA_RATE_LIMIT_REQUESTS=120
@@ -82,6 +85,12 @@ SQLite 使用单进程安全的简单领取逻辑。Postgres 使用 `FOR UPDATE 
 
 任务处理以提交记录为幂等边界。即使 Worker 在处理完成和标记完成之间异常退出，重试时也会复用已经生成的 Case，而不是重复入库。
 
+## 多模态与授权门禁
+
+`/api/assets` 接收多模态资产，当前生产底座先完成类型识别、文件风险扫描、raw quarantine、文本/trace 证据抽取和红线文件拒收。图片、PDF、音频、视频默认进入 `extraction_pending`，后续可以挂 OCR、ASR、视频关键帧和文档解析 Worker，不改变资产表和任务队列接口。
+
+`authorization_snapshots` 是数据出厂的一等门禁。每个文本提交和资产上传都会绑定授权快照，Data Contract 会记录 `authorization_snapshot_ids`。授权撤回后，对应 Case 和 Asset 标记为 `withdrawn`，未来数据集生成会跳过这些 Case。
+
 ## 1w 日活生产口径
 
 本仓库当前提供应用内防线，正式高配生产环境还应在网关和基础设施层叠加：
@@ -91,6 +100,7 @@ SQLite 使用单进程安全的简单领取逻辑。Postgres 使用 `FOR UPDATE 
 - Postgres 使用托管 RDS 或独立高配实例，按实际并发调高 `LODIA_DB_POOL_MAX_SIZE`，并避免超过数据库 `max_connections`。
 - 对象存储使用 OSS/S3-compatible bucket，原始数据和脱敏数据分 bucket 或分前缀隔离，生产建议启用 KMS。
 - Worker 按 ingestion、redaction、annotation、review-export 分队列横向扩容。
+- 多模态大文件上传建议走对象存储直传和回调，本 API 当前作为控制面和内部测试入口。
 - 列表接口必须分页，批量导出必须有 `LODIA_DATASET_MAX_CASES` 或后台离线任务上限。
 
 ## 下一步

@@ -10,6 +10,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       LODIA_QUEUE_BACKEND: database
       LODIA_RATE_LIMIT_ENABLED: "false"
+      LODIA_MAX_ASSET_BYTES: 1048576
       LODIA_MAX_REQUEST_BODY_BYTES: 1048576
     ports:
       - "8000:8000"
@@ -26,6 +27,7 @@ services:
       LODIA_DATA_DIR: /data
       REDIS_URL: redis://redis:6379/0
       LODIA_QUEUE_BACKEND: database
+      LODIA_MAX_ASSET_BYTES: 1048576
       LODIA_OBJECT_STORAGE_BACKEND: local
       LODIA_OBJECT_STORAGE_DIR: /data
     volumes:

@@ -44,6 +44,7 @@ type CaseItem = {
   case_id: string;
   status: string;
   redacted_text: string;
+  authorization_snapshot_id?: string | null;
   annotation: {
     quality_score: number;
     domain: string;
@@ -81,8 +82,10 @@ type ReviewQueueItem = CaseItem;
 
 type MetricsSnapshot = {
   cases: Record<string, number>;
+  assets: Record<string, number>;
   jobs: Record<string, number>;
   users: Record<string, number>;
+  authorizations: Record<string, number>;
   datasets: number;
   pending_payout_cents: number;
   audit_events: number;
@@ -98,6 +101,27 @@ type DataContract = {
     min_drl: string;
     case_count: number;
   };
+};
+
+type AssetItem = {
+  id: string;
+  owner_id: string;
+  submission_id: string | null;
+  authorization_snapshot_id: string | null;
+  filename: string;
+  media_type: string;
+  asset_type: string;
+  byte_size: number;
+  status: string;
+};
+
+type AuthorizationSnapshot = {
+  id: string;
+  owner_id: string;
+  status: string;
+  allowed_uses: string[];
+  policy_version: string;
+  terms_version: string;
 };
 
 const metrics = [
@@ -129,6 +153,9 @@ function App() {
   const [reviewQueue, setReviewQueue] = useState<ReviewQueueItem[]>([]);
   const [metricsSnapshot, setMetricsSnapshot] = useState<MetricsSnapshot | null>(null);
   const [dataContract, setDataContract] = useState<DataContract | null>(null);
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [uploadedAsset, setUploadedAsset] = useState<AssetItem | null>(null);
+  const [authorizations, setAuthorizations] = useState<AuthorizationSnapshot[]>([]);
   const [apiToken, setApiToken] = useState("");
   const [loginEmail, setLoginEmail] = useState("contributor@lodia.local");
   const [loginPassword, setLoginPassword] = useState("");
@@ -291,6 +318,58 @@ function App() {
     }
   }
 
+  async function uploadAsset() {
+    if (!selectedFile) return;
+    setLoading(true);
+    try {
+      const form = new FormData();
+      form.append("file", selectedFile);
+      form.append("owner_id", "demo_contributor");
+      form.append("allowed_uses", JSON.stringify(["private_library", "candidate_pool", "commercial_dataset", "training"]));
+      const response = await fetch(apiUrl("/api/assets"), {
+        method: "POST",
+        headers: requestHeaders(apiToken, false),
+        body: form,
+      });
+      const payload = await response.json();
+      setUploadedAsset(payload.asset || null);
+      if (payload.asset?.submission_id) {
+        await loadReviewQueue();
+      }
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function loadAuthorizations() {
+    setLoading(true);
+    try {
+      const response = await fetch(apiUrl("/api/authorizations?limit=6"), {
+        headers: requestHeaders(apiToken, false),
+      });
+      const payload = await response.json();
+      setAuthorizations(payload.items || []);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function withdrawCurrentAuthorization() {
+    const authorizationId = caseItem?.authorization_snapshot_id || uploadedAsset?.authorization_snapshot_id;
+    if (!authorizationId) return;
+    setLoading(true);
+    try {
+      await fetch(apiUrl(`/api/authorizations/${authorizationId}/withdraw`), {
+        method: "POST",
+        headers: requestHeaders(apiToken),
+        body: JSON.stringify({ reason: "Withdrawn from console" }),
+      });
+      await loadAuthorizations();
+    } finally {
+      setLoading(false);
+    }
+  }
+
   return (
     <main className="app-shell">
       <aside className="sidebar">
@@ -415,6 +494,71 @@ function App() {
         <section className="split lower-split">
           <div className="panel">
             <div className="panel-heading">
+              <Layers3 size={18} />
+              <h2>多模态资产</h2>
+            </div>
+            <div className="file-row">
+              <input type="file" onChange={(event) => setSelectedFile(event.target.files?.[0] || null)} />
+              <button className="secondary-action" onClick={uploadAsset} disabled={loading || !selectedFile}>
+                上传资产
+              </button>
+            </div>
+            {uploadedAsset ? (
+              <div className="result-stack">
+                <div className="result-row">
+                  <span>AssetID</span>
+                  <strong>{uploadedAsset.id}</strong>
+                </div>
+                <div className="result-row">
+                  <span>类型</span>
+                  <strong>{uploadedAsset.asset_type}</strong>
+                </div>
+                <div className="result-row">
+                  <span>状态</span>
+                  <strong>{uploadedAsset.status}</strong>
+                </div>
+              </div>
+            ) : (
+              <p className="empty-state">文本、日志和 trace 会自动抽取证据；图片、PDF、音视频先进入专用提取队列。</p>
+            )}
+          </div>
+
+          <div className="panel">
+            <div className="panel-heading">
+              <LockKeyhole size={18} />
+              <h2>授权快照</h2>
+            </div>
+            <div className="action-row">
+              <button className="secondary-action" onClick={loadAuthorizations} disabled={loading}>
+                授权列表
+              </button>
+              <button
+                className="secondary-action"
+                onClick={withdrawCurrentAuthorization}
+                disabled={loading || !(caseItem?.authorization_snapshot_id || uploadedAsset?.authorization_snapshot_id)}
+              >
+                撤回当前授权
+              </button>
+            </div>
+            {authorizations.length ? (
+              <div className="audit-list">
+                {authorizations.map((item) => (
+                  <div className="audit-row" key={item.id}>
+                    <span>{item.status}</span>
+                    <strong>{item.id}</strong>
+                    <small>{item.allowed_uses.join(", ")}</small>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="empty-state">每次提交都会记录用途、协议版本和撤回状态，出厂前必须校验授权仍然有效。</p>
+            )}
+          </div>
+        </section>
+
+        <section className="split lower-split">
+          <div className="panel">
+            <div className="panel-heading">
               <BadgeCheck size={18} />
               <h2>Case 资产</h2>
             </div>
@@ -510,6 +654,10 @@ function App() {
                 <div className="result-row">
                   <span>审计事件</span>
                   <strong>{metricsSnapshot.audit_events}</strong>
+                </div>
+                <div className="result-row">
+                  <span>资产状态</span>
+                  <strong>{Object.keys(metricsSnapshot.assets || {}).length}</strong>
                 </div>
                 <div className="result-row">
                   <span>待分账</span>
