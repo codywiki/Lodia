@@ -13,9 +13,11 @@ from .database import Database, row_to_dict
 from .domain import ContributionWeight, DataReadinessLevel, RevenueEvent
 from .identity import hash_password, new_api_token, normalize_email, token_hash, token_suffix, verify_password
 from .job_queue import JobQueue, create_job_queue
+from .model_gateway import annotation_invocation, extract_asset_text, extraction_invocation
 from .object_storage import ObjectStorage, create_object_storage
 from .payout import calculate_payout
 from .pipeline import process_text_case
+from .redaction import redact_text
 from .serde import dumps, loads, to_jsonable
 
 
@@ -560,6 +562,87 @@ class LodiaStore:
                     raise
         return self.get_asset(asset_id)
 
+    def request_asset_extraction(self, asset_id: str, actor_id: str = "system", queue_name: str = "extraction") -> Dict[str, Any]:
+        with self._session() as conn:
+            asset = self.get_asset(asset_id, conn=conn)
+            if asset["status"] not in {"extraction_pending", "manual_review"}:
+                raise ValueError("asset_not_extractable")
+            job_id = self._enqueue_job(
+                conn,
+                job_type="extract_asset",
+                payload={"asset_id": asset_id},
+                queue_name=queue_name,
+                actor_id=actor_id,
+            )
+            job = self.get_job(job_id, conn=conn)
+        self._publish_job(queue_name, job_id)
+        return job
+
+    def process_asset_extraction(self, asset_id: str, actor_id: str = "system") -> Dict[str, Any]:
+        with self._session() as conn:
+            asset_row = self._get_one(conn, "SELECT * FROM assets WHERE id = ?", (asset_id,))
+            if not asset_row:
+                raise KeyError("asset_not_found")
+            if asset_row["raw_deleted_at"]:
+                raise ValueError("raw_object_deleted")
+            authorization = self.get_authorization_snapshot(asset_row["authorization_snapshot_id"], conn=conn)
+            if authorization["status"] != "active":
+                raise ValueError("authorization_not_active")
+            content = self.objects.read_bytes(asset_row["raw_path"])
+            result = extract_asset_text(asset_row["asset_type"], asset_row["media_type"], content)
+            invocation = extraction_invocation(asset_id, result)
+            invocation["input_hash"] = _sha256_bytes(content)
+            self._record_model_invocation(conn, invocation)
+
+            if result.status != "succeeded" or not result.text:
+                now = _now()
+                metadata = loads(asset_row["metadata_json"])
+                metadata["extraction"] = result.metadata
+                self._execute(
+                    conn,
+                    """
+                    UPDATE assets
+                    SET status = ?, metadata_json = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    ("extraction_pending", dumps(metadata), now, asset_id),
+                )
+                self._audit(conn, actor_id, "asset.extraction_deferred", "asset", asset_id, {"reason": result.error})
+                return self.get_asset(asset_id, conn=conn)
+
+            redaction = to_jsonable(redact_text(result.text))
+            extracted_text = redaction["redacted_text"]
+            extracted_ref = self.objects.put_text(f"evidence/assets/{asset_id}/extracted_text.txt", extracted_text)
+            submission_id = asset_row["submission_id"]
+            if not submission_id and redaction.get("passed", False):
+                submission_id = self._create_submission_from_asset(
+                    conn,
+                    asset_id=asset_id,
+                    owner_id=asset_row["owner_id"],
+                    text=result.text,
+                    allowed_uses=authorization["allowed_uses"],
+                    authorization_snapshot_id=authorization["id"],
+                    actor_id=actor_id,
+                )
+            status = "evidence_ready" if redaction.get("passed", False) else "privacy_review"
+            metadata = loads(asset_row["metadata_json"])
+            metadata["extraction"] = result.metadata
+            now = _now()
+            self._execute(
+                conn,
+                """
+                UPDATE assets
+                SET submission_id = ?, status = ?, extracted_text_path = ?, metadata_json = ?,
+                    redaction_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (submission_id, status, extracted_ref.uri, dumps(metadata), dumps(redaction), now, asset_id),
+            )
+            self._audit(conn, actor_id, "asset.extracted", "asset", asset_id, {"status": status, "provider": result.provider})
+        if submission_id and status == "evidence_ready":
+            self.process_submission(submission_id, actor_id=actor_id)
+        return self.get_asset(asset_id)
+
     def get_asset(self, asset_id: str, conn: Optional[Any] = None) -> Dict[str, Any]:
         if conn is None:
             with self._session() as active:
@@ -658,7 +741,9 @@ class LodiaStore:
             )
             self._execute(conn, "UPDATE submissions SET status = ? WHERE id = ?", (processed.status, submission_id))
             self._audit(conn, actor_id, "case.processed", "case", case["case_id"], {"status": processed.status})
-            return self.get_case(case["case_id"], conn=conn)
+            stored_case = self.get_case(case["case_id"], conn=conn)
+            self._record_model_invocation(conn, annotation_invocation(stored_case))
+            return stored_case
 
     def list_cases(
         self,
@@ -705,6 +790,10 @@ class LodiaStore:
     def approve_case(self, case_id: str, reviewer_id: str, notes: str = "") -> Dict[str, Any]:
         with self._session() as conn:
             case = self.get_case(case_id, conn=conn)
+            if case["status"] == "withdrawn":
+                raise ValueError("case_withdrawn")
+            if not self._case_authorization_active(conn, case):
+                raise ValueError("authorization_not_active")
             gate = dict(case["quality_gate"])
             if not any(use in case["quality_gate"]["allowed_uses"] for use in ["commercial_dataset", "training", "gold_eval"]):
                 raise ValueError("commercial_use_not_authorized")
@@ -726,12 +815,125 @@ class LodiaStore:
             self._execute(
                 conn,
                 """
-                INSERT INTO reviews (id, case_id, reviewer_id, decision, notes, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO reviews
+                (id, case_id, reviewer_id, review_type, decision, score, notes, rubric_json, evidence_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (_id("rev"), case_id, reviewer_id, "approved", notes, _now()),
+                (_id("rev"), case_id, reviewer_id, "human", "approved", 1.0, notes, dumps({}), dumps({}), _now()),
             )
             self._audit(conn, reviewer_id, "case.review_approved", "case", case_id, {"drl": "DRL3"})
+            return self.get_case(case_id, conn=conn)
+
+    def expert_verify_case(
+        self,
+        case_id: str,
+        reviewer_id: str,
+        notes: str = "",
+        rubric: Optional[Dict[str, Any]] = None,
+        evidence: Optional[Dict[str, Any]] = None,
+        score: float = 1.0,
+    ) -> Dict[str, Any]:
+        with self._session() as conn:
+            case = self.get_case(case_id, conn=conn)
+            if case["status"] == "withdrawn":
+                raise ValueError("case_withdrawn")
+            if not self._case_authorization_active(conn, case):
+                raise ValueError("authorization_not_active")
+            if DRL_ORDER.get(case["quality_gate"]["drl"], 0) < DRL_ORDER["DRL3"]:
+                raise ValueError("human_review_required")
+            if "training" not in case["quality_gate"]["allowed_uses"]:
+                raise ValueError("training_use_not_authorized")
+            gate = dict(case["quality_gate"])
+            gate["drl"] = "DRL4"
+            gate["commercial_ready"] = True
+            gate["required_actions"] = [action for action in gate.get("required_actions", []) if action != "expert_review"]
+            self._execute(
+                conn,
+                """
+                INSERT INTO reviews
+                (id, case_id, reviewer_id, review_type, decision, score, notes, rubric_json, evidence_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (_id("rev"), case_id, reviewer_id, "expert", "approved", _bounded_score(score), notes, dumps(rubric or {}), dumps(evidence or {}), _now()),
+            )
+            self._execute(
+                conn,
+                """
+                UPDATE cases
+                SET status = ?, drl = ?, quality_gate_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                ("commercial_ready", "DRL4", dumps(gate), _now(), case_id),
+            )
+            self._audit(conn, reviewer_id, "case.expert_verified", "case", case_id, {"drl": "DRL4"})
+            return self.get_case(case_id, conn=conn)
+
+    def gold_review_case(
+        self,
+        case_id: str,
+        reviewer_id: str,
+        notes: str = "",
+        rubric: Optional[Dict[str, Any]] = None,
+        evidence: Optional[Dict[str, Any]] = None,
+        score: float = 1.0,
+    ) -> Dict[str, Any]:
+        with self._session() as conn:
+            case = self.get_case(case_id, conn=conn)
+            if case["status"] == "withdrawn":
+                raise ValueError("case_withdrawn")
+            if not self._case_authorization_active(conn, case):
+                raise ValueError("authorization_not_active")
+            if "gold_eval" not in case["quality_gate"]["allowed_uses"]:
+                raise ValueError("gold_eval_not_authorized")
+            if DRL_ORDER.get(case["quality_gate"]["drl"], 0) < DRL_ORDER["DRL4"]:
+                raise ValueError("expert_review_required")
+            existing_reviewers = {
+                row["reviewer_id"]
+                for row in self._execute(
+                    conn,
+                    """
+                    SELECT reviewer_id FROM reviews
+                    WHERE case_id = ? AND review_type = ? AND decision = ?
+                    """,
+                    (case_id, "gold", "approved"),
+                )
+            }
+            if reviewer_id in existing_reviewers:
+                raise ValueError("gold_reviewer_duplicate")
+            self._execute(
+                conn,
+                """
+                INSERT INTO reviews
+                (id, case_id, reviewer_id, review_type, decision, score, notes, rubric_json, evidence_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (_id("rev"), case_id, reviewer_id, "gold", "approved", _bounded_score(score), notes, dumps(rubric or {}), dumps(evidence or {}), _now()),
+            )
+            reviewers_after = len(existing_reviewers) + 1
+            gate = dict(case["quality_gate"])
+            if reviewers_after >= 2:
+                gate["drl"] = "DRL5"
+                gate["commercial_ready"] = True
+                gate["required_actions"] = [action for action in gate.get("required_actions", []) if action != "gold_second_review"]
+                drl = "DRL5"
+            else:
+                gate["drl"] = "DRL4"
+                gate["commercial_ready"] = True
+                required = list(gate.get("required_actions", []))
+                if "gold_second_review" not in required:
+                    required.append("gold_second_review")
+                gate["required_actions"] = required
+                drl = "DRL4"
+            self._execute(
+                conn,
+                """
+                UPDATE cases
+                SET status = ?, drl = ?, quality_gate_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                ("commercial_ready", drl, dumps(gate), _now(), case_id),
+            )
+            self._audit(conn, reviewer_id, "case.gold_reviewed", "case", case_id, {"drl": drl, "reviewers": reviewers_after})
             return self.get_case(case_id, conn=conn)
 
     def reject_case(self, case_id: str, reviewer_id: str, reason: str = "") -> Dict[str, Any]:
@@ -749,13 +951,47 @@ class LodiaStore:
             self._execute(
                 conn,
                 """
-                INSERT INTO reviews (id, case_id, reviewer_id, decision, notes, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO reviews
+                (id, case_id, reviewer_id, review_type, decision, score, notes, rubric_json, evidence_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (_id("rev"), case_id, reviewer_id, "rejected", reason, _now()),
+                (_id("rev"), case_id, reviewer_id, "human", "rejected", 0.0, reason, dumps({}), dumps({}), _now()),
             )
             self._audit(conn, reviewer_id, "case.review_rejected", "case", case_id, {"reason": reason[:400]})
             return self.get_case(case_id, conn=conn)
+
+    def list_reviews(
+        self,
+        case_id: Optional[str] = None,
+        review_type: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        limit, offset = _page_bounds(limit, offset, self.settings.max_page_limit)
+        filters: List[str] = []
+        params: List[Any] = []
+        if case_id:
+            filters.append("case_id = ?")
+            params.append(case_id)
+        if review_type:
+            filters.append("review_type = ?")
+            params.append(review_type)
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        params.extend([limit, offset])
+        with self._session() as conn:
+            return [
+                self._review_from_row(row)
+                for row in self._execute(
+                    conn,
+                    f"""
+                    SELECT * FROM reviews
+                    {where}
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    tuple(params),
+                )
+            ]
 
     def list_review_queue(self, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
         limit, offset = _page_bounds(limit, offset, self.settings.max_page_limit)
@@ -786,6 +1022,8 @@ class LodiaStore:
     ) -> Dict[str, Any]:
         if min_drl not in DRL_ORDER:
             raise ValueError("invalid_min_drl")
+        if purpose == "gold_eval" and min_drl != "DRL5":
+            raise ValueError("gold_eval_requires_drl5")
         dataset_id = _id("ds")
         now = _now()
         max_cases = _bounded_limit(max_cases or self.settings.dataset_max_cases, self.settings.dataset_max_cases)
@@ -974,13 +1212,18 @@ class LodiaStore:
         limit: int = 100,
         offset: int = 0,
         contributor_id: Optional[str] = None,
+        status: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         limit, offset = _page_bounds(limit, offset, self.settings.max_page_limit)
         params: List[Any] = []
-        where = ""
+        filters: List[str] = []
         if contributor_id:
-            where = "WHERE contributor_id = ?"
+            filters.append("contributor_id = ?")
             params.append(contributor_id)
+        if status:
+            filters.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
         params.extend([limit, offset])
         with self._session() as conn:
             return [
@@ -997,15 +1240,157 @@ class LodiaStore:
                 )
             ]
 
+    def create_payout_batch(
+        self,
+        contributor_id: Optional[str] = None,
+        min_amount_cents: int = 1,
+        max_events: int = 1000,
+        actor_id: str = "system",
+    ) -> Dict[str, Any]:
+        max_events = _bounded_limit(max_events, self.settings.max_page_limit)
+        filters = ["status = ?"]
+        params: List[Any] = ["pending"]
+        if contributor_id:
+            filters.append("contributor_id = ?")
+            params.append(contributor_id)
+        params.append(max_events)
+        batch_id = _id("pbat")
+        now = _now()
+        with self._session() as conn:
+            lock_clause = "FOR UPDATE SKIP LOCKED" if self.db.use_postgres else ""
+            rows = [
+                row_to_dict(row)
+                for row in self._execute(
+                    conn,
+                    f"""
+                    SELECT * FROM payout_events
+                    WHERE {' AND '.join(filters)}
+                    ORDER BY created_at ASC, id ASC
+                    LIMIT ?
+                    {lock_clause}
+                    """,
+                    tuple(params),
+                )
+            ]
+            total = sum(int(row["amount_cents"]) for row in rows)
+            if not rows or total < max(1, min_amount_cents):
+                raise ValueError("no_payouts_eligible")
+            manifest = {
+                "batch_id": batch_id,
+                "contributor_id": contributor_id,
+                "payout_count": len(rows),
+                "total_amount_cents": total,
+                "payout_ids": [row["id"] for row in rows],
+                "generated_at": now,
+            }
+            manifest_ref = self.objects.put_text(
+                f"payout_batches/{batch_id}/manifest.json",
+                json.dumps(manifest, ensure_ascii=False, indent=2),
+            )
+            self._execute(
+                conn,
+                """
+                INSERT INTO payout_batches
+                (id, status, contributor_id, payout_count, total_amount_cents, manifest_path,
+                 created_by, created_at, settled_by, settled_at, external_reference, notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (batch_id, "ready", contributor_id, len(rows), total, manifest_ref.uri, actor_id, now, None, None, "", ""),
+            )
+            for row in rows:
+                self._execute(
+                    conn,
+                    """
+                    UPDATE payout_events
+                    SET status = ?, settlement_batch_id = ?
+                    WHERE id = ? AND status = ?
+                    """,
+                    ("batched", batch_id, row["id"], "pending"),
+                )
+            self._audit(conn, actor_id, "payout_batch.created", "payout_batch", batch_id, {"payout_count": len(rows), "total_amount_cents": total})
+            return self.get_payout_batch(batch_id, conn=conn)
+
+    def settle_payout_batch(
+        self,
+        batch_id: str,
+        actor_id: str = "system",
+        external_reference: str = "",
+        notes: str = "",
+    ) -> Dict[str, Any]:
+        with self._session() as conn:
+            batch = self.get_payout_batch(batch_id, conn=conn)
+            if batch["status"] != "ready":
+                raise ValueError("payout_batch_not_ready")
+            now = _now()
+            self._execute(
+                conn,
+                """
+                UPDATE payout_batches
+                SET status = ?, settled_by = ?, settled_at = ?, external_reference = ?, notes = ?
+                WHERE id = ?
+                """,
+                ("settled", actor_id, now, external_reference[:160], notes[:1000], batch_id),
+            )
+            self._execute(
+                conn,
+                """
+                UPDATE payout_events
+                SET status = ?, settled_at = ?
+                WHERE settlement_batch_id = ? AND status = ?
+                """,
+                ("settled", now, batch_id, "batched"),
+            )
+            self._audit(conn, actor_id, "payout_batch.settled", "payout_batch", batch_id, {"external_reference": external_reference[:160]})
+            return self.get_payout_batch(batch_id, conn=conn)
+
+    def get_payout_batch(self, batch_id: str, conn: Optional[Any] = None) -> Dict[str, Any]:
+        if conn is None:
+            with self._session() as active:
+                return self.get_payout_batch(batch_id, conn=active)
+        row = self._get_one(conn, "SELECT * FROM payout_batches WHERE id = ?", (batch_id,))
+        if not row:
+            raise KeyError("payout_batch_not_found")
+        return row_to_dict(row)
+
+    def list_payout_batches(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        status: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        limit, offset = _page_bounds(limit, offset, self.settings.max_page_limit)
+        params: List[Any] = []
+        where = ""
+        if status:
+            where = "WHERE status = ?"
+            params.append(status)
+        params.extend([limit, offset])
+        with self._session() as conn:
+            return [
+                row_to_dict(row)
+                for row in self._execute(
+                    conn,
+                    f"""
+                    SELECT * FROM payout_batches
+                    {where}
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    tuple(params),
+                )
+            ]
+
     def contributor_ledger(self, contributor_id: str) -> Dict[str, Any]:
         payouts = self.list_payout_events(limit=self.settings.max_page_limit, contributor_id=contributor_id)
         pending = sum(item["amount_cents"] for item in payouts if item["status"] == "pending")
+        batched = sum(item["amount_cents"] for item in payouts if item["status"] == "batched")
         settled = sum(item["amount_cents"] for item in payouts if item["status"] == "settled")
         return {
             "contributor_id": contributor_id,
             "pending_cents": pending,
+            "batched_cents": batched,
             "settled_cents": settled,
-            "total_cents": pending + settled,
+            "total_cents": pending + batched + settled,
             "payout_count": len(payouts),
             "items": payouts,
         }
@@ -1015,7 +1400,9 @@ class LodiaStore:
             row = self._get_one(conn, "SELECT * FROM payout_events WHERE id = ?", (payout_id,))
             if not row:
                 raise KeyError("payout_not_found")
-            self._execute(conn, "UPDATE payout_events SET status = ? WHERE id = ?", ("settled", payout_id))
+            if row["status"] != "pending":
+                raise ValueError("payout_not_pending")
+            self._execute(conn, "UPDATE payout_events SET status = ?, settled_at = ? WHERE id = ?", ("settled", _now(), payout_id))
             self._audit(conn, actor_id, "payout.settled", "payout_event", payout_id, {"contributor_id": row["contributor_id"]})
             return row_to_dict(self._get_one(conn, "SELECT * FROM payout_events WHERE id = ?", (payout_id,)))
 
@@ -1086,6 +1473,54 @@ class LodiaStore:
                 "pending_payout_cents": _sum_where(conn, self, "payout_events", "amount_cents", "status", "pending"),
                 "audit_events": _single_count(conn, self, "audit_logs"),
             }
+
+    def observability_snapshot(self) -> Dict[str, Any]:
+        with self._session() as conn:
+            readiness = self.readiness_check()
+            return {
+                "ok": readiness["ok"],
+                "readiness": readiness,
+                "metrics": self.metrics_snapshot(),
+                "case_drl": _count_by(conn, self, "cases", "drl"),
+                "payouts": _count_by(conn, self, "payout_events", "status"),
+                "payout_batches": _count_by(conn, self, "payout_batches", "status"),
+                "reviews": _count_by(conn, self, "reviews", "review_type"),
+                "model_invocations": _count_by(conn, self, "model_invocations", "status"),
+                "queue_depth": _count_grouped(conn, self, "jobs", ["queue_name", "status"]),
+            }
+
+    def list_model_invocations(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        entity_id: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        limit, offset = _page_bounds(limit, offset, self.settings.max_page_limit)
+        filters: List[str] = []
+        params: List[Any] = []
+        if entity_id:
+            filters.append("entity_id = ?")
+            params.append(entity_id)
+        if status:
+            filters.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        params.extend([limit, offset])
+        with self._session() as conn:
+            return [
+                self._model_invocation_from_row(row)
+                for row in self._execute(
+                    conn,
+                    f"""
+                    SELECT * FROM model_invocations
+                    {where}
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    tuple(params),
+                )
+            ]
 
     def create_approval_request(
         self,
@@ -1471,6 +1906,31 @@ class LodiaStore:
         except Exception:
             return None
 
+    def _record_model_invocation(self, conn: Any, invocation: Dict[str, Any]) -> None:
+        self._execute(
+            conn,
+            """
+            INSERT INTO model_invocations
+            (id, provider, task_type, entity_type, entity_id, status, input_hash, output_json,
+             error, cost_micros, latency_ms, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                _id("minv"),
+                invocation["provider"],
+                invocation["task_type"],
+                invocation["entity_type"],
+                invocation["entity_id"],
+                invocation["status"],
+                invocation.get("input_hash", ""),
+                dumps(invocation.get("output", {})),
+                invocation.get("error", ""),
+                int(invocation.get("cost_micros", 0)),
+                int(invocation.get("latency_ms", 0)),
+                _now(),
+            ),
+        )
+
     def _case_from_row(self, row: Any) -> Dict[str, Any]:
         return {
             "case_id": row["id"],
@@ -1567,6 +2027,17 @@ class LodiaStore:
         result["payload"] = loads(result.pop("payload_json"))
         return result
 
+    def _review_from_row(self, row: Any) -> Dict[str, Any]:
+        result = row_to_dict(row)
+        result["rubric"] = loads(result.pop("rubric_json") or "{}")
+        result["evidence"] = loads(result.pop("evidence_json") or "{}")
+        return result
+
+    def _model_invocation_from_row(self, row: Any) -> Dict[str, Any]:
+        result = row_to_dict(row)
+        result["output"] = loads(result.pop("output_json") or "{}")
+        return result
+
     @contextmanager
     def _session(self):
         with self.db.session() as conn:
@@ -1616,6 +2087,9 @@ class LodiaStore:
         self._ensure_submission_columns(conn)
         self._ensure_dataset_columns(conn)
         self._ensure_case_query_columns(conn)
+        self._ensure_review_columns(conn)
+        self._ensure_payout_tables(conn)
+        self._ensure_model_invocation_tables(conn)
         self._backfill_authorization_snapshots(conn)
         self._execute(
             conn,
@@ -1634,6 +2108,15 @@ class LodiaStore:
             ON CONFLICT(version) DO NOTHING
             """,
             ("20260506_p1_assets_authorization", _now()),
+        )
+        self._execute(
+            conn,
+            """
+            INSERT INTO schema_migrations (version, applied_at)
+            VALUES (?, ?)
+            ON CONFLICT(version) DO NOTHING
+            """,
+            ("20260506_p2_commercial_controls", _now()),
         )
 
     def _ensure_submission_columns(self, conn: Any) -> None:
@@ -1681,6 +2164,74 @@ class LodiaStore:
                 "UPDATE cases SET drl = ?, quality_score = ? WHERE id = ?",
                 (gate.get("drl", "DRL0"), float(annotation.get("quality_score", 0.0)), row["id"]),
             )
+
+    def _ensure_review_columns(self, conn: Any) -> None:
+        columns = self.db.column_names(conn, "reviews")
+        if "review_type" not in columns:
+            self._execute(conn, "ALTER TABLE reviews ADD COLUMN review_type TEXT")
+        if "score" not in columns:
+            self._execute(conn, "ALTER TABLE reviews ADD COLUMN score REAL")
+        if "rubric_json" not in columns:
+            self._execute(conn, "ALTER TABLE reviews ADD COLUMN rubric_json TEXT")
+        if "evidence_json" not in columns:
+            self._execute(conn, "ALTER TABLE reviews ADD COLUMN evidence_json TEXT")
+        self._execute(conn, "UPDATE reviews SET review_type = ? WHERE review_type IS NULL", ("human",))
+        self._execute(conn, "UPDATE reviews SET score = ? WHERE score IS NULL", (1.0,))
+        self._execute(conn, "UPDATE reviews SET rubric_json = ? WHERE rubric_json IS NULL", (dumps({}),))
+        self._execute(conn, "UPDATE reviews SET evidence_json = ? WHERE evidence_json IS NULL", (dumps({}),))
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_reviews_case_type ON reviews(case_id, review_type, decision)")
+
+    def _ensure_payout_tables(self, conn: Any) -> None:
+        columns = self.db.column_names(conn, "payout_events")
+        if "settlement_batch_id" not in columns:
+            self._execute(conn, "ALTER TABLE payout_events ADD COLUMN settlement_batch_id TEXT")
+        if "settled_at" not in columns:
+            self._execute(conn, "ALTER TABLE payout_events ADD COLUMN settled_at TEXT")
+        self._execute(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS payout_batches (
+                id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                contributor_id TEXT,
+                payout_count INTEGER NOT NULL,
+                total_amount_cents INTEGER NOT NULL,
+                manifest_path TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                settled_by TEXT,
+                settled_at TEXT,
+                external_reference TEXT NOT NULL,
+                notes TEXT NOT NULL
+            )
+            """,
+        )
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_payout_events_status_created ON payout_events(status, created_at)")
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_payout_events_batch ON payout_events(settlement_batch_id)")
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_payout_batches_status_created ON payout_batches(status, created_at)")
+
+    def _ensure_model_invocation_tables(self, conn: Any) -> None:
+        self._execute(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS model_invocations (
+                id TEXT PRIMARY KEY,
+                provider TEXT NOT NULL,
+                task_type TEXT NOT NULL,
+                entity_type TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                input_hash TEXT NOT NULL,
+                output_json TEXT NOT NULL,
+                error TEXT NOT NULL,
+                cost_micros INTEGER NOT NULL,
+                latency_ms INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """,
+        )
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_model_invocations_entity ON model_invocations(entity_type, entity_id)")
+        self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_model_invocations_status ON model_invocations(status, created_at)")
 
     def _ensure_authorization_tables(self, conn: Any) -> None:
         self._execute(
@@ -1880,11 +2431,16 @@ CREATE TABLE IF NOT EXISTS reviews (
     id TEXT PRIMARY KEY,
     case_id TEXT NOT NULL,
     reviewer_id TEXT NOT NULL,
+    review_type TEXT NOT NULL,
     decision TEXT NOT NULL,
+    score REAL NOT NULL,
     notes TEXT NOT NULL,
+    rubric_json TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
     FOREIGN KEY (case_id) REFERENCES cases(id)
 );
+CREATE INDEX IF NOT EXISTS idx_reviews_case_type ON reviews(case_id, review_type, decision);
 
 CREATE TABLE IF NOT EXISTS datasets (
     id TEXT PRIMARY KEY,
@@ -1936,12 +2492,32 @@ CREATE TABLE IF NOT EXISTS payout_events (
     amount_cents INTEGER NOT NULL,
     weight REAL NOT NULL,
     status TEXT NOT NULL,
+    settlement_batch_id TEXT,
+    settled_at TEXT,
     created_at TEXT NOT NULL,
     FOREIGN KEY (usage_event_id) REFERENCES usage_events(id),
     FOREIGN KEY (case_id) REFERENCES cases(id)
 );
 CREATE INDEX IF NOT EXISTS idx_payout_events_contributor_created ON payout_events(contributor_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_payout_events_usage ON payout_events(usage_event_id);
+CREATE INDEX IF NOT EXISTS idx_payout_events_status_created ON payout_events(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_payout_events_batch ON payout_events(settlement_batch_id);
+
+CREATE TABLE IF NOT EXISTS payout_batches (
+    id TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    contributor_id TEXT,
+    payout_count INTEGER NOT NULL,
+    total_amount_cents INTEGER NOT NULL,
+    manifest_path TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    settled_by TEXT,
+    settled_at TEXT,
+    external_reference TEXT NOT NULL,
+    notes TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_payout_batches_status_created ON payout_batches(status, created_at);
 
 CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
@@ -2001,6 +2577,23 @@ CREATE TABLE IF NOT EXISTS approval_requests (
 );
 CREATE INDEX IF NOT EXISTS idx_approval_requests_status ON approval_requests(status, created_at);
 
+CREATE TABLE IF NOT EXISTS model_invocations (
+    id TEXT PRIMARY KEY,
+    provider TEXT NOT NULL,
+    task_type TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    output_json TEXT NOT NULL,
+    error TEXT NOT NULL,
+    cost_micros INTEGER NOT NULL,
+    latency_ms INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_model_invocations_entity ON model_invocations(entity_type, entity_id);
+CREATE INDEX IF NOT EXISTS idx_model_invocations_status ON model_invocations(status, created_at);
+
 CREATE TABLE IF NOT EXISTS audit_logs (
     id TEXT PRIMARY KEY,
     actor_id TEXT NOT NULL,
@@ -2050,13 +2643,15 @@ def _quality_report(dataset_id: str, cases: List[Dict[str, Any]]) -> Dict[str, A
         "drl_distribution": drl_distribution,
         "contains_raw_data": False,
         "human_review_required_for_drl3_plus": True,
+        "expert_review_required_for_drl4_plus": True,
+        "double_review_required_for_drl5": True,
     }
 
 
 def _data_contract(dataset_id: str, name: str, purpose: str, min_drl: str, cases: List[Dict[str, Any]], now: str) -> Dict[str, Any]:
     return {
         "contract_id": _id("dc"),
-        "version": "2026-05-06.p1",
+        "version": "2026-05-06.p2",
         "dataset_id": dataset_id,
         "name": name,
         "purpose": purpose,
@@ -2071,6 +2666,8 @@ def _data_contract(dataset_id: str, name: str, purpose: str, min_drl: str, cases
             "requires_active_authorization_snapshot": True,
             "requires_no_required_actions": True,
             "requires_human_review_for_drl3_plus": True,
+            "requires_expert_review_for_drl4_plus": True,
+            "requires_double_review_for_gold_eval": True,
         },
         "generated_at": now,
     }
@@ -2089,7 +2686,12 @@ def _data_contract_violations(contract: Dict[str, Any], cases: List[Dict[str, An
             violations.append("purpose_not_authorized")
         if not case.get("authorization_snapshot_id"):
             violations.append("authorization_snapshot_missing")
-        if case["quality_gate"].get("required_actions"):
+        if purpose == "gold_eval" and case["quality_gate"]["drl"] != "DRL5":
+            violations.append("gold_eval_requires_drl5")
+        required_actions = list(case["quality_gate"].get("required_actions") or [])
+        if purpose != "gold_eval":
+            required_actions = [action for action in required_actions if action != "gold_second_review"]
+        if required_actions:
             violations.append("required_actions_open")
     return sorted(set(violations))
 
@@ -2130,16 +2732,22 @@ def _contribution_from_case(case: Dict[str, Any]) -> ContributionWeight:
 
 
 def _count_by(conn: Any, store: LodiaStore, table_name: str, column_name: str) -> Dict[str, int]:
+    table_name = _safe_metric_identifier(table_name)
+    column_name = _safe_metric_identifier(column_name)
     rows = store._execute(conn, f"SELECT {column_name} AS key, COUNT(*) AS value FROM {table_name} GROUP BY {column_name}")
     return {row["key"]: row["value"] for row in rows}
 
 
 def _single_count(conn: Any, store: LodiaStore, table_name: str) -> int:
+    table_name = _safe_metric_identifier(table_name)
     row = store._get_one(conn, f"SELECT COUNT(*) AS value FROM {table_name}")
     return int(row["value"]) if row else 0
 
 
 def _sum_where(conn: Any, store: LodiaStore, table_name: str, amount_column: str, where_column: str, where_value: str) -> int:
+    table_name = _safe_metric_identifier(table_name)
+    amount_column = _safe_metric_identifier(amount_column)
+    where_column = _safe_metric_identifier(where_column)
     row = store._get_one(
         conn,
         f"SELECT COALESCE(SUM({amount_column}), 0) AS value FROM {table_name} WHERE {where_column} = ?",
@@ -2148,12 +2756,37 @@ def _sum_where(conn: Any, store: LodiaStore, table_name: str, amount_column: str
     return int(row["value"]) if row else 0
 
 
+def _count_grouped(conn: Any, store: LodiaStore, table_name: str, columns: List[str]) -> Dict[str, int]:
+    safe_table = _safe_metric_identifier(table_name)
+    safe_columns = [_safe_metric_identifier(column) for column in columns]
+    select_columns = ", ".join(safe_columns)
+    rows = store._execute(
+        conn,
+        f"SELECT {select_columns}, COUNT(*) AS count FROM {safe_table} GROUP BY {select_columns}",
+    )
+    result: Dict[str, int] = {}
+    for row in rows:
+        key = ":".join(str(row[column]) for column in safe_columns)
+        result[key] = int(row["count"])
+    return result
+
+
+def _safe_metric_identifier(value: str) -> str:
+    if not value.replace("_", "").isalnum():
+        raise ValueError("invalid_identifier")
+    return value
+
+
 def _page_bounds(limit: int, offset: int, max_limit: int) -> tuple[int, int]:
     return _bounded_limit(limit, max_limit), max(0, offset)
 
 
 def _bounded_limit(limit: int, max_limit: int) -> int:
     return max(1, min(limit, max_limit))
+
+
+def _bounded_score(score: float) -> float:
+    return max(0.0, min(float(score), 1.0))
 
 
 def _clean_roles(roles: List[str]) -> List[str]:
@@ -2184,6 +2817,10 @@ def _id(prefix: str) -> str:
 
 def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
 
 
 def _now() -> str:

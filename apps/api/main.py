@@ -51,6 +51,12 @@ class ReviewRequest(BaseModel):
     notes: str = Field(default="", max_length=2_000)
 
 
+class AdvancedReviewRequest(ReviewRequest):
+    score: float = Field(default=1.0, ge=0, le=1)
+    rubric: dict = Field(default_factory=dict)
+    evidence: dict = Field(default_factory=dict)
+
+
 class DatasetRequest(BaseModel):
     name: str = Field(min_length=1, max_length=160)
     purpose: str = Field(default="commercial_dataset", max_length=80)
@@ -83,6 +89,17 @@ class RejectRequest(BaseModel):
 
 
 class PayoutSettleRequest(BaseModel):
+    notes: str = Field(default="", max_length=1_000)
+
+
+class PayoutBatchCreateRequest(BaseModel):
+    contributor_id: Optional[str] = Field(default=None, max_length=128)
+    min_amount_cents: int = Field(default=1, ge=1)
+    max_events: int = Field(default=1000, ge=1, le=10_000)
+
+
+class PayoutBatchSettleRequest(BaseModel):
+    external_reference: str = Field(default="", max_length=160)
     notes: str = Field(default="", max_length=1_000)
 
 
@@ -345,6 +362,18 @@ async def get_asset(asset_id: str, actor: AuthContext = Depends(require_contribu
     return _public_asset(asset)
 
 
+@app.post("/api/assets/{asset_id}/extract")
+async def request_asset_extraction(asset_id: str, actor: AuthContext = Depends(require_contributor)):
+    try:
+        asset = store.get_asset(asset_id)
+        _assert_readable_owner(asset["owner_id"], actor)
+        return store.request_asset_extraction(asset_id, actor_id=actor.subject_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/api/authorizations")
 async def create_authorization(payload: ConsentCreateRequest, actor: AuthContext = Depends(require_contributor)):
     try:
@@ -418,12 +447,59 @@ async def approve_case(case_id: str, payload: ReviewRequest, actor: AuthContext 
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.post("/api/review/{case_id}/expert-verify")
+async def expert_verify_case(case_id: str, payload: AdvancedReviewRequest, actor: AuthContext = Depends(require_reviewer)):
+    try:
+        reviewer_id = actor.subject_id if auth_manager.enabled else payload.reviewer_id
+        return store.expert_verify_case(
+            case_id,
+            reviewer_id=reviewer_id,
+            notes=payload.notes,
+            rubric=payload.rubric,
+            evidence=payload.evidence,
+            score=payload.score,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/review/{case_id}/gold-review")
+async def gold_review_case(case_id: str, payload: AdvancedReviewRequest, actor: AuthContext = Depends(require_reviewer)):
+    try:
+        reviewer_id = actor.subject_id if auth_manager.enabled else payload.reviewer_id
+        return store.gold_review_case(
+            case_id,
+            reviewer_id=reviewer_id,
+            notes=payload.notes,
+            rubric=payload.rubric,
+            evidence=payload.evidence,
+            score=payload.score,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/api/review/{case_id}/reject")
 async def reject_case(case_id: str, payload: RejectRequest, actor: AuthContext = Depends(require_reviewer)):
     try:
         return store.reject_case(case_id, actor.subject_id, payload.reason)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/reviews")
+async def list_reviews(
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    case_id: Optional[str] = Query(default=None, max_length=160),
+    review_type: Optional[str] = Query(default=None, max_length=40),
+    actor: AuthContext = Depends(require_reviewer),
+):
+    return _page(store.list_reviews(case_id=case_id, review_type=review_type, limit=limit, offset=offset), limit, offset)
 
 
 @app.get("/api/review/queue")
@@ -481,14 +557,53 @@ async def list_payout_events(
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     contributor_id: Optional[str] = Query(default=None, max_length=128),
+    status: Optional[str] = Query(default=None, max_length=40),
     actor: AuthContext = Depends(require_admin),
 ):
-    return _page(store.list_payout_events(limit=limit, offset=offset, contributor_id=contributor_id), limit, offset)
+    return _page(store.list_payout_events(limit=limit, offset=offset, contributor_id=contributor_id, status=status), limit, offset)
 
 
 @app.get("/api/ledger/contributors/{contributor_id}")
 async def contributor_ledger(contributor_id: str, actor: AuthContext = Depends(require_admin)):
     return store.contributor_ledger(contributor_id)
+
+
+@app.post("/api/ledger/payout-batches")
+async def create_payout_batch(payload: PayoutBatchCreateRequest, actor: AuthContext = Depends(require_admin)):
+    try:
+        return store.create_payout_batch(
+            contributor_id=payload.contributor_id,
+            min_amount_cents=payload.min_amount_cents,
+            max_events=payload.max_events,
+            actor_id=actor.subject_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/ledger/payout-batches")
+async def list_payout_batches(
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    status: Optional[str] = Query(default=None, max_length=40),
+    actor: AuthContext = Depends(require_admin),
+):
+    return _page(store.list_payout_batches(limit=limit, offset=offset, status=status), limit, offset)
+
+
+@app.post("/api/ledger/payout-batches/{batch_id}/settle")
+async def settle_payout_batch(batch_id: str, payload: PayoutBatchSettleRequest, actor: AuthContext = Depends(require_admin)):
+    try:
+        return store.settle_payout_batch(
+            batch_id,
+            actor_id=actor.subject_id,
+            external_reference=payload.external_reference,
+            notes=payload.notes,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/ledger/payout-events/{payout_id}/settle")
@@ -498,6 +613,8 @@ async def settle_payout(payout_id: str, payload: PayoutSettleRequest, actor: Aut
         return {**settled, "notes": payload.notes}
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/audit/logs")
@@ -529,6 +646,22 @@ async def purge_expired_raw(limit: int = Query(default=100, ge=1, le=500), actor
 @app.get("/api/admin/metrics")
 async def metrics(actor: AuthContext = Depends(require_admin)):
     return store.metrics_snapshot()
+
+
+@app.get("/api/admin/observability")
+async def observability(actor: AuthContext = Depends(require_admin)):
+    return store.observability_snapshot()
+
+
+@app.get("/api/admin/model-invocations")
+async def list_model_invocations(
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    entity_id: Optional[str] = Query(default=None, max_length=160),
+    status: Optional[str] = Query(default=None, max_length=40),
+    actor: AuthContext = Depends(require_admin),
+):
+    return _page(store.list_model_invocations(limit=limit, offset=offset, entity_id=entity_id, status=status), limit, offset)
 
 
 @app.post("/api/admin/approvals")

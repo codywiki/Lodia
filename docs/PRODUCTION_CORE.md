@@ -7,17 +7,18 @@
 - 数据库：通过 `Database` 抽象支持 SQLite 与 Postgres。
 - 对象存储：通过 `ObjectStorage` 抽象支持本地对象目录与 S3-compatible 存储。
 - 数据库连接：Postgres 使用连接池，SQLite 开发模式使用短连接 session，避免请求级连接泄漏。
-- 版本迁移：`schema_migrations` 记录 P0 迁移版本，启动时补齐新增表、列和索引。
+- 版本迁移：`schema_migrations` 记录 P0/P1/P2 迁移版本，启动时补齐新增表、列和索引。
 - 队列 Worker：`jobs` 表提供持久化任务队列，生产可接 Redis 做分发，DB 仍保留兜底扫描。
 - 幂等处理：`submission_id` 建唯一索引，Worker 重试不会重复生成同一条 Case。
 - Auth/RBAC：支持环境 Bootstrap Token、数据库用户、登录 Token、Token 撤销和 `admin`、`reviewer`、`contributor` 三类角色。
-- 审核后台：支持审核队列、DRL3 审核通过、驳回、审计日志和控制台查看。
+- 审核后台：支持审核队列、DRL3 人审、DRL4 专家验证、DRL5 双人 gold review、驳回、审计日志和控制台查看。
 - 数据出厂：Dataset Builder 生成 `Data Contract`、Manifest、Quality Report 和 JSONL。
-- 多模态资产：支持资产上传、类型识别、危险文件拒收、文本/trace 证据抽取、图片/PDF/音视频待提取状态和专用 Worker 扩展点。
+- 多模态资产：支持资产上传、类型识别、危险文件拒收、文本/trace 证据抽取、PDF 文本层提取、图片/PDF/音视频待提取状态和专用 Worker 扩展点。
 - 授权快照：每次提交记录用途范围、协议版本和授权状态，撤回后同步阻断 Case、Asset 和未来数据集出厂。
-- Ledger：支持 UsageEvent、PayoutEvent、贡献者账本和 payout settle。
+- Model Gateway：记录本地规则标注和多模态提取调用，为后续国内模型、OCR、ASR 和成本核算预留统一审计表。
+- Ledger：支持 UsageEvent、PayoutEvent、贡献者账本、payout settle、结算批次、批次 manifest 和幂等结算保护。
 - 操作审批：支持审批请求、审批/拒绝、审批审计，供高风险导出和结算接入。
-- 生产护栏：API request id、请求体上限、单节点限流、请求签名开关、分页查询、`/api/ready` 就绪检查。
+- 生产护栏：API request id、请求体上限、单节点限流、请求签名开关、分页查询、`/api/ready` 就绪检查和 `/api/admin/observability` 指标快照。
 - 查询性能：Case 增加 `drl`、`quality_score` 查询列和核心索引，数据集生成按 DRL/质量分筛选并限制批量大小。
 - Raw Quarantine：原始对象记录过期时间，支持 TTL purge，S3-compatible 存储支持 SSE/KMS 参数。
 - 部署：生产 Compose 启动 `postgres`、`redis`、`api`、`worker`、`web` 五类服务。
@@ -87,9 +88,15 @@ SQLite 使用单进程安全的简单领取逻辑。Postgres 使用 `FOR UPDATE 
 
 ## 多模态与授权门禁
 
-`/api/assets` 接收多模态资产，当前生产底座先完成类型识别、文件风险扫描、raw quarantine、文本/trace 证据抽取和红线文件拒收。图片、PDF、音频、视频默认进入 `extraction_pending`，后续可以挂 OCR、ASR、视频关键帧和文档解析 Worker，不改变资产表和任务队列接口。
+`/api/assets` 接收多模态资产，当前生产底座先完成类型识别、文件风险扫描、raw quarantine、文本/trace 证据抽取、PDF 文本层提取和红线文件拒收。图片、扫描 PDF、音频、视频默认进入 `extraction_pending`，可通过 `/api/assets/{asset_id}/extract` 投递到 `extraction` 队列，后续接入 OCR、ASR、视频关键帧和文档解析 Worker 时不改变资产表和任务队列接口。
 
 `authorization_snapshots` 是数据出厂的一等门禁。每个文本提交和资产上传都会绑定授权快照，Data Contract 会记录 `authorization_snapshot_ids`。授权撤回后，对应 Case 和 Asset 标记为 `withdrawn`，未来数据集生成会跳过这些 Case。
+
+## DRL4/DRL5 与结算
+
+自动化 worker 最高只生成 DRL2 候选。DRL3 必须人审通过；DRL4 必须在 DRL3 基础上完成专家验证且具备 training 授权；DRL5 必须具备 gold_eval 授权、DRL4 基础和两名不同 reviewer 的 gold review。`gold_eval` 数据集强制 `min_drl=DRL5`，Data Contract 会阻断仍存在 `gold_second_review` 等待办项的 Case。
+
+结算链路支持单个 payout settle，也支持先生成 `payout_batches`。批次会写入 manifest，对应 `payout_events` 从 `pending` 进入 `batched`，最终 settle 后统一进入 `settled` 并记录 `settled_at`、外部流水和审计事件。已经 settled 的批次不能重复结算。
 
 ## 1w 日活生产口径
 
@@ -99,14 +106,15 @@ SQLite 使用单进程安全的简单领取逻辑。Postgres 使用 `FOR UPDATE 
 - 只有在服务只接收可信反向代理流量时，才开启 `LODIA_TRUST_PROXY_HEADERS=true` 读取 `X-Forwarded-For`。
 - Postgres 使用托管 RDS 或独立高配实例，按实际并发调高 `LODIA_DB_POOL_MAX_SIZE`，并避免超过数据库 `max_connections`。
 - 对象存储使用 OSS/S3-compatible bucket，原始数据和脱敏数据分 bucket 或分前缀隔离，生产建议启用 KMS。
-- Worker 按 ingestion、redaction、annotation、review-export 分队列横向扩容。
+- Worker 按 ingestion、extraction、redaction、annotation、review-export 分队列横向扩容。
 - 多模态大文件上传建议走对象存储直传和回调，本 API 当前作为控制面和内部测试入口。
 - 列表接口必须分页，批量导出必须有 `LODIA_DATASET_MAX_CASES` 或后台离线任务上限。
 
 ## 下一步
 
 - 将当前内置 versioned migration 升级为 Alembic CLI 工作流。
-- 将审计日志和 `/api/admin/metrics` 接入 SLS/Prometheus/Grafana。
+- 将审计日志、`/api/admin/metrics` 和 `/api/admin/observability` 接入 SLS/Prometheus/Grafana。
 - 接入真实 OSS RAM 角色或 STS 临时凭据，补删除证明对象。
+- 接入真实 PaddleOCR/ASR/文档解析供应商，并将供应商调用落入 `model_invocations`。
 - 将 Reviewer Console 拆成独立路由和更完整的人审工作台。
-- 增加企业租户、SSO、订单合同、提现结算和争议仲裁。
+- 增加企业租户、SSO、订单合同、真实提现通道和争议仲裁。
