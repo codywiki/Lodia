@@ -1,120 +1,137 @@
 # Lodia
 
-> 与其被 AI 吞没，不如成为 AI 生态的一部分。不是把人从未来的工作里移走，而是把人的经验、判断和反馈，留在价值链里。
+> Turn long-horizon AI work into reusable datasets and lasting data assets.
 
-Lodia 想做一件很具体的事：把你每天和 AI 一起完成的对话、任务、案例、评测和执行记录，变成可授权、可复用、可持续分成的数据资产。
+Lodia is a data asset platform for LLM and Agent-era work.
 
-我们相信，未来很多职业工作会被 AI 重写。真正稀缺的不会是又一段漂亮回答，而是真实世界里的问题、上下文、约束、失败路径、工具过程、人类反馈和行业判断。那些东西现在散落在聊天记录、邮件、文档、代码任务、客服工单、Agent trace 和评测表里，用完就沉底。
+It turns high-quality AI conversations, Codex/Cursor tasks, Agent traces, evaluation reviews, tool execution records, and human acceptance feedback into authorized, structured, privacy-safe, commercially usable training and evaluation datasets.
 
-Lodia 要把这些沉底的经验重新打捞出来。
+The product starts from one focused belief: the most valuable AI data is not a polished answer. It is the full task path: goal, context, constraints, process, tool evidence, failure, correction, acceptance, and reusable judgment.
 
-## Lodia 是什么
+## What Lodia Does
 
-Lodia 是一个 AI Case-to-Dataset 数据资产平台。
+Lodia helps contributors preserve the value hidden inside daily AI work, and helps AI companies obtain higher-quality long-horizon task data.
 
-个人可以把高质量 AI 对话、任务过程、案例和评测提交给 Lodia。Lodia 先隔离原始数据，再完成脱敏、去重、结构化、自动标注、人工审核和专家精标。只有通过授权、隐私、质量和可用性门禁的 Case，才可能进入可商用数据集、评测集、行业案例库或企业私有数据资产。
+For contributors, Lodia is a way to build personal data assets from real work. A useful case can keep generating revenue when it is accepted, packaged, delivered, or reused.
 
-当一条 Case 被采纳、授权、打包、调用或销售，收益会回到贡献者账本。不是一次性买断人的经验，而是只要这条 Case 还在产生价值，数据所有者就应该持续参与回报。
+For AI teams and enterprises, Lodia is a governed pipeline for data that can actually be trained on, evaluated against, audited, and paid for fairly.
 
-## 我们相信
+## Data Focus
 
-- 每个人都应该拥有自己的数据资产，而不是只把劳动痕迹留给平台。
-- AI 公司需要更真实、更干净、更可追溯的数据，而不是一堆来路不明的聊天碎片。
-- 好数据不只是“内容”，还包括任务目标、约束条件、执行过程、工具结果、用户反馈和验收标准。
-- 隐私和授权不是发布前补一张协议，而应该写进数据处理链的第一天。
-- 真正有价值的 Case，应该让贡献者长期分到收益。
+Lodia currently focuses on LLM long-horizon task cases.
 
-## 它怎么工作
+A qualified case should include as much of the following structure as possible:
+
+- Objective
+- Context
+- Constraints
+- Steps
+- Tool results
+- Failures
+- Corrections
+- Acceptance criteria
+- Reusable rules
+
+Attachments, screenshots, logs, files, and multimodal assets are treated as supporting evidence for a task case. They are not separate generic media datasets.
+
+## Product Pipeline
 
 ```text
-上传或转发 AI 对话 / 任务 / 案例 / 评测
--> 原始数据隔离
--> 自动脱敏与风险扫描
--> 去重、聚类和价值评分
--> 结构化解析与自动标注
--> 人工审核与专家精标
--> 数据资产注册与授权快照
--> 数据集打包、API 调用或企业交付
--> 使用记录与收益分账
+AI conversation / Agent trace / Codex task / evaluation review
+-> raw data quarantine
+-> automatic redaction and risk scan
+-> deduplication and novelty check
+-> long-horizon task extraction
+-> structured annotation and quality scoring
+-> reviewer field-level refinement
+-> content-safety and authorization gates
+-> dataset artifacts and commercial proof
+-> enterprise delivery or controlled export
+-> usage events, payout events, and contributor revenue ledger
 ```
 
-Lodia 的核心不是“收件箱”，也不是“自动标注”。核心是一条可信的数据资产生产线：知道数据从哪里来，谁授权了它，被怎样处理过，质量到了什么等级，用在了哪里，收益该回到谁。
+The core of Lodia is not a mailbox, a form, or a labeling UI. It is a trusted data production line: where the data came from, who owns it, what it may be used for, how it was processed, why it is valuable, where it was delivered, and who should share the revenue.
 
-## 给贡献者
+## Current Engineering Spine
 
-如果你是 AI 重度用户、开发者、咨询顾问、运营、客服、销售、培训师、行业专家，或者只是每天认真使用 AI 完成工作的人，Lodia 想帮你保留那些本来会消失的劳动价值。
+The active product mainline is:
 
-你贡献的可以是：
+- Go API service under `apps/api-go`
+- React console and product site under `apps/web`
+- MySQL as the primary transactional store
+- Redis-backed worker queue
+- OSS-compatible object storage for raw evidence, assets, and dataset artifacts
+- HTTP smoke coverage through `scripts/go_smoke.sh`
+- CI coverage through `.github/workflows/app.yml`
 
-- 一个高质量问题和完整上下文
-- 一次复杂任务的执行过程
-- 一段 Agent 调用工具并完成目标的 trace
-- 一份人工验收过的回答
-- 一组模型评测样本
-- 一个行业场景里的失败案例、边界条件或修正过程
+The Go mainline owns new backend development. Product documentation and architecture specifications are kept under `docs`.
 
-低质量、重复、缺少授权或隐私风险过高的内容不会进入商业数据集。真正被采纳的 Case，会通过 CaseID、授权快照、使用事件和收益账本持续追踪。
+## Core Capabilities
 
-## 给 AI 公司和企业
+- Contribution intake: text submissions, inbox ingestion, webhook cases, and one-click trace export.
+- Trace export: structured long-horizon task import with evidence attachments.
+- Privacy handling: raw data isolation, deterministic redaction, residual risk checks, and raw retention controls.
+- Deduplication: raw hash, canonical hash, duplicate submission state, and novelty-aware intake.
+- Annotation: long-horizon task extraction, quality score, DRL gate, reuse intent, and confidence.
+- Reviewer workbench: field-level refinement for objective, context, constraints, steps, tool results, failures, corrections, acceptance, and reusable rules.
+- Dataset packaging: data JSONL, manifest, quality report, and data contract artifacts.
+- Commercial proof: artifact hash checks, case readiness, content-safety state, evaluation state, and authorization state.
+- Enterprise delivery: customers, contracts, orders, delivery grants, portal access, usage reports, invoices, reconciliation, and disputes.
+- Contributor ledger: usage events, payout events, payout batches, payout transfer records, and contributor dashboard.
+- Governance: RBAC, audit logs, migration registry, launch readiness checks, operational alerts, DSR requests, content-safety scans, and payout profiles.
 
-Lodia 面向需要高质量可训练数据、评测数据和真实任务样本的团队。
+## Fair Revenue Model
 
-你拿到的不是未经处理的原始聊天记录，而是经过脱敏、授权、去重、分级、审核和质量门禁的数据资产。每个数据集都应该带着清单、来源、用途边界、质量等级、已知限制和审计记录。
+Lodia is designed around contributor-aligned economics.
 
-适用场景包括：
+The platform keeps 20% of net revenue after direct costs. The remaining 80% goes into the contributor pool and is distributed by case-level payout events. Allocation can consider case quality, task completeness, evidence strength, reviewer outcome, and commercial usage.
 
-- 模型训练和指令微调候选数据
-- Agent 任务评测集
-- 行业场景案例库
-- 客服、销售、法务、财务、人力等企业 AI 流程评测
-- RAG 知识样本与 SOP 沉淀
-- 企业私有 AI 使用经验库
+The accounting model is event-based:
 
-## 为什么开源
+- UsageEvent records commercial usage.
+- PayoutEvent records each contributor allocation.
+- PayoutBatch groups payable events.
+- PayoutTransfer records external settlement.
+- Contributor dashboard shows pending, batched, settled, and total earnings.
 
-数据资产平台最先要解决的不是界面问题，而是信任问题。
+## Data Quality Standard
 
-所以这个仓库先开放产品需求、技术架构和风险评估：Lodia 怎么理解隐私，怎么处理授权，怎么定义 Case 的价值，怎么区分自动标注和人工精标，怎么判断一条数据是否真的可以商用。
+Lodia does not treat every conversation as useful data.
 
-这不是一个已经完成的产品仓库，而是 Lodia 从想法走向产品的公开起点。当前代码已经开始从官网和文档进入可运行产品主干：先搭建商业化平台骨架，再围绕脱敏、标注、质量门禁、数据出厂和收益分账逐步加深。
+A case becomes commercially useful only when it passes the required gates:
 
-## 当前仓库包含
+- Authorized use scope
+- Privacy and redaction checks
+- Duplicate and novelty checks
+- Long-horizon task evidence score
+- Human review or expert refinement where required
+- Content-safety scan
+- Dataset evaluation
+- Commercial proof generation
+- Authorization-withdrawal blocking
 
-- 静态官网：[`site/`](./site)
-- 前端控制台骨架：[`apps/web/`](./apps/web)
-- 后端核心服务骨架：[`apps/api/`](./apps/api)
-- 产品需求文档：[`docs/LODIA_PRD.md`](./docs/LODIA_PRD.md)
-- 技术架构文档：[`docs/LODIA_TECH_ARCHITECTURE.md`](./docs/LODIA_TECH_ARCHITECTURE.md)
-- 技术风险与数据质量评估：[`docs/LODIA_TECH_RISK_ASSESSMENT.md`](./docs/LODIA_TECH_RISK_ASSESSMENT.md)
-- 生产化核心改造：[`docs/PRODUCTION_CORE.md`](./docs/PRODUCTION_CORE.md)
-- 最小 MVP 实施计划：[`docs/plans/2026-05-05-lodia-mvp.md`](./docs/plans/2026-05-05-lodia-mvp.md)
-- 顶级商业化平台实施计划：[`docs/plans/2026-05-05-lodia-commercial-platform.md`](./docs/plans/2026-05-05-lodia-commercial-platform.md)
+This is how Lodia moves from “collected content” to reusable, auditable, commercially usable data.
 
-## 当前工程主干
+## Repository Structure
 
-第一批代码聚焦 Lodia 的核心可信链路：
+```text
+apps/
+  api-go/      Go API, worker-facing store, pipeline, review, dataset, ledger, and enterprise delivery logic
+  web/         React product site and console
+docs/          Product, architecture, data quality, compliance, and production-readiness documents
+scripts/       Smoke tests, production verification helpers, and deployment utilities
+.github/       CI and repository automation
+```
 
-- `redaction`：PII、密钥、内部 URL、公司名、地址等规则脱敏和残留扫描。
-- `dedup`：raw hash、canonical hash、simhash 和基础重复识别。
-- `annotation`：领域、任务类型、复用用途、质量分和置信度预标注。
-- `model_gateway`：本地规则模型调用记录、多模态提取扩展点和供应商处理审计底座。
-- `quality`：Quality Gate、DRL0-DRL5 分级规则和商用准入限制。
-- `payout`：平台只保留净收益 20%，贡献者池 80% 按权重公平分配。
-- `pipeline`：文本 Case 自动处理预览链路。
-- `assets`：多模态资产入口、文件风险扫描、文本/trace 证据抽取和专用处理队列。
-- `upload_sessions`：对象存储直传会话、完成回调和服务端验收，支持未来 OSS/S3 大文件链路。
-- `authorization`：贡献者授权快照、用途范围、协议版本和撤回后出厂阻断。
-- `tenants`：租户元数据、用户 tenant_id 和认证上下文，作为企业 SSO/配额/隔离底座。
-- `auth`：环境 Bootstrap Token、数据库用户登录、Token 撤销、角色权限和最小 RBAC。
-- `database`：SQLite/Postgres 双后端。
-- `object_storage`：本地对象目录与 S3-compatible 对象存储，支持 SSE/KMS 参数和 raw TTL 清理。
-- `worker`：持久化任务队列、Redis 分发和异步处理 Worker。
-- `review`：审核队列、通过、驳回、DRL3 人审、DRL4 专家验证和 DRL5 双人 gold review。
-- `contract`：Data Contract、Manifest、Quality Report 和数据出厂门禁。
-- `ledger`：UsageEvent、PayoutEvent、贡献者账本、结算批次和幂等结算状态。
-- `limits`：请求体上限、单节点限流、请求签名、请求追踪和生产护栏。
-- `readiness`：`/api/ready` 检查数据库、队列与对象存储，`/api/admin/observability` 和 Prometheus 文本指标汇总 DRL、队列、模型调用、审核和结算状态。
+## Documentation
 
-## 许可证
+- Product requirements: `docs/LODIA_PRD.md`
+- Technical architecture: `docs/LODIA_TECH_ARCHITECTURE.md`
+- Production core: `docs/PRODUCTION_CORE.md`
+- LLM long-horizon task data PRD: `docs/LLM_LONG_HORIZON_TASK_DATA_PRD.md`
 
-本项目采用 GNU Affero General Public License v3.0 开源协议。详见 [`LICENSE`](./LICENSE)。
+## License
+
+Lodia is released under the GNU Affero General Public License v3.0.
+
+See [LICENSE](./LICENSE).
