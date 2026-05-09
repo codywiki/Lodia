@@ -132,6 +132,7 @@ scripts/       Smoke tests、生产验证脚本和部署工具
 - 技术架构：`docs/LODIA_TECH_ARCHITECTURE.md`
 - 生产核心：`docs/PRODUCTION_CORE.md`
 - LLM 长程任务数据 PRD：`docs/LLM_LONG_HORIZON_TASK_DATA_PRD.md`
+- 可拉取部署：`docs/deploy/PULL_DEPLOYMENT.md`
 
 ## English
 
@@ -260,6 +261,7 @@ scripts/       Smoke tests, production verification helpers, and deployment util
 - Technical architecture: `docs/LODIA_TECH_ARCHITECTURE.md`
 - Production core: `docs/PRODUCTION_CORE.md`
 - LLM long-horizon task data PRD: `docs/LLM_LONG_HORIZON_TASK_DATA_PRD.md`
+- Pull-based deployment: `docs/deploy/PULL_DEPLOYMENT.md`
 
 ## License
 

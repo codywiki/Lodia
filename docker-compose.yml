@@ -1,47 +1,112 @@
 services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: lodia
+      MYSQL_USER: lodia
+      MYSQL_PASSWORD: lodia_dev_only
+      MYSQL_ROOT_PASSWORD: lodia_root_dev_only
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --innodb-buffer-pool-size=256M
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u lodia -plodia_dev_only --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
   api:
     build:
-      context: ./apps/api
-    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+      context: ./apps/api-go
     environment:
       LODIA_ENV: development
-      LODIA_OBJECT_STORAGE_BACKEND: local
-      LODIA_OBJECT_STORAGE_DIR: /data
+      LODIA_DEPLOYMENT_PROFILE: development
+      LODIA_DATA_FOCUS: llm_long_horizon_task
+      LODIA_HTTP_ADDR: :8080
+      MYSQL_DSN: lodia:lodia_dev_only@tcp(mysql:3306)/lodia?parseTime=true&charset=utf8mb4&loc=UTC
       REDIS_URL: redis://redis:6379/0
-      LODIA_QUEUE_BACKEND: database
-      LODIA_RATE_LIMIT_ENABLED: "false"
-      LODIA_MAX_ASSET_BYTES: 1048576
-      LODIA_UPLOAD_SESSION_TTL_SECONDS: 900
+      LODIA_WORKER_QUEUE: ingestion
+      LODIA_ASYNC_PROCESSING: "true"
       LODIA_MAX_REQUEST_BODY_BYTES: 1048576
+      LODIA_RATE_LIMIT_ENABLED: "true"
+      LODIA_RATE_LIMIT_REQUESTS: 1000
+      LODIA_RATE_LIMIT_WINDOW_SECONDS: 60
+      LODIA_TRUST_PROXY_HEADERS: "false"
+      LODIA_ACCESS_LOG_ENABLED: "true"
+      LODIA_RAW_OBJECT_TTL_HOURS: 24
+      LODIA_PURGE_RAW_AFTER_PROCESSING: "true"
+      LODIA_OBJECT_STORAGE_BACKEND: local
+      LODIA_OBJECT_STORAGE_DIR: /objects
+      LODIA_OBJECT_STORAGE_STS_ENABLED: "false"
+      LODIA_OSS_STS_ENDPOINT_URL: https://sts.aliyuncs.com
+      LODIA_OSS_STS_SESSION_NAME: lodia-upload
+      LODIA_OSS_STS_DURATION_SECONDS: 900
+      LODIA_PASSWORD_PEPPER: dev-only-password-pepper
     ports:
-      - "8000:8000"
+      - "8080:8080"
     volumes:
-      - ./apps/api:/app
-      - ./storage/dev:/data
+      - ./storage/dev/objects:/objects
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/api/ready >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+      retries: 10
 
   worker:
     build:
-      context: ./apps/api
-    command: python worker.py
+      context: ./apps/api-go
+    entrypoint: ["/app/lodia-worker"]
     environment:
       LODIA_ENV: development
-      LODIA_DATA_DIR: /data
+      LODIA_DEPLOYMENT_PROFILE: development
+      LODIA_DATA_FOCUS: llm_long_horizon_task
+      MYSQL_DSN: lodia:lodia_dev_only@tcp(mysql:3306)/lodia?parseTime=true&charset=utf8mb4&loc=UTC
       REDIS_URL: redis://redis:6379/0
-      LODIA_QUEUE_BACKEND: database
-      LODIA_MAX_ASSET_BYTES: 1048576
-      LODIA_UPLOAD_SESSION_TTL_SECONDS: 900
+      LODIA_WORKER_QUEUE: ingestion
       LODIA_OBJECT_STORAGE_BACKEND: local
-      LODIA_OBJECT_STORAGE_DIR: /data
+      LODIA_OBJECT_STORAGE_DIR: /objects
+      LODIA_OBJECT_STORAGE_STS_ENABLED: "false"
+      LODIA_PASSWORD_PEPPER: dev-only-password-pepper
+      LODIA_PURGE_RAW_AFTER_PROCESSING: "true"
+      LODIA_ACCESS_LOG_ENABLED: "true"
     volumes:
-      - ./apps/api:/app
-      - ./storage/dev:/data
+      - ./storage/dev/objects:/objects
     depends_on:
-      - api
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
   web:
     image: node:22-alpine
     working_dir: /app
-    command: sh -c "npm install && npm run dev"
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    environment:
+      VITE_API_BASE_URL: http://localhost:8080
     ports:
       - "5173:5173"
     volumes:
@@ -49,21 +114,6 @@ services:
     depends_on:
       - api
 
-  postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_DB: lodia
-      POSTGRES_USER: lodia
-      POSTGRES_PASSWORD: lodia_dev_only
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-
 volumes:
-  postgres-data:
+  mysql-data:
+  redis-data:

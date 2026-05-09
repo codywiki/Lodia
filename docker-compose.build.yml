@@ -1,0 +1,10 @@
+services:
+  api:
+    build:
+      context: ./apps/api-go
+    image: ${LODIA_API_IMAGE:-ghcr.io/codywiki/lodia-api:local}
+
+  web:
+    build:
+      context: ./apps/web
+    image: ${LODIA_WEB_IMAGE:-ghcr.io/codywiki/lodia-web:local}

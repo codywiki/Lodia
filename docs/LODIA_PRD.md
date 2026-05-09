@@ -1,13 +1,13 @@
 # Lodia 产品需求文档 PRD
 
-版本：v0.4  
-日期：2026-05-05  
-状态：中国区独立运营版 / 商业化产品需求定义 / MVP 到企业级数据产品路线  
-产品定位：中国区 AI 数据资产矿脉平台 / AI Case-to-Dataset Platform
+版本：v0.5
+日期：2026-05-07
+状态：中国区独立运营版 / LLM 长程任务数据聚焦版 / MVP 到企业级数据产品路线
+产品定位：中国区 LLM 长程任务数据资产平台 / LLM Long-Horizon Task Data Platform
 
 ## 1. 一句话定位
 
-Lodia 是一个 AI 数据资产平台，帮助用户一键把 AI 对话、任务执行记录、案例、附件和评测过程沉淀为可复用、可评估、可授权、可持续变现的数据资产。
+Lodia 是一个 LLM 长程任务数据资产平台，帮助用户一键把 AI 对话中的复杂任务执行记录、Agent trace、代码任务、工具调用、验收过程和复盘案例沉淀为可复用、可评估、可授权、可持续变现的数据资产。
 
 品牌含义：
 
@@ -15,19 +15,25 @@ Lodia 是一个 AI 数据资产平台，帮助用户一键把 AI 对话、任务
 
 对外主张：
 
-> 一键把 AI 工作记录变成可复用、可变现的数据资产。
+> 一键把 LLM 长程任务变成可复用、可变现的数据资产。
 
 扩展说明：
 
-> 用户只需转发或上传 AI 对话、任务记录和案例，Lodia 自动完成隔离、脱敏、去重、结构化、标注、质量评分、分类汇总和数据集生成。优质 Case 被采纳、授权、调用或进入数据集后，贡献者可以获得收益。
+> 用户只需转发或上传 LLM 对话、Agent 执行记录、代码修复任务、企业流程任务和评测复盘，Lodia 自动完成隔离、脱敏、去重、结构化、长程任务证据评分、标注、审核和数据集生成。优质 Case 被采纳、授权或进入训练/评测数据集后，贡献者可以获得收益。
+
+当前聚焦：
+
+- 只建设 LLM 长程任务高质量数据。
+- 暂不建设泛图片、音频、视频、普通闲聊、单轮问答、通用文本或知识库切片数据。
+- 附件只作为长程任务 Case 的证据补充，不作为独立数据产品。
 
 产品模块命名：
 
-- Lodia Inbox：AI 对话、任务、案例、文件和评测记录的一键收集入口。
-- Lodia Pipeline：脱敏、解析、去重、结构化、自动标注和质量门禁处理链。
-- Lodia Gold：高质量可商用数据集和 gold eval 数据集。
+- Lodia Inbox：LLM 对话、Agent trace、代码任务和评测复盘的一键收集入口。
+- Lodia Pipeline：脱敏、解析、去重、结构化、长程任务证据评分、自动标注和质量门禁处理链。
+- Lodia Gold：高质量长程任务训练数据集和 gold eval 数据集。
 - Lodia Ledger：CaseID、授权、使用记录和贡献者收益分账账本。
-- Lodia Eval：面向模型、Agent 和企业 AI 流程的评测数据与评测服务。
+- Lodia Eval：面向模型、Agent 和企业 AI 流程的长程任务评测数据与评测服务。
 
 ### 1.1 中国区独立运营定义
 
@@ -1307,17 +1313,18 @@ flowchart LR
 
 推荐技术栈：
 
-- 后端：Python FastAPI 或 Node.js/NestJS
-- 数据库：Postgres
-- 向量检索：pgvector 起步
-- 对象存储：S3、Cloudflare R2、阿里云 OSS
-- 队列：Redis Queue、BullMQ、Celery，后期 Kafka
+- 后端：Go 模块化单体 + Go Worker
+- 数据库：MySQL 8.x
+- 缓存/队列：Redis
+- 对象存储：阿里云 OSS 独立私有 bucket，开发环境可用本地对象目录
+- 检索：MySQL FULLTEXT 起步，后续可接 OpenSearch / Vector DB
+- 工作流：先用 MySQL job 状态源 + Redis 分发，后续接 Temporal
 - 工作流：Temporal 可作为中后期选择
 - OCR：PaddleOCR 或云 OCR
 - ASR：Whisper 或云 ASR
 - Secret scanner：规则引擎 + 开源扫描器思路
 - LLM：可插拔模型网关
-- 前端：Next.js 审核工作台和控制台
+- 前端：React/Vite 审核工作台和控制台
 
 中国区需要新增或强化以下服务：
 
