@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -8,6 +9,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/codywiki/lodia/apps/api-go/internal/annotation"
+	"github.com/codywiki/lodia/apps/api-go/internal/focus"
+	"github.com/codywiki/lodia/apps/api-go/internal/redaction"
 	"github.com/codywiki/lodia/apps/api-go/internal/store"
 )
 
@@ -300,15 +304,241 @@ func (s *Server) evaluateDataset(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
-	metricsJSON, _ := json.Marshal(map[string]any{"case_count": len(dataset.CaseIDs), "holdout_overlap_count": 0, "duplicate_count": 0})
-	findingsJSON, _ := json.Marshal([]map[string]any{})
-	evaluation := store.DatasetEvaluation{DatasetID: dataset.ID, Status: "completed", MetricsJSON: string(metricsJSON), FindingsJSON: string(findingsJSON)}
+	result, err := s.buildDatasetEvaluation(r.Context(), dataset)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	metricsJSON, _ := json.Marshal(result.metrics)
+	findingsJSON, _ := json.Marshal(result.findings)
+	evaluation := store.DatasetEvaluation{DatasetID: dataset.ID, Status: result.status, MetricsJSON: string(metricsJSON), FindingsJSON: string(findingsJSON)}
 	err = s.db.CreateDatasetEvaluation(r.Context(), &evaluation)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, store.DatasetEvaluationPayload(evaluation))
+}
+
+type datasetEvaluationResult struct {
+	status   string
+	metrics  map[string]any
+	findings []datasetQualityFinding
+}
+
+type datasetQualityFinding struct {
+	Code             string   `json:"code"`
+	Severity         string   `json:"severity"`
+	Message          string   `json:"message"`
+	Count            int      `json:"count,omitempty"`
+	CaseID           string   `json:"case_id,omitempty"`
+	ArtifactType     string   `json:"artifact_type,omitempty"`
+	RelatedDatasetID string   `json:"related_dataset_id,omitempty"`
+	RelatedPurpose   string   `json:"related_purpose,omitempty"`
+	Items            []string `json:"items,omitempty"`
+}
+
+func (s *Server) buildDatasetEvaluation(ctx context.Context, dataset store.Dataset) (datasetEvaluationResult, error) {
+	findings := []datasetQualityFinding{}
+	addFinding := func(severity string, code string, message string, count int, caseID string, artifactType string, items []string) {
+		if count <= 0 {
+			count = 1
+		}
+		findings = append(findings, datasetQualityFinding{
+			Code:         code,
+			Severity:     severity,
+			Message:      message,
+			Count:        count,
+			CaseID:       caseID,
+			ArtifactType: artifactType,
+			Items:        items,
+		})
+	}
+
+	expectedArtifacts := []string{"data", "manifest", "quality_report", "data_contract"}
+	artifactByType := map[string]store.DatasetArtifact{}
+	artifacts, err := s.db.ListDatasetArtifacts(ctx, dataset.ID)
+	if err != nil {
+		return datasetEvaluationResult{}, err
+	}
+	for _, artifact := range artifacts {
+		artifactByType[artifact.ArtifactType] = artifact
+	}
+	for _, artifactType := range expectedArtifacts {
+		artifact, ok := artifactByType[artifactType]
+		if !ok {
+			addFinding("critical", "artifact_missing", "required dataset artifact is missing", 1, "", artifactType, nil)
+			continue
+		}
+		if artifact.ByteSize <= 0 || strings.TrimSpace(artifact.ObjectURI) == "" {
+			addFinding("critical", "artifact_invalid", "required dataset artifact has invalid storage metadata", 1, "", artifactType, nil)
+		}
+	}
+	if len(dataset.CaseIDs) == 0 {
+		addFinding("critical", "dataset_empty", "dataset contains no cases", 1, "", "", nil)
+	}
+	holdoutOverlapCount := 0
+	overlaps, err := s.db.DatasetCaseOverlaps(ctx, dataset.ID, dataset.CaseIDs, 5000)
+	if err != nil {
+		return datasetEvaluationResult{}, err
+	}
+	holdoutByDataset := map[string]struct {
+		purpose string
+		caseIDs []string
+	}{}
+	for _, overlap := range overlaps {
+		if !holdoutIsolationRequired(dataset.Purpose, overlap.Purpose) {
+			continue
+		}
+		group := holdoutByDataset[overlap.DatasetID]
+		group.purpose = overlap.Purpose
+		group.caseIDs = append(group.caseIDs, overlap.CaseID)
+		holdoutByDataset[overlap.DatasetID] = group
+		holdoutOverlapCount++
+	}
+	for datasetID, group := range holdoutByDataset {
+		findings = append(findings, datasetQualityFinding{
+			Code:             "holdout_overlap",
+			Severity:         "critical",
+			Message:          "dataset overlaps with an incompatible train/eval holdout dataset",
+			Count:            len(group.caseIDs),
+			RelatedDatasetID: datasetID,
+			RelatedPurpose:   group.purpose,
+			Items:            limitStrings(group.caseIDs, 20),
+		})
+	}
+
+	caseIDSeen := map[string]bool{}
+	canonicalSeen := map[string]string{}
+	statusCounts := map[string]int{}
+	drlCounts := map[string]int{}
+	ownerIDs := map[string]bool{}
+	totalAnnotationScore := 0.0
+	totalLongHorizonScore := 0.0
+	totalRequiredFields := 0
+	filledRequiredFields := 0
+	commercialReadyCount := 0
+	contentSafetyPassedCount := 0
+	redactionPassedCount := 0
+	reviewedCount := 0
+	minRank := drlRank(dataset.MinDRL)
+	if minRank == 0 {
+		minRank = drlRank("DRL3")
+	}
+
+	for _, caseID := range dataset.CaseIDs {
+		if caseIDSeen[caseID] {
+			addFinding("critical", "duplicate_case_id", "dataset contains duplicate case id", 1, caseID, "", nil)
+			continue
+		}
+		caseIDSeen[caseID] = true
+
+		c, err := s.db.GetCase(ctx, caseID)
+		if err != nil {
+			addFinding("critical", "case_missing", "dataset references a case that cannot be loaded", 1, caseID, "", nil)
+			continue
+		}
+		statusCounts[c.Status]++
+		drlCounts[c.DRL]++
+		ownerIDs[c.OwnerID] = true
+		ann := annotation.UnmarshalAnnotation(c.AnnotationJSON)
+		gate := annotation.UnmarshalGate(c.QualityGateJSON)
+		wb := workbenchForCase(c)
+		totalAnnotationScore += ann.QualityScore
+		totalLongHorizonScore += wb.Quality.Score
+		if c.Status == "approved" {
+			reviewedCount++
+		}
+		if c.CommercialReady && gate.CommercialReady {
+			commercialReadyCount++
+		} else {
+			addFinding("critical", "case_not_commercial_ready", "case is not commercial ready under its quality gate", 1, c.ID, "", nil)
+		}
+		if rank := drlRank(c.DRL); rank < minRank {
+			addFinding("critical", "case_below_min_drl", "case DRL is below dataset minimum", 1, c.ID, "", []string{c.DRL, dataset.MinDRL})
+		}
+		if existingCaseID, ok := canonicalSeen[c.CanonicalHash]; ok && strings.TrimSpace(c.CanonicalHash) != "" {
+			addFinding("critical", "duplicate_canonical_hash", "dataset contains duplicate canonical case content", 1, c.ID, "", []string{existingCaseID, c.ID})
+		} else {
+			canonicalSeen[c.CanonicalHash] = c.ID
+		}
+		var redactionResult redaction.Result
+		if err := json.Unmarshal([]byte(c.RedactionJSON), &redactionResult); err == nil && redactionResult.Passed {
+			redactionPassedCount++
+		} else {
+			addFinding("critical", "redaction_not_passed", "case redaction result is missing or did not pass", 1, c.ID, "", nil)
+		}
+		requiredMissing := requiredMissingFields(wb)
+		totalRequiredFields += len(requiredLongHorizonFields())
+		filledRequiredFields += len(requiredLongHorizonFields()) - len(requiredMissing)
+		if len(requiredMissing) > 0 {
+			addFinding("critical", "required_long_horizon_fields_missing", "case is missing required long-horizon task fields", len(requiredMissing), c.ID, "", requiredMissing)
+		}
+		if wb.Evidence.SourceChars < 120 {
+			addFinding("warning", "source_evidence_too_thin", "case source evidence is thin for long-horizon reuse", 1, c.ID, "", nil)
+		}
+		if c.Status != "approved" {
+			addFinding("warning", "case_not_human_approved", "case has not reached approved review status", 1, c.ID, "", []string{c.Status})
+		}
+		scan, err := s.db.LatestContentSafetyScan(ctx, "case", c.ID)
+		if err != nil {
+			addFinding("critical", "content_safety_missing", "case is missing content safety scan", 1, c.ID, "", nil)
+			continue
+		}
+		if scan.Status == "completed" && scan.RiskLevel == "low" && scan.Action == "allow" {
+			contentSafetyPassedCount++
+		} else {
+			addFinding("critical", "content_safety_blocked", "case content safety scan blocks commercial use", 1, c.ID, "", []string{scan.Status, scan.RiskLevel, scan.Action})
+		}
+	}
+
+	caseCount := len(dataset.CaseIDs)
+	averageAnnotationScore := ratio(totalAnnotationScore, caseCount)
+	averageLongHorizonScore := ratio(totalLongHorizonScore, caseCount)
+	requiredCoverage := 0.0
+	if totalRequiredFields > 0 {
+		requiredCoverage = float64(filledRequiredFields) / float64(totalRequiredFields)
+	}
+	severityCounts := datasetFindingSeverityCounts(findings)
+	criticalCount := severityCounts["critical"]
+	warningCount := severityCounts["warning"]
+	readinessScore := averageAnnotationScore*0.45 + averageLongHorizonScore*0.35 + requiredCoverage*0.20
+	readinessScore -= float64(criticalCount) * 0.08
+	readinessScore -= float64(warningCount) * 0.02
+	if readinessScore < 0 {
+		readinessScore = 0
+	}
+	if readinessScore > 1 {
+		readinessScore = 1
+	}
+	status := "completed"
+	if criticalCount > 0 {
+		status = "blocked"
+	}
+	metrics := map[string]any{
+		"case_count":                    caseCount,
+		"artifact_count":                len(artifacts),
+		"expected_artifact_count":       len(expectedArtifacts),
+		"missing_artifact_count":        missingArtifactCount(expectedArtifacts, artifactByType),
+		"duplicate_count":               severityCounts["duplicate_case_id"] + severityCounts["duplicate_canonical_hash"],
+		"holdout_overlap_count":         holdoutOverlapCount,
+		"critical_count":                criticalCount,
+		"warning_count":                 warningCount,
+		"info_count":                    severityCounts["info"],
+		"readiness_score":               round2(readinessScore),
+		"average_quality_score":         round2(averageAnnotationScore),
+		"average_long_horizon_score":    round2(averageLongHorizonScore),
+		"required_field_coverage":       round2(requiredCoverage),
+		"commercial_ready_count":        commercialReadyCount,
+		"redaction_passed_count":        redactionPassedCount,
+		"content_safety_passed_count":   contentSafetyPassedCount,
+		"reviewed_count":                reviewedCount,
+		"owner_count":                   len(ownerIDs),
+		"status_distribution":           statusCounts,
+		"drl_distribution":              drlCounts,
+		"ready_for_commercial_delivery": criticalCount == 0,
+	}
+	return datasetEvaluationResult{status: status, metrics: metrics, findings: findings}, nil
 }
 
 func (s *Server) createReconciliation(w http.ResponseWriter, r *http.Request) {
@@ -700,6 +930,9 @@ func (s *Server) operationalAlerts(w http.ResponseWriter, r *http.Request) {
 	if failedVendorCalls, err := s.db.CountVendorProcessingRecords(r.Context(), "failed"); err == nil && failedVendorCalls > 0 {
 		addAlert("warning", "vendor_processing_failed", "model gateway or vendor calls failed", failedVendorCalls)
 	}
+	if blockedEvaluations, err := s.db.CountDatasetEvaluations(r.Context(), "blocked"); err == nil && blockedEvaluations > 0 {
+		addAlert("warning", "dataset_evaluation_blocked", "one or more dataset quality evaluations have critical findings", blockedEvaluations)
+	}
 	productionProfile := s.cfg.ProductionProfile()
 	if productionProfile && !strings.EqualFold(s.cfg.ObjectBackend, "oss") {
 		addAlert("critical", "production_object_storage_not_oss", "production deployment must use OSS object storage", 1)
@@ -803,10 +1036,14 @@ func (s *Server) commercialProof(w http.ResponseWriter, r *http.Request) {
 	}
 
 	evaluation, err := s.db.LatestDatasetEvaluation(r.Context(), dataset.ID)
-	evaluationCompleted := err == nil && evaluation.Status == "completed"
+	evaluationAvailable := err == nil
+	evaluationCompleted := evaluationAvailable && evaluation.Status == "completed"
+	evaluationPassed := false
+	evaluationCriticalCount := 0
 	evaluationPayload := map[string]any{"status": "missing"}
 	if err == nil {
 		evaluationPayload = store.DatasetEvaluationPayload(evaluation)
+		evaluationPassed, evaluationCriticalCount = datasetEvaluationReady(evaluation)
 	}
 
 	withdrawalCount := int64(0)
@@ -825,7 +1062,7 @@ func (s *Server) commercialProof(w http.ResponseWriter, r *http.Request) {
 	artifactHashesPresent := len(missingArtifacts) == 0 && len(artifactSizeMismatches) == 0
 	casesCommercialReady := len(missingCases) == 0 && len(blockedCases) == 0 && commercialReadyCount == len(dataset.CaseIDs)
 	contentSafetyPassed := len(contentSafetyBlocked) == 0 && contentSafetyMissing == 0
-	ready := artifactHashesPresent && casesCommercialReady && contentSafetyPassed && evaluationCompleted && allAuthorizationsActive
+	ready := artifactHashesPresent && casesCommercialReady && contentSafetyPassed && evaluationPassed && allAuthorizationsActive
 	blockedReasons := []string{}
 	if !artifactHashesPresent {
 		blockedReasons = append(blockedReasons, "artifact_integrity_incomplete")
@@ -836,8 +1073,10 @@ func (s *Server) commercialProof(w http.ResponseWriter, r *http.Request) {
 	if !contentSafetyPassed {
 		blockedReasons = append(blockedReasons, "content_safety_gate_failed")
 	}
-	if !evaluationCompleted {
+	if !evaluationAvailable {
 		blockedReasons = append(blockedReasons, "dataset_evaluation_missing")
+	} else if !evaluationPassed {
+		blockedReasons = append(blockedReasons, "dataset_evaluation_failed")
 	}
 	if !allAuthorizationsActive {
 		blockedReasons = append(blockedReasons, "authorization_withdrawn")
@@ -849,6 +1088,8 @@ func (s *Server) commercialProof(w http.ResponseWriter, r *http.Request) {
 		"cases_commercial_ready":         casesCommercialReady,
 		"content_safety_passed":          contentSafetyPassed,
 		"dataset_evaluation_completed":   evaluationCompleted,
+		"dataset_evaluation_passed":      evaluationPassed,
+		"dataset_evaluation_critical":    evaluationCriticalCount,
 		"authorization_withdrawal_count": withdrawalCount,
 	}
 	material := map[string]any{
@@ -1180,6 +1421,120 @@ func boolCount(value bool) int {
 		return 1
 	}
 	return 0
+}
+
+func requiredLongHorizonFields() []string {
+	return focus.RequiredFields
+}
+
+func requiredMissingFields(wb focus.Workbench) []string {
+	missing := []string{}
+	task := focus.NormalizeTask(wb.Task)
+	for _, field := range requiredLongHorizonFields() {
+		if len(task[field]) == 0 {
+			missing = append(missing, field)
+		}
+	}
+	return missing
+}
+
+func datasetFindingSeverityCounts(findings []datasetQualityFinding) map[string]int {
+	counts := map[string]int{"critical": 0, "warning": 0, "info": 0}
+	for _, finding := range findings {
+		count := finding.Count
+		if count <= 0 {
+			count = 1
+		}
+		counts[finding.Severity] += count
+		counts[finding.Code] += count
+	}
+	return counts
+}
+
+func missingArtifactCount(expected []string, artifacts map[string]store.DatasetArtifact) int {
+	count := 0
+	for _, artifactType := range expected {
+		if _, ok := artifacts[artifactType]; !ok {
+			count++
+		}
+	}
+	return count
+}
+
+func holdoutIsolationRequired(targetPurpose string, otherPurpose string) bool {
+	target := normalizedDatasetPurpose(targetPurpose)
+	other := normalizedDatasetPurpose(otherPurpose)
+	if target == "" || other == "" {
+		return false
+	}
+	targetEval := evalDatasetPurpose(target)
+	otherEval := evalDatasetPurpose(other)
+	if targetEval {
+		return true
+	}
+	return trainDatasetPurpose(target) && otherEval
+}
+
+func normalizedDatasetPurpose(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.ReplaceAll(value, "-", "_")
+	value = strings.ReplaceAll(value, " ", "_")
+	return value
+}
+
+func evalDatasetPurpose(value string) bool {
+	return strings.Contains(value, "eval") || strings.Contains(value, "benchmark") || strings.Contains(value, "gold")
+}
+
+func trainDatasetPurpose(value string) bool {
+	return strings.Contains(value, "train") || strings.Contains(value, "commercial")
+}
+
+func limitStrings(values []string, limit int) []string {
+	if limit <= 0 || len(values) <= limit {
+		return values
+	}
+	out := make([]string, limit)
+	copy(out, values[:limit])
+	return out
+}
+
+func datasetEvaluationReady(evaluation store.DatasetEvaluation) (bool, int) {
+	if evaluation.Status != "completed" {
+		return false, 1
+	}
+	var findings []datasetQualityFinding
+	if err := json.Unmarshal([]byte(evaluation.FindingsJSON), &findings); err != nil {
+		return false, 1
+	}
+	critical := datasetFindingSeverityCounts(findings)["critical"]
+	return critical == 0, critical
+}
+
+func drlRank(value string) int {
+	switch strings.ToUpper(strings.TrimSpace(value)) {
+	case "DRL0":
+		return 0
+	case "DRL1":
+		return 1
+	case "DRL2":
+		return 2
+	case "DRL3":
+		return 3
+	case "DRL4":
+		return 4
+	case "DRL5":
+		return 5
+	default:
+		return 0
+	}
+}
+
+func ratio(total float64, count int) float64 {
+	if count <= 0 {
+		return 0
+	}
+	return total / float64(count)
 }
 
 func round2(value float64) float64 {

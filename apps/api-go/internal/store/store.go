@@ -108,6 +108,12 @@ type DatasetArtifact struct {
 	CreatedAt    time.Time
 }
 
+type DatasetCaseOverlap struct {
+	DatasetID string
+	Purpose   string
+	CaseID    string
+}
+
 type AuditLog struct {
 	ID          string
 	ActorID     string
@@ -657,6 +663,53 @@ func (db *DB) ListDatasetArtifacts(ctx context.Context, datasetID string) ([]Dat
 		artifacts = append(artifacts, artifact)
 	}
 	return artifacts, rows.Err()
+}
+
+func (db *DB) DatasetCaseOverlaps(ctx context.Context, datasetID string, caseIDs []string, limit int) ([]DatasetCaseOverlap, error) {
+	unique := make([]string, 0, len(caseIDs))
+	seen := map[string]bool{}
+	for _, caseID := range caseIDs {
+		caseID = strings.TrimSpace(caseID)
+		if caseID == "" || seen[caseID] {
+			continue
+		}
+		seen[caseID] = true
+		unique = append(unique, caseID)
+	}
+	if len(unique) == 0 {
+		return []DatasetCaseOverlap{}, nil
+	}
+	if limit <= 0 || limit > 5000 {
+		limit = 1000
+	}
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(unique)), ",")
+	args := make([]any, 0, len(unique)+2)
+	args = append(args, datasetID)
+	for _, caseID := range unique {
+		args = append(args, caseID)
+	}
+	args = append(args, limit)
+	rows, err := db.sql.QueryContext(ctx, fmt.Sprintf(`
+		SELECT d.id, d.purpose, jt.case_id
+		FROM datasets d
+		JOIN JSON_TABLE(d.case_ids_json, '$[*]' COLUMNS(case_id VARCHAR(64) PATH '$')) AS jt
+		WHERE d.id <> ? AND jt.case_id IN (%s)
+		ORDER BY d.created_at DESC
+		LIMIT ?
+	`, placeholders), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	overlaps := []DatasetCaseOverlap{}
+	for rows.Next() {
+		var overlap DatasetCaseOverlap
+		if err := rows.Scan(&overlap.DatasetID, &overlap.Purpose, &overlap.CaseID); err != nil {
+			return nil, err
+		}
+		overlaps = append(overlaps, overlap)
+	}
+	return overlaps, rows.Err()
 }
 
 func (db *DB) CreateReview(ctx context.Context, caseID string, reviewerID string, reviewType string, decision string, score float64, notes string, evidence any) error {

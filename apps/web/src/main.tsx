@@ -336,8 +336,17 @@ type EvalRun = {
   id: string;
   dataset_id: string;
   status: string;
-  metrics: { case_count: number; holdout_overlap_count: number; duplicate_count: number };
-  findings: Array<{ code: string; severity: string }>;
+  metrics: {
+    case_count: number;
+    holdout_overlap_count: number;
+    duplicate_count: number;
+    critical_count?: number;
+    warning_count?: number;
+    readiness_score?: number;
+    average_long_horizon_score?: number;
+    required_field_coverage?: number;
+  };
+  findings: Array<{ code: string; severity: string; message?: string; count?: number }>;
 };
 
 type ReconciliationReport = {
@@ -2944,7 +2953,9 @@ function ConsoleApp() {
               {evalRun ? (
                 <div className="result-row">
                   <span>评测</span>
-                  <strong>{evalRun.status} · {evalRun.findings.length} findings</strong>
+                  <strong>
+                    {evalRun.status} · score {(evalRun.metrics.readiness_score ?? 0).toFixed(2)} · {evalRun.metrics.critical_count || 0} critical
+                  </strong>
                 </div>
               ) : null}
               {reconciliation ? (

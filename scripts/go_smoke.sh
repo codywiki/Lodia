@@ -245,10 +245,10 @@ safety="$(post_json "/api/admin/content-safety/case/$case_id/run" '{}')"
 jq -e '.status == "completed"' >/dev/null <<<"$safety"
 
 evaluation="$(post_json "/api/admin/datasets/$dataset_id/evaluate" '{}')"
-jq -e '.status == "completed"' >/dev/null <<<"$evaluation"
+jq -e '.status == "completed" and .metrics.critical_count == 0 and .metrics.holdout_overlap_count == 0 and .metrics.ready_for_commercial_delivery == true and (.metrics.readiness_score >= 0.5)' >/dev/null <<<"$evaluation"
 
 proof="$(get_json "/api/admin/datasets/$dataset_id/commercial-proof")"
-jq -e --arg owner "$smoke_owner" '.case_count >= 1 and (.proof_hash | length) == 64 and .commercial_checks.artifact_hashes_present == true and .commercial_checks.content_safety_passed == true and .commercial_checks.dataset_evaluation_completed == true and .commercial_checks.all_authorizations_active == false and .ready_for_commercial_delivery == false and (.artifact_hashes.data.sha256 | length) == 64 and (.blocked_reasons | index("authorization_withdrawn")) and any(.authorization_checks[]; .owner_id == $owner and .status == "withdrawn")' >/dev/null <<<"$proof"
+jq -e --arg owner "$smoke_owner" '.case_count >= 1 and (.proof_hash | length) == 64 and .commercial_checks.artifact_hashes_present == true and .commercial_checks.content_safety_passed == true and .commercial_checks.dataset_evaluation_completed == true and .commercial_checks.dataset_evaluation_passed == true and .commercial_checks.dataset_evaluation_critical == 0 and .commercial_checks.all_authorizations_active == false and .ready_for_commercial_delivery == false and (.artifact_hashes.data.sha256 | length) == 64 and (.blocked_reasons | index("authorization_withdrawn")) and any(.authorization_checks[]; .owner_id == $owner and .status == "withdrawn")' >/dev/null <<<"$proof"
 
 readiness="$(get_json /api/admin/launch-readiness)"
 jq -e '.signals.schema_migrations_ok == true and .signals.active_provider_configs >= 1 and .signals.completed_compliance_tasks >= 1' >/dev/null <<<"$readiness"

@@ -275,6 +275,18 @@ func (db *DB) LatestDatasetEvaluation(ctx context.Context, datasetID string) (Da
 	return scanDatasetEvaluation(row)
 }
 
+func (db *DB) CountDatasetEvaluations(ctx context.Context, status string) (int64, error) {
+	query := `SELECT COUNT(*) FROM dataset_evaluations`
+	args := []any{}
+	if status != "" {
+		query += ` WHERE status = ?`
+		args = append(args, status)
+	}
+	var count int64
+	err := db.sql.QueryRowContext(ctx, query, args...).Scan(&count)
+	return count, err
+}
+
 func (db *DB) CreateReconciliationReport(ctx context.Context, report *ReconciliationReport) error {
 	now := nowUTC()
 	if report.ID == "" {

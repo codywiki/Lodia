@@ -33,6 +33,7 @@ docker compose down
 - `/api/review/{case_id}/long-horizon`：Reviewer 字段级精标工作台，覆盖目标、上下文、约束、步骤、工具结果、失败、修正、验收和可复用规则。
 - `/api/assets`：文件进入对象存储，文本类附件可抽取为长程任务 Case；非文本多模态资产保留为待接 OCR/ASR/文档解析的证据资产。
 - `/api/datasets`：从商用就绪 Case 生成 JSONL、Manifest、Quality Report 和 Data Contract，并写入对象存储。
+- `/api/admin/datasets/{id}/evaluate`：执行数据集质量评估，检查 artifact 完整性、Case 去重、train/eval holdout 重叠、DRL、商用门禁、脱敏、内容安全和长程任务必填字段，输出 metrics、findings 和 readiness score。
 - `/api/admin/metrics`、`/api/admin/observability`、`/api/audit/logs`：基础可观测和审计查看。
 - Domestic Model Gateway：`/api/pipeline/preview` 和提交处理统一经过脱敏前置的模型网关；开发可用本地规则，生产可切换国内 HTTP 模型服务，并将供应商调用写入审计表。
 - `/api/admin/model-gateway/health`、`/api/admin/vendor-processing-records`：查看模型网关健康、区域、模式、调用计数和最近供应商处理记录；生产准入会阻断未配置好的模型网关。
@@ -154,6 +155,8 @@ LODIA_MODEL_GATEWAY_MAX_INPUT_CHARS=8000
 - 单节点限流按客户端 IP + 固定窗口执行，返回 `X-RateLimit-Limit`、`X-RateLimit-Remaining`、`X-RateLimit-Reset`，触发时返回 `429` 和 `Retry-After`。
 - `LODIA_TRUST_PROXY_HEADERS=false` 为默认值；只有在可信反向代理后方部署时才应启用 `X-Forwarded-For` / `X-Real-IP`。
 - 模型调用必须先完成自动脱敏，HTTP 模式只发送 redacted text 和结构化 workbench；供应商审计记录不落原文，生产准入要求模型网关健康。
+- 商用证明要求数据集评估状态为 `completed` 且无 critical finding；评估被阻断时，Proof 会返回 `dataset_evaluation_failed`。
+- 运营告警会暴露被阻断的数据集评估，避免 critical finding 被埋在后台记录里。
 
 ## 下一步
 
