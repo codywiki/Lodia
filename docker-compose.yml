@@ -104,16 +104,18 @@ services:
   web:
     image: node:22-alpine
     working_dir: /app
-    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    command: sh -c "npm install --include=optional --no-package-lock && npm run dev -- --host 0.0.0.0"
     environment:
       VITE_API_BASE_URL: http://localhost:8080
     ports:
       - "5173:5173"
     volumes:
       - ./apps/web:/app
+      - web-node-modules:/app/node_modules
     depends_on:
       - api
 
 volumes:
   mysql-data:
   redis-data:
+  web-node-modules:
