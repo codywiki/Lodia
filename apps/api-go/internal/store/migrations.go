@@ -136,6 +136,12 @@ func expectedMigrations() []MigrationEntry {
 			Description: "Typed usage and payout event ledger tables",
 			Status:      "applied",
 		},
+		{
+			ID:          "20260510_005_model_gateway_audit_tables",
+			Checksum:    checksumStrings(typedModelGatewaySchemaStatements),
+			Description: "Domestic model gateway and vendor processing audit tables",
+			Status:      "applied",
+		},
 	}
 }
 

@@ -34,6 +34,8 @@ docker compose down
 - `/api/assets`：文件进入对象存储，文本类附件可抽取为长程任务 Case；非文本多模态资产保留为待接 OCR/ASR/文档解析的证据资产。
 - `/api/datasets`：从商用就绪 Case 生成 JSONL、Manifest、Quality Report 和 Data Contract，并写入对象存储。
 - `/api/admin/metrics`、`/api/admin/observability`、`/api/audit/logs`：基础可观测和审计查看。
+- Domestic Model Gateway：`/api/pipeline/preview` 和提交处理统一经过脱敏前置的模型网关；开发可用本地规则，生产可切换国内 HTTP 模型服务，并将供应商调用写入审计表。
+- `/api/admin/model-gateway/health`、`/api/admin/vendor-processing-records`：查看模型网关健康、区域、模式、调用计数和最近供应商处理记录；生产准入会阻断未配置好的模型网关。
 
 ## MySQL 设计
 
@@ -58,6 +60,7 @@ docker compose down
 - `disputes`、`review_samples`、`dataset_evaluations`、`reconciliation_reports`：争议冻结、抽检盲审、数据集质量评估和业务对账。
 - `invoices`、`sso_providers`、`inboxes`、`inbound_messages`、`webhook_cases`：发票、企业身份、收件箱入口、入站消息和外部系统 Case 接入。
 - `content_safety_scans`、`payout_profiles`、`authorization_withdrawals`：内容安全扫描、贡献者收款资料和授权撤回阻断。
+- `vendor_processing_records`：国内模型网关和受托处理方调用记录，只保存 provider、区域、模型/prompt 版本、脱敏输入 hash、输出 hash、耗时、token、成本和错误码，不保存原文。
 - `records`：保留为低优先级实验对象的兼容层，不承接 P0 生产控制面对象。
 
 索引策略：
@@ -119,6 +122,17 @@ LODIA_ADMIN_TOKEN=...
 LODIA_REVIEWER_TOKEN=...
 LODIA_CONTRIBUTOR_TOKEN=...
 LODIA_PASSWORD_PEPPER=...
+
+LODIA_MODEL_GATEWAY_MODE=http
+LODIA_MODEL_GATEWAY_PROVIDER_TYPE=llm
+LODIA_MODEL_GATEWAY_PROVIDER_NAME=domestic_llm
+LODIA_MODEL_GATEWAY_REGION=CN
+LODIA_MODEL_GATEWAY_ENDPOINT=https://model-gateway.internal.example.com/annotate
+LODIA_MODEL_GATEWAY_API_KEY=...
+LODIA_MODEL_GATEWAY_MODEL=domestic-long-task-critic
+LODIA_MODEL_GATEWAY_PROMPT_VERSION=long_horizon_task.v1
+LODIA_MODEL_GATEWAY_TIMEOUT_SECONDS=15
+LODIA_MODEL_GATEWAY_MAX_INPUT_CHARS=8000
 ```
 
 ## 1w 日活口径
@@ -139,6 +153,7 @@ LODIA_PASSWORD_PEPPER=...
 - API 输出 JSON 结构化访问日志，包含 request id、方法、路径、状态码、响应字节数、耗时、客户端 IP 和 user agent，不记录 query string、token 或请求体。
 - 单节点限流按客户端 IP + 固定窗口执行，返回 `X-RateLimit-Limit`、`X-RateLimit-Remaining`、`X-RateLimit-Reset`，触发时返回 `429` 和 `Retry-After`。
 - `LODIA_TRUST_PROXY_HEADERS=false` 为默认值；只有在可信反向代理后方部署时才应启用 `X-Forwarded-For` / `X-Real-IP`。
+- 模型调用必须先完成自动脱敏，HTTP 模式只发送 redacted text 和结构化 workbench；供应商审计记录不落原文，生产准入要求模型网关健康。
 
 ## 下一步
 

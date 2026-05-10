@@ -591,6 +591,8 @@ func (s *Server) launchReadiness(w http.ResponseWriter, r *http.Request) {
 	adminUsers, _ := s.db.CountUsers(r.Context(), "admin", "active")
 	activeProviders, _ := s.db.CountProviderConfigs(r.Context(), "active")
 	completedComplianceTasks, _ := s.db.CountComplianceTasks(r.Context(), "completed")
+	modelGateway := s.processor.ModelGatewayHealth(r.Context())
+	productionProfile := s.cfg.ProductionProfile()
 	if !migrationsOK {
 		blockers = append(blockers, map[string]any{"code": "schema_migrations_not_ok", "count": 1})
 	}
@@ -603,11 +605,14 @@ func (s *Server) launchReadiness(w http.ResponseWriter, r *http.Request) {
 	if strings.EqualFold(s.cfg.Env, "production") && strings.EqualFold(s.cfg.ObjectBackend, "oss") && (!s.cfg.OSSSTSEnabled || s.cfg.OSSSTSRoleARN == "") {
 		warnings = append(warnings, map[string]any{"code": "oss_sts_not_ready", "count": 1})
 	}
-	if strings.EqualFold(s.cfg.Deployment, "production") && activeProviders == 0 {
+	if productionProfile && activeProviders == 0 {
 		blockers = append(blockers, map[string]any{"code": "production_providers_required", "count": 1})
 	}
-	if strings.EqualFold(s.cfg.Deployment, "production") && completedComplianceTasks == 0 {
+	if productionProfile && completedComplianceTasks == 0 {
 		blockers = append(blockers, map[string]any{"code": "compliance_evidence_required", "count": 1})
+	}
+	if productionProfile && !truthy(modelGateway["ok"]) {
+		blockers = append(blockers, map[string]any{"code": "model_gateway_not_ready", "count": 1})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ready":          len(blockers) == 0,
@@ -615,8 +620,37 @@ func (s *Server) launchReadiness(w http.ResponseWriter, r *http.Request) {
 		"blockers":       blockers,
 		"warnings":       warnings,
 		"next_actions":   []string{"configure_oss_sts_role", "enable_observability", "run_go_smoke"},
-		"signals":        map[string]any{"schema_migrations_ok": migrationsOK, "schema_migrations_applied": migrations.AppliedCount, "schema_migrations_expected": migrations.ExpectedCount, "db_admin_users": adminUsers, "active_provider_configs": activeProviders, "completed_compliance_tasks": completedComplianceTasks},
+		"signals":        map[string]any{"schema_migrations_ok": migrationsOK, "schema_migrations_applied": migrations.AppliedCount, "schema_migrations_expected": migrations.ExpectedCount, "db_admin_users": adminUsers, "active_provider_configs": activeProviders, "completed_compliance_tasks": completedComplianceTasks, "model_gateway": modelGateway},
 	})
+}
+
+func (s *Server) modelGatewayHealth(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.require(w, r, "admin", "reviewer"); !ok {
+		return
+	}
+	failed, _ := s.db.CountVendorProcessingRecords(r.Context(), "failed")
+	completed, _ := s.db.CountVendorProcessingRecords(r.Context(), "completed")
+	skipped, _ := s.db.CountVendorProcessingRecords(r.Context(), "skipped")
+	writeJSON(w, http.StatusOK, map[string]any{
+		"gateway": s.processor.ModelGatewayHealth(r.Context()),
+		"records": map[string]any{
+			"completed": completed,
+			"failed":    failed,
+			"skipped":   skipped,
+		},
+	})
+}
+
+func (s *Server) vendorProcessingRecords(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.require(w, r, "admin", "reviewer"); !ok {
+		return
+	}
+	records, err := s.db.ListVendorProcessingRecords(r.Context(), queryLimit(r, 50))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": store.VendorProcessingRecordsPayload(records)})
 }
 
 func (s *Server) bootstrapInternalTest(w http.ResponseWriter, r *http.Request) {
@@ -663,10 +697,17 @@ func (s *Server) operationalAlerts(w http.ResponseWriter, r *http.Request) {
 	if highSafety, err := s.db.CountContentSafetyScans(r.Context(), "high"); err == nil && highSafety > 0 {
 		addAlert("warning", "content_safety_high_risk", "high risk content safety scans need manual review", highSafety)
 	}
-	if strings.EqualFold(s.cfg.Deployment, "production") && !strings.EqualFold(s.cfg.ObjectBackend, "oss") {
+	if failedVendorCalls, err := s.db.CountVendorProcessingRecords(r.Context(), "failed"); err == nil && failedVendorCalls > 0 {
+		addAlert("warning", "vendor_processing_failed", "model gateway or vendor calls failed", failedVendorCalls)
+	}
+	productionProfile := s.cfg.ProductionProfile()
+	if productionProfile && !strings.EqualFold(s.cfg.ObjectBackend, "oss") {
 		addAlert("critical", "production_object_storage_not_oss", "production deployment must use OSS object storage", 1)
 	}
-	if strings.EqualFold(s.cfg.Deployment, "production") {
+	if productionProfile && !truthy(s.processor.ModelGatewayHealth(r.Context())["ok"]) {
+		addAlert("critical", "model_gateway_not_ready", "domestic model gateway is not ready", 1)
+	}
+	if productionProfile {
 		activeProviders, _ := s.db.CountProviderConfigs(r.Context(), "active")
 		completedComplianceTasks, _ := s.db.CountComplianceTasks(r.Context(), "completed")
 		if activeProviders == 0 {

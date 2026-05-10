@@ -31,6 +31,17 @@ type Config struct {
 	ContributorToken        string
 	PasswordPepper          string
 
+	ModelGatewayMode          string
+	ModelGatewayProviderType  string
+	ModelGatewayProviderName  string
+	ModelGatewayRegion        string
+	ModelGatewayEndpoint      string
+	ModelGatewayAPIKey        string
+	ModelGatewayModel         string
+	ModelGatewayPromptVersion string
+	ModelGatewayTimeout       time.Duration
+	ModelGatewayMaxInputChars int
+
 	ObjectBackend         string
 	ObjectDir             string
 	OSSEndpoint           string
@@ -69,23 +80,45 @@ func FromEnv() Config {
 		ReviewerToken:           os.Getenv("LODIA_REVIEWER_TOKEN"),
 		ContributorToken:        os.Getenv("LODIA_CONTRIBUTOR_TOKEN"),
 		PasswordPepper:          os.Getenv("LODIA_PASSWORD_PEPPER"),
-		ObjectBackend:           env("LODIA_OBJECT_STORAGE_BACKEND", "local"),
-		ObjectDir:               env("LODIA_OBJECT_STORAGE_DIR", "storage/dev/objects"),
-		OSSEndpoint:             os.Getenv("LODIA_OSS_ENDPOINT"),
-		OSSBucket:               os.Getenv("LODIA_OSS_BUCKET"),
-		OSSAccessKey:            first(os.Getenv("LODIA_OSS_ACCESS_KEY_ID"), os.Getenv("ALIBABA_CLOUD_ACCESS_KEY_ID")),
-		OSSSecretKey:            first(os.Getenv("LODIA_OSS_ACCESS_KEY_SECRET"), os.Getenv("ALIBABA_CLOUD_ACCESS_KEY_SECRET")),
-		OSSPrefix:               env("LODIA_OSS_PREFIX", "lodia"),
-		OSSSTSEnabled:           boolEnv("LODIA_OBJECT_STORAGE_STS_ENABLED", false),
-		OSSSTSRoleARN:           os.Getenv("LODIA_OSS_STS_ROLE_ARN"),
-		OSSSTSEndpoint:          env("LODIA_OSS_STS_ENDPOINT_URL", "https://sts.aliyuncs.com"),
-		OSSSTSSessionName:       env("LODIA_OSS_STS_SESSION_NAME", "lodia-upload"),
-		OSSSTSDurationSeconds:   intEnv("LODIA_OSS_STS_DURATION_SECONDS", 900),
+		ModelGatewayMode:        strings.ToLower(env("LODIA_MODEL_GATEWAY_MODE", "local")),
+		ModelGatewayProviderType: env(
+			"LODIA_MODEL_GATEWAY_PROVIDER_TYPE",
+			"llm",
+		),
+		ModelGatewayProviderName:  env("LODIA_MODEL_GATEWAY_PROVIDER_NAME", "local_rules"),
+		ModelGatewayRegion:        env("LODIA_MODEL_GATEWAY_REGION", "CN"),
+		ModelGatewayEndpoint:      os.Getenv("LODIA_MODEL_GATEWAY_ENDPOINT"),
+		ModelGatewayAPIKey:        os.Getenv("LODIA_MODEL_GATEWAY_API_KEY"),
+		ModelGatewayModel:         env("LODIA_MODEL_GATEWAY_MODEL", "lodia-rules-v1"),
+		ModelGatewayPromptVersion: env("LODIA_MODEL_GATEWAY_PROMPT_VERSION", "long_horizon_task.v1"),
+		ModelGatewayTimeout:       time.Duration(intEnv("LODIA_MODEL_GATEWAY_TIMEOUT_SECONDS", 15)) * time.Second,
+		ModelGatewayMaxInputChars: intEnv("LODIA_MODEL_GATEWAY_MAX_INPUT_CHARS", 8000),
+		ObjectBackend:             env("LODIA_OBJECT_STORAGE_BACKEND", "local"),
+		ObjectDir:                 env("LODIA_OBJECT_STORAGE_DIR", "storage/dev/objects"),
+		OSSEndpoint:               os.Getenv("LODIA_OSS_ENDPOINT"),
+		OSSBucket:                 os.Getenv("LODIA_OSS_BUCKET"),
+		OSSAccessKey:              first(os.Getenv("LODIA_OSS_ACCESS_KEY_ID"), os.Getenv("ALIBABA_CLOUD_ACCESS_KEY_ID")),
+		OSSSecretKey:              first(os.Getenv("LODIA_OSS_ACCESS_KEY_SECRET"), os.Getenv("ALIBABA_CLOUD_ACCESS_KEY_SECRET")),
+		OSSPrefix:                 env("LODIA_OSS_PREFIX", "lodia"),
+		OSSSTSEnabled:             boolEnv("LODIA_OBJECT_STORAGE_STS_ENABLED", false),
+		OSSSTSRoleARN:             os.Getenv("LODIA_OSS_STS_ROLE_ARN"),
+		OSSSTSEndpoint:            env("LODIA_OSS_STS_ENDPOINT_URL", "https://sts.aliyuncs.com"),
+		OSSSTSSessionName:         env("LODIA_OSS_STS_SESSION_NAME", "lodia-upload"),
+		OSSSTSDurationSeconds:     intEnv("LODIA_OSS_STS_DURATION_SECONDS", 900),
 	}
 }
 
 func (c Config) AuthEnabled() bool {
 	return c.AdminToken != "" || c.ReviewerToken != "" || c.ContributorToken != ""
+}
+
+func (c Config) ProductionProfile() bool {
+	switch strings.ToLower(strings.TrimSpace(c.Deployment)) {
+	case "production", "china_independent", "china-production", "cn-production":
+		return true
+	default:
+		return false
+	}
 }
 
 func env(key, fallback string) string {

@@ -487,6 +487,49 @@ type OperationalAlerts = {
   critical_count: number;
 };
 
+type ModelGatewayHealth = {
+  gateway: {
+    ok: boolean;
+    mode: string;
+    provider_type: string;
+    provider_name: string;
+    region: string;
+    model: string;
+    prompt_version: string;
+    external_call: boolean;
+    redaction_first: boolean;
+    endpoint_configured?: boolean;
+    provider_name_configured?: boolean;
+    model_configured?: boolean;
+    production_profile?: boolean;
+    reasons?: string[];
+  };
+  records: {
+    completed: number;
+    failed: number;
+    skipped: number;
+  };
+};
+
+type VendorProcessingRecord = {
+  id: string;
+  provider_type: string;
+  provider_name: string;
+  operation: string;
+  entity_type: string;
+  entity_id: string;
+  status: string;
+  region: string;
+  data_classification: string;
+  model_name: string;
+  latency_ms: number;
+  input_tokens: number;
+  output_tokens: number;
+  cost_micros: number;
+  error_code: string;
+  created_at: string;
+};
+
 type MaintenanceResult = {
   status: string;
   raw: { purged_count: number };
@@ -850,6 +893,8 @@ function ConsoleApp() {
   const [payoutTransfer, setPayoutTransfer] = useState<PayoutTransfer | null>(null);
   const [buyerUsageReport, setBuyerUsageReport] = useState<BuyerUsageReport | null>(null);
   const [operationalAlerts, setOperationalAlerts] = useState<OperationalAlerts | null>(null);
+  const [modelGatewayHealth, setModelGatewayHealth] = useState<ModelGatewayHealth | null>(null);
+  const [vendorProcessingRecords, setVendorProcessingRecords] = useState<VendorProcessingRecord[]>([]);
   const [maintenanceResult, setMaintenanceResult] = useState<MaintenanceResult | null>(null);
   const [commercialProof, setCommercialProof] = useState<CommercialProof | null>(null);
   const [contributorOnboarding, setContributorOnboarding] = useState<ContributorOnboarding | null>(null);
@@ -1790,6 +1835,27 @@ function ConsoleApp() {
     }
   }
 
+  async function loadModelGatewayHealth() {
+    setLoading(true);
+    try {
+      const response = await fetch(apiUrl("/api/admin/model-gateway/health"), { headers: requestHeaders(apiToken, false) });
+      setModelGatewayHealth(await response.json());
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function loadVendorProcessingRecords() {
+    setLoading(true);
+    try {
+      const response = await fetch(apiUrl("/api/admin/vendor-processing-records?limit=5"), { headers: requestHeaders(apiToken, false) });
+      const payload = await response.json();
+      setVendorProcessingRecords(payload.items || []);
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function runMaintenance() {
     setLoading(true);
     try {
@@ -2716,6 +2782,12 @@ function ConsoleApp() {
               <button className="secondary-action" onClick={loadOperationalAlerts} disabled={loading}>
                 运营告警
               </button>
+              <button className="secondary-action" onClick={loadModelGatewayHealth} disabled={loading}>
+                模型网关
+              </button>
+              <button className="secondary-action" onClick={loadVendorProcessingRecords} disabled={loading}>
+                调用审计
+              </button>
               <button className="secondary-action" onClick={runMaintenance} disabled={loading}>
                 维护任务
               </button>
@@ -2790,6 +2862,30 @@ function ConsoleApp() {
                   <strong>{operationalAlerts.critical_count} critical · {operationalAlerts.alert_count} total</strong>
                 </div>
               ) : null}
+              {modelGatewayHealth ? (
+                <div className="result-row">
+                  <span>Gateway</span>
+                  <strong>
+                    {modelGatewayHealth.gateway.ok ? "ok" : modelGatewayHealth.gateway.reasons?.[0] || "blocked"} · {modelGatewayHealth.gateway.provider_name} · {modelGatewayHealth.gateway.mode}
+                  </strong>
+                </div>
+              ) : null}
+              {modelGatewayHealth ? (
+                <div className="result-row">
+                  <span>Vendor</span>
+                  <strong>
+                    {modelGatewayHealth.records.completed} completed · {modelGatewayHealth.records.failed} failed · {modelGatewayHealth.records.skipped} skipped
+                  </strong>
+                </div>
+              ) : null}
+              {vendorProcessingRecords[0] ? (
+                <div className="result-row">
+                  <span>Last call</span>
+                  <strong>
+                    {vendorProcessingRecords[0].status} · {vendorProcessingRecords[0].provider_name} · {vendorProcessingRecords[0].entity_type}
+                  </strong>
+                </div>
+              ) : null}
               {maintenanceResult ? (
                 <div className="result-row">
                   <span>Maintenance</span>
@@ -2803,7 +2899,7 @@ function ConsoleApp() {
                 </div>
               ) : null}
             </div>
-            {!launchReadiness && !internalTestBootstrap && !migrationStatus && !migrationPlan && !temporaryCredentials && !providerConfig && !payoutTransfer && !buyerUsageReport && !operationalAlerts && !maintenanceResult && !commercialProof ? (
+            {!launchReadiness && !internalTestBootstrap && !migrationStatus && !migrationPlan && !temporaryCredentials && !providerConfig && !payoutTransfer && !buyerUsageReport && !operationalAlerts && !modelGatewayHealth && !vendorProcessingRecords.length && !maintenanceResult && !commercialProof ? (
               <p className="empty-state">迁移状态、供应商、备案任务、支付回单、运营告警、维护任务和商用证明共同构成上线前准入证据。</p>
             ) : null}
           </div>

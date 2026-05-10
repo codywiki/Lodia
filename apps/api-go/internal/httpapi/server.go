@@ -104,6 +104,8 @@ func (s *Server) Router() http.Handler {
 	mux.HandleFunc("GET /api/admin/migrations/status", s.migrationStatus)
 	mux.HandleFunc("GET /api/admin/migrations/plan", s.migrationPlan)
 	mux.HandleFunc("GET /api/admin/launch-readiness", s.launchReadiness)
+	mux.HandleFunc("GET /api/admin/model-gateway/health", s.modelGatewayHealth)
+	mux.HandleFunc("GET /api/admin/vendor-processing-records", s.vendorProcessingRecords)
 	mux.HandleFunc("POST /api/admin/internal-test/bootstrap", s.bootstrapInternalTest)
 	mux.HandleFunc("GET /api/admin/operational-alerts", s.operationalAlerts)
 	mux.HandleFunc("POST /api/admin/maintenance/run", s.runMaintenance)
@@ -201,7 +203,7 @@ func (s *Server) preview(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "text_required")
 		return
 	}
-	preview := s.processor.Preview(req.Text, defaultAllowedUses(req.AllowedUses))
+	preview := s.processor.Preview(r.Context(), req.Text, defaultAllowedUses(req.AllowedUses))
 	writeJSON(w, http.StatusOK, map[string]any{"status": "preview_ready", "case": preview})
 }
 

@@ -172,6 +172,11 @@ func (db *DB) Migrate(ctx context.Context) error {
 			return err
 		}
 	}
+	for _, stmt := range typedModelGatewaySchemaStatements {
+		if _, err := db.sql.ExecContext(ctx, stmt); err != nil {
+			return err
+		}
+	}
 	return db.RegisterExpectedMigrations(ctx)
 }
 

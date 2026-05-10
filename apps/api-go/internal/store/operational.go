@@ -128,6 +128,29 @@ type ContentSafetyScan struct {
 	UpdatedAt      time.Time
 }
 
+type VendorProcessingRecord struct {
+	ID                 string
+	ProviderType       string
+	ProviderName       string
+	Operation          string
+	EntityType         string
+	EntityID           string
+	Status             string
+	Region             string
+	DataClassification string
+	InputHash          string
+	OutputHash         string
+	PromptVersion      string
+	ModelName          string
+	LatencyMS          int64
+	InputTokens        int
+	OutputTokens       int
+	CostMicros         int64
+	ErrorCode          string
+	MetadataJSON       string
+	CreatedAt          time.Time
+}
+
 type PayoutProfile struct {
 	ID               string
 	ContributorID    string
@@ -472,6 +495,64 @@ func (db *DB) CountContentSafetyScans(ctx context.Context, riskLevel string) (in
 	return count, err
 }
 
+func (db *DB) CreateVendorProcessingRecord(ctx context.Context, record *VendorProcessingRecord) error {
+	now := nowUTC()
+	if record.ID == "" {
+		record.ID = NewID("vendor")
+	}
+	if record.Status == "" {
+		record.Status = "completed"
+	}
+	if record.MetadataJSON == "" {
+		record.MetadataJSON = "{}"
+	}
+	record.CreatedAt = now
+	_, err := db.sql.ExecContext(ctx, `
+		INSERT INTO vendor_processing_records
+			(id, provider_type, provider_name, operation, entity_type, entity_id, status, region, data_classification,
+			 input_hash, output_hash, prompt_version, model_name, latency_ms, input_tokens, output_tokens, cost_micros, error_code, metadata_json, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, record.ID, record.ProviderType, record.ProviderName, record.Operation, record.EntityType, record.EntityID, record.Status, record.Region, record.DataClassification,
+		record.InputHash, record.OutputHash, record.PromptVersion, record.ModelName, record.LatencyMS, record.InputTokens, record.OutputTokens, record.CostMicros, record.ErrorCode, record.MetadataJSON, record.CreatedAt)
+	return err
+}
+
+func (db *DB) ListVendorProcessingRecords(ctx context.Context, limit int) ([]VendorProcessingRecord, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	rows, err := db.sql.QueryContext(ctx, `
+		SELECT id, provider_type, provider_name, operation, entity_type, entity_id, status, region, data_classification,
+			input_hash, output_hash, prompt_version, model_name, latency_ms, input_tokens, output_tokens, cost_micros, error_code, CAST(metadata_json AS CHAR), created_at
+		FROM vendor_processing_records ORDER BY created_at DESC LIMIT ?
+	`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	records := []VendorProcessingRecord{}
+	for rows.Next() {
+		record, err := scanVendorProcessingRecord(rows)
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, record)
+	}
+	return records, rows.Err()
+}
+
+func (db *DB) CountVendorProcessingRecords(ctx context.Context, status string) (int64, error) {
+	query := `SELECT COUNT(*) FROM vendor_processing_records`
+	args := []any{}
+	if status != "" {
+		query += ` WHERE status = ?`
+		args = append(args, status)
+	}
+	var count int64
+	err := db.sql.QueryRowContext(ctx, query, args...).Scan(&count)
+	return count, err
+}
+
 func (db *DB) CreatePayoutProfile(ctx context.Context, profile *PayoutProfile) error {
 	now := nowUTC()
 	if profile.ID == "" {
@@ -676,6 +757,39 @@ func ContentSafetyScanPayload(scan ContentSafetyScan) map[string]any {
 	}
 }
 
+func VendorProcessingRecordPayload(record VendorProcessingRecord) map[string]any {
+	return map[string]any{
+		"id":                  record.ID,
+		"provider_type":       record.ProviderType,
+		"provider_name":       record.ProviderName,
+		"operation":           record.Operation,
+		"entity_type":         record.EntityType,
+		"entity_id":           record.EntityID,
+		"status":              record.Status,
+		"region":              record.Region,
+		"data_classification": record.DataClassification,
+		"input_hash":          record.InputHash,
+		"output_hash":         record.OutputHash,
+		"prompt_version":      record.PromptVersion,
+		"model_name":          record.ModelName,
+		"latency_ms":          record.LatencyMS,
+		"input_tokens":        record.InputTokens,
+		"output_tokens":       record.OutputTokens,
+		"cost_micros":         record.CostMicros,
+		"error_code":          record.ErrorCode,
+		"metadata":            jsonMap(record.MetadataJSON),
+		"created_at":          record.CreatedAt.UTC().Format(timeFormatMySQLCompatible),
+	}
+}
+
+func VendorProcessingRecordsPayload(records []VendorProcessingRecord) []map[string]any {
+	items := make([]map[string]any, 0, len(records))
+	for _, record := range records {
+		items = append(items, VendorProcessingRecordPayload(record))
+	}
+	return items
+}
+
 func PayoutProfilePayload(profile PayoutProfile) map[string]any {
 	return map[string]any{
 		"id":                 profile.ID,
@@ -738,6 +852,33 @@ func scanContentSafetyScan(scanner interface{ Scan(dest ...any) error }) (Conten
 	var scan ContentSafetyScan
 	err := scanner.Scan(&scan.ID, &scan.EntityType, &scan.EntityID, &scan.OwnerID, &scan.Status, &scan.RiskLevel, &scan.Action, &scan.CategoriesJSON, &scan.CreatedAt, &scan.UpdatedAt)
 	return scan, err
+}
+
+func scanVendorProcessingRecord(scanner interface{ Scan(dest ...any) error }) (VendorProcessingRecord, error) {
+	var record VendorProcessingRecord
+	err := scanner.Scan(
+		&record.ID,
+		&record.ProviderType,
+		&record.ProviderName,
+		&record.Operation,
+		&record.EntityType,
+		&record.EntityID,
+		&record.Status,
+		&record.Region,
+		&record.DataClassification,
+		&record.InputHash,
+		&record.OutputHash,
+		&record.PromptVersion,
+		&record.ModelName,
+		&record.LatencyMS,
+		&record.InputTokens,
+		&record.OutputTokens,
+		&record.CostMicros,
+		&record.ErrorCode,
+		&record.MetadataJSON,
+		&record.CreatedAt,
+	)
+	return record, err
 }
 
 func jsonAny(raw string) any {
@@ -909,5 +1050,34 @@ var typedOperationalSchemaStatements = []string{
 		updated_at DATETIME(6) NOT NULL,
 		KEY idx_authorization_withdrawals_auth_status (authorization_id, status),
 		KEY idx_authorization_withdrawals_created (created_at)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+}
+
+var typedModelGatewaySchemaStatements = []string{
+	`CREATE TABLE IF NOT EXISTS vendor_processing_records (
+		id VARCHAR(64) PRIMARY KEY,
+		provider_type VARCHAR(64) NOT NULL,
+		provider_name VARCHAR(128) NOT NULL,
+		operation VARCHAR(128) NOT NULL,
+		entity_type VARCHAR(64) NOT NULL,
+		entity_id VARCHAR(128) NOT NULL,
+		status VARCHAR(32) NOT NULL,
+		region VARCHAR(64) NOT NULL DEFAULT '',
+		data_classification VARCHAR(64) NOT NULL DEFAULT '',
+		input_hash CHAR(64) NOT NULL DEFAULT '',
+		output_hash CHAR(64) NOT NULL DEFAULT '',
+		prompt_version VARCHAR(128) NOT NULL DEFAULT '',
+		model_name VARCHAR(128) NOT NULL DEFAULT '',
+		latency_ms BIGINT NOT NULL DEFAULT 0,
+		input_tokens INT NOT NULL DEFAULT 0,
+		output_tokens INT NOT NULL DEFAULT 0,
+		cost_micros BIGINT NOT NULL DEFAULT 0,
+		error_code VARCHAR(128) NOT NULL DEFAULT '',
+		metadata_json JSON NOT NULL,
+		created_at DATETIME(6) NOT NULL,
+		KEY idx_vendor_records_entity_created (entity_type, entity_id, created_at),
+		KEY idx_vendor_records_provider_created (provider_type, provider_name, created_at),
+		KEY idx_vendor_records_status_created (status, created_at),
+		KEY idx_vendor_records_operation_created (operation, created_at)
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 }
