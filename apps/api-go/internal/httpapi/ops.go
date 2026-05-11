@@ -36,6 +36,15 @@ func (s *Server) createPayoutBatch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnprocessableEntity, "no_pending_payout_events")
 		return
 	}
+	disputeBlockers, err := s.db.ActivePayoutDisputeBlockers(r.Context(), events, 20)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if len(disputeBlockers) > 0 {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": "payout_blocked_by_dispute", "blockers": store.DisputeBlockersPayload(disputeBlockers), "blocked_count": len(disputeBlockers)})
+		return
+	}
 	eventIDs := make([]string, 0, len(events))
 	contributorIDs := map[string]bool{}
 	total := int64(0)
@@ -88,6 +97,15 @@ func (s *Server) settlePayoutBatch(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(missingProfiles) > 0 {
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": "payout_profiles_not_ready", "missing_contributor_ids": limitStrings(missingProfiles, 20), "missing_count": len(missingProfiles)})
+		return
+	}
+	disputeBlockers, err := s.db.ActivePayoutBatchDisputeBlockers(r.Context(), batchID, 20)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if len(disputeBlockers) > 0 {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": "payout_blocked_by_dispute", "blockers": store.DisputeBlockersPayload(disputeBlockers), "blocked_count": len(disputeBlockers)})
 		return
 	}
 	succeededTransfers, err := s.db.CountPayoutTransfers(r.Context(), batchID, "succeeded")
@@ -263,6 +281,49 @@ func (s *Server) createDispute(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	_ = s.db.Audit(r.Context(), "admin", "dispute.created", req.EntityType, req.EntityID, store.DisputePayload(dispute))
+	writeJSON(w, http.StatusOK, store.DisputePayload(dispute))
+}
+
+func (s *Server) listDisputes(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.require(w, r, "admin", "reviewer"); !ok {
+		return
+	}
+	disputes, err := s.db.ListDisputes(r.Context(), strings.TrimSpace(r.URL.Query().Get("status")), queryLimit(r, 100))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": store.DisputesPayload(disputes)})
+}
+
+func (s *Server) resolveDispute(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.require(w, r, "admin"); !ok {
+		return
+	}
+	var req struct {
+		Status  string         `json:"status"`
+		Notes   string         `json:"notes"`
+		Payload map[string]any `json:"payload"`
+	}
+	_ = readJSON(r, &req)
+	status := firstNonEmpty(req.Status, "resolved")
+	if status != "resolved" && status != "rejected" && status != "withdrawn" {
+		writeError(w, http.StatusBadRequest, "invalid_dispute_resolution_status")
+		return
+	}
+	payload := req.Payload
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	payload["resolution_status"] = status
+	payload["notes"] = req.Notes
+	dispute, err := s.db.ResolveDispute(r.Context(), r.PathValue("id"), status, payload)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	_ = s.db.Audit(r.Context(), "admin", "dispute.resolved", dispute.EntityType, dispute.EntityID, store.DisputePayload(dispute))
 	writeJSON(w, http.StatusOK, store.DisputePayload(dispute))
 }
 
@@ -1009,6 +1070,12 @@ func (s *Server) operationalAlerts(w http.ResponseWriter, r *http.Request) {
 	if blockedEvaluations, err := s.db.CountDatasetEvaluations(r.Context(), "blocked"); err == nil && blockedEvaluations > 0 {
 		addAlert("warning", "dataset_evaluation_blocked", "one or more dataset quality evaluations have critical findings", blockedEvaluations)
 	}
+	if activeDisputes, err := s.db.CountActiveDisputes(r.Context(), false); err == nil && activeDisputes > 0 {
+		addAlert("warning", "active_disputes_open", "open disputes require resolution before affected data can be delivered", activeDisputes)
+	}
+	if payoutHolds, err := s.db.CountActiveDisputes(r.Context(), true); err == nil && payoutHolds > 0 {
+		addAlert("critical", "payout_dispute_holds_active", "one or more open disputes are holding payout settlement", payoutHolds)
+	}
 	productionProfile := s.cfg.ProductionProfile()
 	if productionProfile && !strings.EqualFold(s.cfg.ObjectBackend, "oss") {
 		addAlert("critical", "production_object_storage_not_oss", "production deployment must use OSS object storage", 1)
@@ -1543,7 +1610,9 @@ func (s *Server) datasetDeliveryBlockers(ctx context.Context, datasetID string) 
 		}
 	}
 	owners := map[string]bool{}
+	deliveryDisputeEntities := map[string][]string{"dataset": {dataset.ID}}
 	for _, caseID := range dataset.CaseIDs {
+		deliveryDisputeEntities["case"] = append(deliveryDisputeEntities["case"], caseID)
 		c, err := s.db.GetCase(ctx, caseID)
 		if err != nil {
 			blockers = append(blockers, "case_missing")
@@ -1552,6 +1621,7 @@ func (s *Server) datasetDeliveryBlockers(ctx context.Context, datasetID string) 
 		owners[c.OwnerID] = true
 	}
 	for ownerID := range owners {
+		deliveryDisputeEntities["contributor"] = append(deliveryDisputeEntities["contributor"], ownerID)
 		count, err := s.db.CountAuthorizationWithdrawals(ctx, authorizationIDForOwner(ownerID))
 		if err != nil {
 			return nil, err
@@ -1560,6 +1630,13 @@ func (s *Server) datasetDeliveryBlockers(ctx context.Context, datasetID string) 
 			blockers = append(blockers, "authorization_withdrawn")
 			break
 		}
+	}
+	disputeBlockers, err := s.db.ActiveDisputeBlockers(ctx, deliveryDisputeEntities, false, 1)
+	if err != nil {
+		return nil, err
+	}
+	if len(disputeBlockers) > 0 {
+		blockers = append(blockers, "open_dispute")
 	}
 	return blockers, nil
 }

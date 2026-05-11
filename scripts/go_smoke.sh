@@ -196,8 +196,13 @@ jq -e '.status == "paid" and .amount_cents == 100000' >/dev/null <<<"$paid_invoi
 reconciliation="$(post_json /api/admin/reconciliation "$(jq -nc --arg order_id "$order_id" '{scope_type:"enterprise_order", scope_id:$order_id}')")"
 jq -e '.status == "balanced" and .summary.anomaly_count == 0' >/dev/null <<<"$reconciliation"
 
-dispute="$(post_json /api/admin/disputes "$(jq -nc --arg order_id "$order_id" '{entity_type:"enterprise_order", entity_id:$order_id, reason:"smoke", hold_payouts:true}')")"
-jq -e '.status == "open" and .held_payout_count == 1' >/dev/null <<<"$dispute"
+dispute="$(post_json /api/admin/disputes "$(jq -nc --arg order_id "$order_id" '{entity_type:"enterprise_order", entity_id:$order_id, reason:"smoke", hold_payouts:false}')")"
+jq -e '.status == "open" and .held_payout_count == 0' >/dev/null <<<"$dispute"
+dispute_id="$(jq -r '.id' <<<"$dispute")"
+resolved_dispute="$(post_json "/api/admin/disputes/$dispute_id/resolve" '{"status":"resolved","notes":"smoke resolved"}')"
+jq -e '.status == "resolved" and .held_payout_count == 0' >/dev/null <<<"$resolved_dispute"
+resolved_disputes="$(get_json /api/admin/disputes?status=resolved)"
+jq -e --arg dispute_id "$dispute_id" 'any(.items[]; .id == $dispute_id and .status == "resolved")' >/dev/null <<<"$resolved_disputes"
 
 grant="$(post_json "/api/admin/datasets/$dataset_id/delivery-grants" "$(jq -nc --arg customer_id "$customer_id" --arg order_id "$order_id" '{customer_id:$customer_id, order_id:$order_id, max_reads:3}')")"
 grant_id="$(jq -r '.id' <<<"$grant")"

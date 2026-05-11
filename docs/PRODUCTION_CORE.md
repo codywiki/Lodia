@@ -40,6 +40,7 @@ docker compose down
 - `/api/admin/datasets/{id}/delivery-grants`：企业交付授权必须在数据集评估通过、无授权撤回且订单已确认收入后才能生成。
 - `/api/enterprise/portal/{grant_id}/artifacts/{artifact}`：企业交付门户按 grant token 受控下载数据集 artifact，并记录 read count、最大读取次数和下载审计。
 - `/api/ledger/payout-batches/{id}/settle`：结算前强制检查批次内贡献者收款资料为 active，且成功打款 transfer 金额覆盖批次总额。
+- `/api/admin/disputes`、`/api/admin/disputes/{id}/resolve`：后台可查看、创建和解决争议；争议可针对 dataset、case、contributor、payout_event 等对象打开；开放争议会阻断受影响数据交付，带 payout hold 的争议会阻断打款批次创建和结算，解决过程进入审计日志。
 - `/api/admin/dsr/{id}/fulfill`：DSR 删除/撤回请求履约会自动写入授权撤回，记录影响 Case/Asset 数量，并进入审计日志。
 
 ## MySQL 设计
@@ -161,6 +162,7 @@ LODIA_MODEL_GATEWAY_MAX_INPUT_CHARS=8000
 - 模型调用必须先完成自动脱敏，HTTP 模式只发送 redacted text 和结构化 workbench；供应商审计记录不落原文，生产准入要求模型网关健康。
 - 商用证明要求数据集评估状态为 `completed` 且无 critical finding；评估被阻断时，Proof 会返回 `dataset_evaluation_failed`。
 - 运营告警会暴露被阻断的数据集评估，避免 critical finding 被埋在后台记录里。
+- 运营告警会暴露开放争议和 payout hold；交付与结算路径会实时读取争议状态，解决争议后才恢复对应链路。
 - 生产 profile 会阻断缺失密码 pepper、CORS 未显式配置、限流关闭、非 OSS 存储、OSS STS 未配置、合规证据缺失和模型网关不可用；共享环境 token 会作为高风险告警，提醒尽快迁移到数据库托管的细粒度账号。
 - 正式上线合规证据至少覆盖隐私政策、贡献者授权、买方许可、DPA、内容安全政策、备份恢复演练、安全事件 runbook 和收益税务政策。
 

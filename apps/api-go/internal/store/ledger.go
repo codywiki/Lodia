@@ -160,6 +160,52 @@ func (db *DB) ListPayoutEventsByStatus(ctx context.Context, status string, limit
 	return events, rows.Err()
 }
 
+func (db *DB) ActivePayoutDisputeBlockers(ctx context.Context, events []PayoutEvent, limit int) ([]DisputeBlocker, error) {
+	entities := map[string][]string{}
+	for _, event := range events {
+		entities["payout_event"] = append(entities["payout_event"], event.ID)
+		entities["dataset"] = append(entities["dataset"], event.DatasetID)
+		entities["case"] = append(entities["case"], event.CaseID)
+		entities["contributor"] = append(entities["contributor"], event.ContributorID)
+	}
+	return db.ActiveDisputeBlockers(ctx, entities, true, limit)
+}
+
+func (db *DB) ActivePayoutBatchDisputeBlockers(ctx context.Context, batchID string, limit int) ([]DisputeBlocker, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	rows, err := db.sql.QueryContext(ctx, `
+		SELECT d.id, d.entity_type, d.entity_id, d.reason
+		FROM payout_events pe
+		JOIN disputes d ON d.status = 'open'
+			AND d.held_payout_count > 0
+			AND (
+				(d.entity_type = 'payout_event' AND d.entity_id = pe.id)
+				OR (d.entity_type = 'dataset' AND d.entity_id = pe.dataset_id)
+				OR (d.entity_type = 'case' AND d.entity_id = pe.case_id)
+				OR (d.entity_type = 'contributor' AND d.entity_id = pe.contributor_id)
+			)
+		WHERE pe.batch_id = ?
+		GROUP BY d.id, d.entity_type, d.entity_id, d.reason
+		ORDER BY MAX(d.created_at) DESC
+		LIMIT ?
+	`, batchID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	blockers := []DisputeBlocker{}
+	for rows.Next() {
+		var blocker DisputeBlocker
+		if err := rows.Scan(&blocker.ID, &blocker.EntityType, &blocker.EntityID, &blocker.Reason); err != nil {
+			return nil, err
+		}
+		blockers = append(blockers, blocker)
+	}
+	return blockers, rows.Err()
+}
+
 func (db *DB) AttachPayoutEventsToBatch(ctx context.Context, batchID string, eventIDs []string) error {
 	tx, err := db.sql.BeginTx(ctx, nil)
 	if err != nil {

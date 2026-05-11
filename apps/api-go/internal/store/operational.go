@@ -5,6 +5,9 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"sort"
+	"strings"
 	"time"
 )
 
@@ -18,6 +21,13 @@ type Dispute struct {
 	PayloadJSON     string
 	CreatedAt       time.Time
 	UpdatedAt       time.Time
+}
+
+type DisputeBlocker struct {
+	ID         string
+	EntityType string
+	EntityID   string
+	Reason     string
 }
 
 type ReviewSample struct {
@@ -194,6 +204,141 @@ func (db *DB) CreateDispute(ctx context.Context, dispute *Dispute) error {
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, dispute.ID, dispute.EntityType, dispute.EntityID, dispute.Status, dispute.HeldPayoutCount, dispute.Reason, dispute.PayloadJSON, dispute.CreatedAt, dispute.UpdatedAt)
 	return err
+}
+
+func (db *DB) GetDispute(ctx context.Context, id string) (Dispute, error) {
+	row := db.sql.QueryRowContext(ctx, `
+		SELECT id, entity_type, entity_id, status, held_payout_count, reason, CAST(payload_json AS CHAR), created_at, updated_at
+		FROM disputes WHERE id = ?
+	`, id)
+	return scanDispute(row)
+}
+
+func (db *DB) ListDisputes(ctx context.Context, status string, limit int) ([]Dispute, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	query := `
+		SELECT id, entity_type, entity_id, status, held_payout_count, reason, CAST(payload_json AS CHAR), created_at, updated_at
+		FROM disputes
+	`
+	args := []any{}
+	if status != "" {
+		query += ` WHERE status = ?`
+		args = append(args, status)
+	}
+	query += ` ORDER BY created_at DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := db.sql.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	disputes := []Dispute{}
+	for rows.Next() {
+		dispute, err := scanDispute(rows)
+		if err != nil {
+			return nil, err
+		}
+		disputes = append(disputes, dispute)
+	}
+	return disputes, rows.Err()
+}
+
+func (db *DB) ResolveDispute(ctx context.Context, id string, status string, payload any) (Dispute, error) {
+	if status == "" {
+		status = "resolved"
+	}
+	payloadJSON, err := jsonText(payload)
+	if err != nil {
+		return Dispute{}, err
+	}
+	_, err = db.sql.ExecContext(ctx, `
+		UPDATE disputes
+		SET status = ?, held_payout_count = 0, payload_json = ?, updated_at = ?
+		WHERE id = ?
+	`, status, payloadJSON, nowUTC(), id)
+	if err != nil {
+		return Dispute{}, err
+	}
+	return db.GetDispute(ctx, id)
+}
+
+func (db *DB) ActiveDisputeBlockers(ctx context.Context, entityIDs map[string][]string, requirePayoutHold bool, limit int) ([]DisputeBlocker, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	clauses := []string{}
+	args := []any{}
+	entityTypes := make([]string, 0, len(entityIDs))
+	for entityType := range entityIDs {
+		entityTypes = append(entityTypes, entityType)
+	}
+	sort.Strings(entityTypes)
+	for _, entityType := range entityTypes {
+		values := cleanUniqueStrings(entityIDs[entityType])
+		if len(values) == 0 {
+			continue
+		}
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(values)), ",")
+		clauses = append(clauses, fmt.Sprintf("(entity_type = ? AND entity_id IN (%s))", placeholders))
+		args = append(args, entityType)
+		for _, value := range values {
+			args = append(args, value)
+		}
+	}
+	if len(clauses) == 0 {
+		return []DisputeBlocker{}, nil
+	}
+	query := `
+		SELECT id, entity_type, entity_id, reason
+		FROM disputes
+		WHERE status = 'open'
+	`
+	if requirePayoutHold {
+		query += ` AND held_payout_count > 0`
+	}
+	query += ` AND (` + strings.Join(clauses, " OR ") + `) ORDER BY created_at DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := db.sql.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	blockers := []DisputeBlocker{}
+	for rows.Next() {
+		var blocker DisputeBlocker
+		if err := rows.Scan(&blocker.ID, &blocker.EntityType, &blocker.EntityID, &blocker.Reason); err != nil {
+			return nil, err
+		}
+		blockers = append(blockers, blocker)
+	}
+	return blockers, rows.Err()
+}
+
+func (db *DB) CountActiveDisputes(ctx context.Context, requirePayoutHold bool) (int64, error) {
+	query := `SELECT COUNT(*) FROM disputes WHERE status = 'open'`
+	if requirePayoutHold {
+		query += ` AND held_payout_count > 0`
+	}
+	var count int64
+	err := db.sql.QueryRowContext(ctx, query).Scan(&count)
+	return count, err
+}
+
+func cleanUniqueStrings(values []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func (db *DB) CreateReviewSample(ctx context.Context, sample *ReviewSample) error {
@@ -633,6 +778,37 @@ func DisputePayload(dispute Dispute) map[string]any {
 		"created_at":        dispute.CreatedAt.UTC().Format(timeFormatMySQLCompatible),
 		"updated_at":        dispute.UpdatedAt.UTC().Format(timeFormatMySQLCompatible),
 	}
+}
+
+func DisputesPayload(disputes []Dispute) []map[string]any {
+	items := make([]map[string]any, 0, len(disputes))
+	for _, dispute := range disputes {
+		items = append(items, DisputePayload(dispute))
+	}
+	return items
+}
+
+func DisputeBlockerPayload(blocker DisputeBlocker) map[string]any {
+	return map[string]any{
+		"id":          blocker.ID,
+		"entity_type": blocker.EntityType,
+		"entity_id":   blocker.EntityID,
+		"reason":      blocker.Reason,
+	}
+}
+
+func DisputeBlockersPayload(blockers []DisputeBlocker) []map[string]any {
+	items := make([]map[string]any, 0, len(blockers))
+	for _, blocker := range blockers {
+		items = append(items, DisputeBlockerPayload(blocker))
+	}
+	return items
+}
+
+func scanDispute(scanner interface{ Scan(dest ...any) error }) (Dispute, error) {
+	var dispute Dispute
+	err := scanner.Scan(&dispute.ID, &dispute.EntityType, &dispute.EntityID, &dispute.Status, &dispute.HeldPayoutCount, &dispute.Reason, &dispute.PayloadJSON, &dispute.CreatedAt, &dispute.UpdatedAt)
+	return dispute, err
 }
 
 func ReviewSamplePayload(sample ReviewSample) map[string]any {
