@@ -164,6 +164,11 @@ while IFS= read -r dataset_case_id; do
   jq -e '.status == "completed"' >/dev/null <<<"$dataset_safety"
 done < <(jq -r '.case_ids[]' <<<"$dataset")
 
+initial_evaluation="$(post_json "/api/admin/datasets/$dataset_id/evaluate" '{}')"
+jq -e '.status == "completed" and .metrics.critical_count == 0 and .metrics.holdout_overlap_count == 0 and .metrics.ready_for_commercial_delivery == true and (.metrics.readiness_score >= 0.5)' >/dev/null <<<"$initial_evaluation"
+initial_proof="$(get_json "/api/admin/datasets/$dataset_id/commercial-proof")"
+jq -e '.ready_for_commercial_delivery == true and .commercial_checks.dataset_evaluation_passed == true and .commercial_checks.all_authorizations_active == true' >/dev/null <<<"$initial_proof"
+
 batch="$(post_json /api/ledger/payout-batches '{"min_amount_cents":100,"max_events":100}')"
 batch_id="$(jq -r '.id' <<<"$batch")"
 jq -e '.payout_count >= 1 and .total_amount_cents > 0' >/dev/null <<<"$batch"
@@ -206,6 +211,9 @@ fi
 portal="$(portal_get_json "/api/enterprise/portal/$grant_id" "$delivery_token")"
 jq -e --arg dataset_id "$dataset_id" '.dataset.id == $dataset_id' >/dev/null <<<"$portal"
 
+delivered_data="$(portal_get_json "/api/enterprise/portal/$grant_id/artifacts/data" "$delivery_token")"
+grep -q "$case_id" <<<"$delivered_data"
+
 usage="$(portal_post_json "/api/enterprise/portal/$grant_id/usage-reports" "$delivery_token" "$(jq -nc --arg grant_id "$grant_id" '{grant_id:$grant_id, external_event_id:"smoke-usage-1", reported_case_count:1, payload:{purpose:"portal_smoke"}}')")"
 jq -e '.status == "recorded"' >/dev/null <<<"$usage"
 
@@ -214,8 +222,11 @@ inbox_address="$(jq -r '.address' <<<"$inbox")"
 inbound="$(post_json /api/admin/inbound/messages "$(jq -nc --arg recipient "$inbox_address" --arg text "$case_text" '{recipient:$recipient, message_id:"smoke-message-1", sender:"contributor@smoke.example", subject:"Smoke long-horizon case", body_text:$text, enqueue:false}')")"
 jq -e '.submission_id | length > 0' >/dev/null <<<"$inbound"
 
-payout_profile="$(post_json "/api/admin/payout-profiles/$smoke_owner" '{"country_region":"CN","account_type":"bank","account_reference":"6222020202020202","kyc_status":"verified","tax_status":"verified","risk_status":"clear"}')"
-jq -e '.status == "active" and .account_ref_suffix == "0202" and (.account_ref_hash | length) == 12' >/dev/null <<<"$payout_profile"
+while IFS= read -r payout_contributor_id; do
+  [[ -z "$payout_contributor_id" ]] && continue
+  payout_profile="$(post_json "/api/admin/payout-profiles/$payout_contributor_id" '{"country_region":"CN","account_type":"bank","account_reference":"6222020202020202","kyc_status":"verified","tax_status":"verified","risk_status":"clear"}')"
+  jq -e '.status == "active" and .account_ref_suffix == "0202" and (.account_ref_hash | length) == 12' >/dev/null <<<"$payout_profile"
+done < <(jq -r '.payout.allocations[].contributor_id' <<<"$dataset" | sort -u)
 
 webhook="$(post_json /api/admin/webhook-cases "$(jq -nc --arg owner "$smoke_owner" --arg text "$case_text" '{source:"codex", external_id:"smoke-webhook-1", owner_id:$owner, text:$text, allowed_uses:["commercial_dataset","training"], enqueue:false}')")"
 jq -e '.submission_id | length > 0' >/dev/null <<<"$webhook"
@@ -232,7 +243,7 @@ jq -e '.payouts.settled >= 1 and .pending_payout_cents >= 0' >/dev/null <<<"$pay
 dsr="$(post_json /api/admin/dsr "$(jq -nc --arg owner "$smoke_owner" '{owner_id:$owner, request_type:"delete", reason:"smoke"}')")"
 dsr_id="$(jq -r '.id' <<<"$dsr")"
 fulfilled="$(post_json "/api/admin/dsr/$dsr_id/fulfill" '{}')"
-jq -e '.status == "fulfilled"' >/dev/null <<<"$fulfilled"
+jq -e '.status == "fulfilled" and .deleted_cases >= 1' >/dev/null <<<"$fulfilled"
 
 owner_authorizations="$(get_json "/api/authorizations?contributor_id=$smoke_owner")"
 owner_auth_id="$(jq -r '.items[0].id' <<<"$owner_authorizations")"

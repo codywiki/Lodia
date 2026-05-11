@@ -317,6 +317,12 @@ func (db *DB) CountCommercialReadyCasesByOwner(ctx context.Context, ownerID stri
 	return count, err
 }
 
+func (db *DB) CountCasesByOwner(ctx context.Context, ownerID string) (int64, error) {
+	var count int64
+	err := db.sql.QueryRowContext(ctx, `SELECT COUNT(*) FROM cases WHERE owner_id = ?`, ownerID).Scan(&count)
+	return count, err
+}
+
 func (db *DB) ListReviewQueue(ctx context.Context, limit int) ([]Case, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 20

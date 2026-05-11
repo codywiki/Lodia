@@ -116,6 +116,7 @@ func (s *Server) Router() http.Handler {
 	mux.HandleFunc("POST /api/admin/buyer-usage-reports", s.createBuyerUsageReport)
 	mux.HandleFunc("POST /api/admin/payout-profiles/{contributor_id}", s.upsertAdminPayoutProfile)
 	mux.HandleFunc("GET /api/enterprise/portal/{id}", s.enterprisePortal)
+	mux.HandleFunc("GET /api/enterprise/portal/{id}/artifacts/{artifact}", s.enterprisePortalArtifact)
 	mux.HandleFunc("POST /api/enterprise/portal/{id}/usage-reports", s.enterprisePortalUsageReport)
 	mux.HandleFunc("POST /api/object-storage/temporary-upload-credentials", s.temporaryUploadCredentials)
 	mux.HandleFunc("POST /api/admin/object-storage/temporary-upload-credentials", s.temporaryUploadCredentials)
@@ -475,6 +476,15 @@ func (s *Server) createDataset(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnprocessableEntity, "no_commercial_ready_cases")
 		return
 	}
+	cases, err = s.authorizedCommercialCases(r.Context(), cases)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if len(cases) == 0 {
+		writeError(w, http.StatusUnprocessableEntity, "no_authorized_commercial_ready_cases")
+		return
+	}
 	caseIDs := make([]string, 0, len(cases))
 	for _, c := range cases {
 		caseIDs = append(caseIDs, c.ID)
@@ -533,6 +543,27 @@ func (s *Server) createDataset(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = s.db.Audit(r.Context(), "admin", "dataset.created", "dataset", dataset.ID, map[string]any{"case_count": len(cases), "usage_event_id": usage.ID, "payout_event_count": len(allocations)})
 	writeJSON(w, http.StatusOK, datasetDTO(dataset, payout))
+}
+
+func (s *Server) authorizedCommercialCases(ctx context.Context, cases []store.Case) ([]store.Case, error) {
+	out := make([]store.Case, 0, len(cases))
+	withdrawnByOwner := map[string]bool{}
+	checked := map[string]bool{}
+	for _, c := range cases {
+		if !checked[c.OwnerID] {
+			count, err := s.db.CountAuthorizationWithdrawals(ctx, authorizationIDForOwner(c.OwnerID))
+			if err != nil {
+				return nil, err
+			}
+			withdrawnByOwner[c.OwnerID] = count > 0
+			checked[c.OwnerID] = true
+		}
+		if withdrawnByOwner[c.OwnerID] {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out, nil
 }
 
 func (s *Server) datasetContract(w http.ResponseWriter, r *http.Request) {
@@ -1478,6 +1509,15 @@ func writeText(w http.ResponseWriter, status int, contentType string, value stri
 	_, _ = w.Write([]byte(value))
 }
 
+func writeBytes(w http.ResponseWriter, status int, contentType string, value []byte) {
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.WriteHeader(status)
+	_, _ = w.Write(value)
+}
+
 func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]any{"error": message})
 }
@@ -1530,6 +1570,9 @@ func (s *Server) cors(next http.Handler) http.Handler {
 
 func (s *Server) allowedOrigin(origin string) string {
 	if len(s.cfg.AllowedOrigins) == 0 {
+		if s.cfg.ProductionProfile() {
+			return ""
+		}
 		return "*"
 	}
 	for _, allowed := range s.cfg.AllowedOrigins {

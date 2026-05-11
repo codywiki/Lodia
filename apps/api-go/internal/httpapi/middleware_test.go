@@ -3,6 +3,8 @@ package httpapi
 import (
 	"testing"
 	"time"
+
+	"github.com/codywiki/lodia/apps/api-go/internal/config"
 )
 
 func TestRateLimiterAllowsThenBlocksWithinWindow(t *testing.T) {
@@ -30,5 +32,23 @@ func TestCleanRequestID(t *testing.T) {
 	}
 	if got := cleanRequestID(string(make([]byte, 97))); got != "" {
 		t.Fatalf("overlong request id should be rejected, got %q", got)
+	}
+}
+
+func TestAllowedOriginRequiresExplicitOriginsInProductionProfile(t *testing.T) {
+	prod := &Server{cfg: config.Config{Deployment: "china_independent"}}
+	if got := prod.allowedOrigin("https://app.lodia.cn"); got != "" {
+		t.Fatalf("production profile should not wildcard CORS origins, got %q", got)
+	}
+	dev := &Server{cfg: config.Config{Deployment: "development"}}
+	if got := dev.allowedOrigin("https://app.lodia.local"); got != "*" {
+		t.Fatalf("development without explicit origins should allow wildcard, got %q", got)
+	}
+	explicit := &Server{cfg: config.Config{Deployment: "china_independent", AllowedOrigins: []string{"https://app.lodia.cn"}}}
+	if got := explicit.allowedOrigin("https://app.lodia.cn"); got != "https://app.lodia.cn" {
+		t.Fatalf("explicit production origin should be allowed, got %q", got)
+	}
+	if got := explicit.allowedOrigin("https://evil.example"); got != "" {
+		t.Fatalf("unlisted origin should be rejected, got %q", got)
 	}
 }

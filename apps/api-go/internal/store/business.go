@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"time"
 )
 
@@ -219,6 +220,55 @@ func (db *DB) ConfirmPayoutTransfer(ctx context.Context, id string, status strin
 	return db.GetPayoutTransfer(ctx, id)
 }
 
+func (db *DB) CountPayoutTransfers(ctx context.Context, batchID string, status string) (int64, error) {
+	query := `SELECT COUNT(*) FROM payout_transfers WHERE batch_id = ?`
+	args := []any{batchID}
+	if status != "" {
+		query += ` AND status = ?`
+		args = append(args, status)
+	}
+	var count int64
+	err := db.sql.QueryRowContext(ctx, query, args...).Scan(&count)
+	return count, err
+}
+
+func (db *DB) SumPayoutTransfers(ctx context.Context, batchID string, status string) (int64, error) {
+	query := `SELECT COALESCE(SUM(amount_cents), 0) FROM payout_transfers WHERE batch_id = ?`
+	args := []any{batchID}
+	if status != "" {
+		query += ` AND status = ?`
+		args = append(args, status)
+	}
+	var total int64
+	err := db.sql.QueryRowContext(ctx, query, args...).Scan(&total)
+	return total, err
+}
+
+func (db *DB) MissingActivePayoutProfiles(ctx context.Context, batchID string) ([]string, error) {
+	rows, err := db.sql.QueryContext(ctx, `
+		SELECT pe.contributor_id
+		FROM payout_events pe
+		LEFT JOIN payout_profiles pp ON pp.contributor_id = pe.contributor_id AND pp.status = 'active'
+		WHERE pe.batch_id = ?
+		GROUP BY pe.contributor_id
+		HAVING COUNT(pp.id) = 0
+		ORDER BY pe.contributor_id ASC
+	`, batchID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	missing := []string{}
+	for rows.Next() {
+		var contributorID string
+		if err := rows.Scan(&contributorID); err != nil {
+			return nil, err
+		}
+		missing = append(missing, contributorID)
+	}
+	return missing, rows.Err()
+}
+
 func (db *DB) CreateEnterpriseCustomer(ctx context.Context, customer *EnterpriseCustomer) error {
 	now := nowUTC()
 	if customer.ID == "" {
@@ -349,11 +399,14 @@ func (db *DB) GetDeliveryGrant(ctx context.Context, id string) (DeliveryGrant, e
 }
 
 func (db *DB) IncrementDeliveryGrantRead(ctx context.Context, id string) (DeliveryGrant, error) {
-	_, err := db.sql.ExecContext(ctx, `
+	result, err := db.sql.ExecContext(ctx, `
 		UPDATE delivery_grants SET read_count = read_count + 1, updated_at = ? WHERE id = ? AND read_count < max_reads
 	`, nowUTC(), id)
 	if err != nil {
 		return DeliveryGrant{}, err
+	}
+	if rows, err := result.RowsAffected(); err == nil && rows == 0 {
+		return DeliveryGrant{}, fmt.Errorf("delivery_read_limit_exceeded")
 	}
 	return db.GetDeliveryGrant(ctx, id)
 }
@@ -439,6 +492,19 @@ func (db *DB) FulfillDSRRequest(ctx context.Context, id string) (DSRRequest, err
 	return db.GetDSRRequest(ctx, id)
 }
 
+func (db *DB) FulfillDSRRequestWithEvidence(ctx context.Context, id string, deletedCases int, deletedAssets int) (DSRRequest, error) {
+	now := nowUTC()
+	_, err := db.sql.ExecContext(ctx, `
+		UPDATE dsr_requests
+		SET status = 'fulfilled', deleted_cases = ?, deleted_assets = ?, fulfilled_at = COALESCE(fulfilled_at, ?), updated_at = ?
+		WHERE id = ?
+	`, deletedCases, deletedAssets, now, now, id)
+	if err != nil {
+		return DSRRequest{}, err
+	}
+	return db.GetDSRRequest(ctx, id)
+}
+
 func (db *DB) CreateProviderConfig(ctx context.Context, provider *ProviderConfig) error {
 	now := nowUTC()
 	if provider.ID == "" {
@@ -501,6 +567,26 @@ func (db *DB) CountComplianceTasks(ctx context.Context, status string) (int64, e
 	var count int64
 	err := db.sql.QueryRowContext(ctx, query, args...).Scan(&count)
 	return count, err
+}
+
+func (db *DB) CompletedComplianceTaskTypes(ctx context.Context) (map[string]int64, error) {
+	rows, err := db.sql.QueryContext(ctx, `
+		SELECT task_type, COUNT(*) FROM compliance_tasks WHERE status = 'completed' GROUP BY task_type
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int64{}
+	for rows.Next() {
+		var taskType string
+		var count int64
+		if err := rows.Scan(&taskType, &count); err != nil {
+			return nil, err
+		}
+		out[taskType] = count
+	}
+	return out, rows.Err()
 }
 
 func PayoutBatchPayload(batch PayoutBatch) map[string]any {

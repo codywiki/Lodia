@@ -5,7 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -73,7 +75,36 @@ func (s *Server) settlePayoutBatch(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.require(w, r, "admin"); !ok {
 		return
 	}
-	batch, err := s.db.SettlePayoutBatchAndEvents(r.Context(), r.PathValue("id"))
+	batchID := r.PathValue("id")
+	batchBeforeSettle, err := s.db.GetPayoutBatch(r.Context(), batchID)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	missingProfiles, err := s.db.MissingActivePayoutProfiles(r.Context(), batchID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if len(missingProfiles) > 0 {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": "payout_profiles_not_ready", "missing_contributor_ids": limitStrings(missingProfiles, 20), "missing_count": len(missingProfiles)})
+		return
+	}
+	succeededTransfers, err := s.db.CountPayoutTransfers(r.Context(), batchID, "succeeded")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	succeededAmount, err := s.db.SumPayoutTransfers(r.Context(), batchID, "succeeded")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if succeededTransfers == 0 || succeededAmount < batchBeforeSettle.TotalAmountCents {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": "payout_transfer_not_confirmed", "succeeded_transfer_count": succeededTransfers, "succeeded_amount_cents": succeededAmount, "batch_amount_cents": batchBeforeSettle.TotalAmountCents})
+		return
+	}
+	batch, err := s.db.SettlePayoutBatchAndEvents(r.Context(), batchID)
 	if err != nil {
 		writeStoreError(w, err)
 		return
@@ -581,14 +612,39 @@ func (s *Server) createDSR(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) fulfillDSR(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.require(w, r, "admin"); !ok {
+	actor, ok := s.require(w, r, "admin")
+	if !ok {
 		return
 	}
-	updated, err := s.db.FulfillDSRRequest(r.Context(), r.PathValue("id"))
+	request, err := s.db.GetDSRRequest(r.Context(), r.PathValue("id"))
 	if err != nil {
 		writeStoreError(w, err)
 		return
 	}
+	deletedCases, err := s.db.CountCasesByOwner(r.Context(), request.OwnerID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	deletedAssets, err := s.db.CountAssetsByOwner(r.Context(), request.OwnerID, "")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if strings.EqualFold(request.RequestType, "delete") || strings.EqualFold(request.RequestType, "withdraw") {
+		withdrawnAt := time.Now().UTC().Truncate(time.Microsecond)
+		withdrawal := store.AuthorizationWithdrawal{AuthorizationID: authorizationIDForOwner(request.OwnerID), Status: "withdrawn", WithdrawnAt: &withdrawnAt}
+		if err := s.db.CreateAuthorizationWithdrawal(r.Context(), &withdrawal); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+	updated, err := s.db.FulfillDSRRequestWithEvidence(r.Context(), request.ID, int(deletedCases), int(deletedAssets))
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	_ = s.db.Audit(r.Context(), actor.Subject, "dsr.fulfilled", "dsr", updated.ID, map[string]any{"owner_id": updated.OwnerID, "request_type": updated.RequestType, "deleted_cases": updated.DeletedCases, "deleted_assets": updated.DeletedAssets})
 	writeJSON(w, http.StatusOK, store.DSRRequestPayload(updated))
 }
 
@@ -821,25 +877,45 @@ func (s *Server) launchReadiness(w http.ResponseWriter, r *http.Request) {
 	adminUsers, _ := s.db.CountUsers(r.Context(), "admin", "active")
 	activeProviders, _ := s.db.CountProviderConfigs(r.Context(), "active")
 	completedComplianceTasks, _ := s.db.CountComplianceTasks(r.Context(), "completed")
+	completedComplianceTypes, _ := s.db.CompletedComplianceTaskTypes(r.Context())
+	missingComplianceTypes := missingRequiredComplianceTasks(completedComplianceTypes)
 	modelGateway := s.processor.ModelGatewayHealth(r.Context())
 	productionProfile := s.cfg.ProductionProfile()
 	if !migrationsOK {
 		blockers = append(blockers, map[string]any{"code": "schema_migrations_not_ok", "count": 1})
 	}
-	if strings.EqualFold(s.cfg.Env, "production") && !s.cfg.AuthEnabled() && adminUsers == 0 {
-		blockers = append(blockers, map[string]any{"code": "auth_tokens_missing", "count": 1})
+	if productionProfile && adminUsers == 0 {
+		blockers = append(blockers, map[string]any{"code": "db_admin_user_required", "count": 1})
 	}
-	if strings.EqualFold(s.cfg.Env, "production") && !strings.EqualFold(s.cfg.ObjectBackend, "oss") {
-		warnings = append(warnings, map[string]any{"code": "object_storage_not_oss", "count": 1})
+	if productionProfile && strings.TrimSpace(s.cfg.PasswordPepper) == "" {
+		blockers = append(blockers, map[string]any{"code": "password_pepper_required", "count": 1})
 	}
-	if strings.EqualFold(s.cfg.Env, "production") && strings.EqualFold(s.cfg.ObjectBackend, "oss") && (!s.cfg.OSSSTSEnabled || s.cfg.OSSSTSRoleARN == "") {
-		warnings = append(warnings, map[string]any{"code": "oss_sts_not_ready", "count": 1})
+	if productionProfile && s.cfg.AuthEnabled() {
+		warnings = append(warnings, map[string]any{"code": "static_env_tokens_configured", "count": boolCount(s.cfg.AuthEnabled())})
+	}
+	if productionProfile && !strings.EqualFold(s.cfg.ObjectBackend, "oss") {
+		blockers = append(blockers, map[string]any{"code": "object_storage_not_oss", "count": 1})
+	}
+	if productionProfile && strings.EqualFold(s.cfg.ObjectBackend, "oss") && (!s.cfg.OSSSTSEnabled || s.cfg.OSSSTSRoleARN == "") {
+		blockers = append(blockers, map[string]any{"code": "oss_sts_not_ready", "count": 1})
+	}
+	if productionProfile && len(s.cfg.AllowedOrigins) == 0 {
+		blockers = append(blockers, map[string]any{"code": "cors_allowed_origins_required", "count": 1})
+	}
+	if productionProfile && !s.cfg.RateLimitEnabled {
+		blockers = append(blockers, map[string]any{"code": "rate_limit_required", "count": 1})
+	}
+	if productionProfile && !s.cfg.AccessLogEnabled {
+		blockers = append(blockers, map[string]any{"code": "access_log_required", "count": 1})
 	}
 	if productionProfile && activeProviders == 0 {
 		blockers = append(blockers, map[string]any{"code": "production_providers_required", "count": 1})
 	}
 	if productionProfile && completedComplianceTasks == 0 {
 		blockers = append(blockers, map[string]any{"code": "compliance_evidence_required", "count": 1})
+	}
+	if productionProfile && len(missingComplianceTypes) > 0 {
+		blockers = append(blockers, map[string]any{"code": "production_compliance_tasks_missing", "count": len(missingComplianceTypes), "items": missingComplianceTypes})
 	}
 	if productionProfile && !truthy(modelGateway["ok"]) {
 		blockers = append(blockers, map[string]any{"code": "model_gateway_not_ready", "count": 1})
@@ -850,7 +926,7 @@ func (s *Server) launchReadiness(w http.ResponseWriter, r *http.Request) {
 		"blockers":       blockers,
 		"warnings":       warnings,
 		"next_actions":   []string{"configure_oss_sts_role", "enable_observability", "run_go_smoke"},
-		"signals":        map[string]any{"schema_migrations_ok": migrationsOK, "schema_migrations_applied": migrations.AppliedCount, "schema_migrations_expected": migrations.ExpectedCount, "db_admin_users": adminUsers, "active_provider_configs": activeProviders, "completed_compliance_tasks": completedComplianceTasks, "model_gateway": modelGateway},
+		"signals":        map[string]any{"schema_migrations_ok": migrationsOK, "schema_migrations_applied": migrations.AppliedCount, "schema_migrations_expected": migrations.ExpectedCount, "db_admin_users": adminUsers, "static_env_tokens_configured": s.cfg.AuthEnabled(), "allowed_origins_count": len(s.cfg.AllowedOrigins), "rate_limit_enabled": s.cfg.RateLimitEnabled, "access_log_enabled": s.cfg.AccessLogEnabled, "active_provider_configs": activeProviders, "completed_compliance_tasks": completedComplianceTasks, "completed_compliance_types": completedComplianceTypes, "missing_compliance_types": missingComplianceTypes, "model_gateway": modelGateway},
 	})
 }
 
@@ -937,17 +1013,37 @@ func (s *Server) operationalAlerts(w http.ResponseWriter, r *http.Request) {
 	if productionProfile && !strings.EqualFold(s.cfg.ObjectBackend, "oss") {
 		addAlert("critical", "production_object_storage_not_oss", "production deployment must use OSS object storage", 1)
 	}
+	if productionProfile && strings.EqualFold(s.cfg.ObjectBackend, "oss") && (!s.cfg.OSSSTSEnabled || s.cfg.OSSSTSRoleARN == "") {
+		addAlert("critical", "production_oss_sts_not_ready", "OSS STS role must be configured for direct upload credentials", 1)
+	}
+	if productionProfile && s.cfg.AuthEnabled() {
+		addAlert("warning", "production_static_env_tokens_configured", "production should rotate bootstrap environment tokens into database-backed scoped tokens", 1)
+	}
+	if productionProfile && strings.TrimSpace(s.cfg.PasswordPepper) == "" {
+		addAlert("critical", "production_password_pepper_missing", "password pepper is required for database-backed auth", 1)
+	}
+	if productionProfile && len(s.cfg.AllowedOrigins) == 0 {
+		addAlert("critical", "production_cors_origins_missing", "production CORS must explicitly list allowed origins", 1)
+	}
+	if productionProfile && !s.cfg.RateLimitEnabled {
+		addAlert("critical", "production_rate_limit_disabled", "production rate limiting must be enabled", 1)
+	}
 	if productionProfile && !truthy(s.processor.ModelGatewayHealth(r.Context())["ok"]) {
 		addAlert("critical", "model_gateway_not_ready", "domestic model gateway is not ready", 1)
 	}
 	if productionProfile {
 		activeProviders, _ := s.db.CountProviderConfigs(r.Context(), "active")
 		completedComplianceTasks, _ := s.db.CountComplianceTasks(r.Context(), "completed")
+		completedTypes, _ := s.db.CompletedComplianceTaskTypes(r.Context())
+		missingCompliance := missingRequiredComplianceTasks(completedTypes)
 		if activeProviders == 0 {
 			addAlert("critical", "production_providers_missing", "production provider configuration is missing", 1)
 		}
 		if completedComplianceTasks == 0 {
 			addAlert("critical", "compliance_evidence_missing", "production compliance evidence is missing", 1)
+		}
+		if len(missingCompliance) > 0 {
+			addAlert("critical", "production_compliance_tasks_missing", "required launch compliance evidence is incomplete", int64(len(missingCompliance)))
 		}
 	}
 	criticalCount := int64(0)
@@ -1185,6 +1281,27 @@ func (s *Server) createDeliveryGrant(w http.ResponseWriter, r *http.Request) {
 	if _, err := s.db.GetDataset(r.Context(), datasetID); err != nil {
 		writeStoreError(w, err)
 		return
+	} else if blockers, err := s.datasetDeliveryBlockers(r.Context(), datasetID); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	} else if len(blockers) > 0 {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": "dataset_not_ready_for_delivery", "blockers": blockers})
+		return
+	}
+	if req.OrderID != "" {
+		order, err := s.db.GetEnterpriseOrder(r.Context(), req.OrderID)
+		if err != nil {
+			writeStoreError(w, err)
+			return
+		}
+		if order.DatasetID != datasetID || (req.CustomerID != "" && order.CustomerID != req.CustomerID) {
+			writeError(w, http.StatusConflict, "delivery_order_dataset_mismatch")
+			return
+		}
+		if order.Status != "revenue_recognized" {
+			writeError(w, http.StatusUnprocessableEntity, "delivery_order_not_revenue_recognized")
+			return
+		}
 	}
 	token := "ldg_" + store.NewID("token")
 	tokenHash := sha256.Sum256([]byte(token))
@@ -1230,12 +1347,47 @@ func (s *Server) enterprisePortal(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) enterprisePortalArtifact(w http.ResponseWriter, r *http.Request) {
+	grant, ok := s.validDeliveryGrant(w, r)
+	if !ok {
+		return
+	}
+	artifactType := r.PathValue("artifact")
+	if !allowedDatasetArtifact(artifactType) {
+		writeError(w, http.StatusNotFound, "artifact_not_found")
+		return
+	}
+	artifact, err := s.db.GetDatasetArtifact(r.Context(), grant.DatasetID, artifactType)
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	body, err := s.objects.Get(r.Context(), artifact.ObjectURI)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	updatedGrant, err := s.db.IncrementDeliveryGrantRead(r.Context(), grant.ID)
+	if err != nil {
+		writeError(w, http.StatusForbidden, "delivery_read_limit_exceeded")
+		return
+	}
+	w.Header().Set("X-Lodia-Delivery-Grant", updatedGrant.ID)
+	w.Header().Set("X-Lodia-Delivery-Read-Count", strconv.Itoa(updatedGrant.ReadCount))
+	w.Header().Set("X-Lodia-Delivery-Max-Reads", strconv.Itoa(updatedGrant.MaxReads))
+	_ = s.db.Audit(r.Context(), grant.CustomerID, "enterprise.artifact.downloaded", "dataset", grant.DatasetID, map[string]any{"grant_id": grant.ID, "artifact_type": artifactType, "byte_size": len(body), "read_count": updatedGrant.ReadCount})
+	writeBytes(w, http.StatusOK, artifact.ContentType, body)
+}
+
 func (s *Server) enterprisePortalUsageReport(w http.ResponseWriter, r *http.Request) {
 	grant, ok := s.validDeliveryGrant(w, r)
 	if !ok {
 		return
 	}
-	_, _ = s.db.IncrementDeliveryGrantRead(r.Context(), grant.ID)
+	if _, err := s.db.IncrementDeliveryGrantRead(r.Context(), grant.ID); err != nil {
+		writeError(w, http.StatusForbidden, "delivery_read_limit_exceeded")
+		return
+	}
 	report, err := s.persistBuyerUsageReport(r)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -1360,7 +1512,65 @@ func (s *Server) validDeliveryGrant(w http.ResponseWriter, r *http.Request) (sto
 		writeError(w, http.StatusForbidden, "delivery_read_limit_exceeded")
 		return store.DeliveryGrant{}, false
 	}
+	if blockers, err := s.datasetDeliveryBlockers(r.Context(), grant.DatasetID); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return store.DeliveryGrant{}, false
+	} else if len(blockers) > 0 {
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "dataset_delivery_blocked", "blockers": blockers})
+		return store.DeliveryGrant{}, false
+	}
 	return grant, true
+}
+
+func (s *Server) datasetDeliveryBlockers(ctx context.Context, datasetID string) ([]string, error) {
+	dataset, err := s.db.GetDataset(ctx, datasetID)
+	if err != nil {
+		return nil, err
+	}
+	blockers := []string{}
+	evaluation, err := s.db.LatestDatasetEvaluation(ctx, dataset.ID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			blockers = append(blockers, "dataset_evaluation_missing")
+		} else {
+			return nil, err
+		}
+	} else if ready, critical := datasetEvaluationReady(evaluation); !ready {
+		if critical > 0 {
+			blockers = append(blockers, "dataset_evaluation_failed")
+		} else {
+			blockers = append(blockers, "dataset_evaluation_not_completed")
+		}
+	}
+	owners := map[string]bool{}
+	for _, caseID := range dataset.CaseIDs {
+		c, err := s.db.GetCase(ctx, caseID)
+		if err != nil {
+			blockers = append(blockers, "case_missing")
+			continue
+		}
+		owners[c.OwnerID] = true
+	}
+	for ownerID := range owners {
+		count, err := s.db.CountAuthorizationWithdrawals(ctx, authorizationIDForOwner(ownerID))
+		if err != nil {
+			return nil, err
+		}
+		if count > 0 {
+			blockers = append(blockers, "authorization_withdrawn")
+			break
+		}
+	}
+	return blockers, nil
+}
+
+func allowedDatasetArtifact(artifactType string) bool {
+	switch artifactType {
+	case "data", "manifest", "quality_report", "data_contract":
+		return true
+	default:
+		return false
+	}
 }
 
 func deliveryGrantResponse(grant store.DeliveryGrant, token string) map[string]any {
@@ -1421,6 +1631,29 @@ func boolCount(value bool) int {
 		return 1
 	}
 	return 0
+}
+
+func requiredProductionComplianceTasks() []string {
+	return []string{
+		"privacy_policy_published",
+		"contributor_authorization_terms",
+		"buyer_data_license_template",
+		"data_processing_agreement",
+		"content_safety_policy",
+		"backup_restore_drill",
+		"security_incident_runbook",
+		"payout_tax_policy",
+	}
+}
+
+func missingRequiredComplianceTasks(completed map[string]int64) []string {
+	missing := []string{}
+	for _, taskType := range requiredProductionComplianceTasks() {
+		if completed[taskType] <= 0 {
+			missing = append(missing, taskType)
+		}
+	}
+	return missing
 }
 
 func requiredLongHorizonFields() []string {

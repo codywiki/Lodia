@@ -84,3 +84,27 @@ func TestHoldoutIsolationRequired(t *testing.T) {
 		})
 	}
 }
+
+func TestMissingRequiredComplianceTasks(t *testing.T) {
+	completed := map[string]int64{}
+	for _, taskType := range requiredProductionComplianceTasks() {
+		completed[taskType] = 1
+	}
+	delete(completed, "backup_restore_drill")
+	delete(completed, "payout_tax_policy")
+	missing := missingRequiredComplianceTasks(completed)
+	if len(missing) != 2 || missing[0] != "backup_restore_drill" || missing[1] != "payout_tax_policy" {
+		t.Fatalf("unexpected missing compliance tasks: %#v", missing)
+	}
+}
+
+func TestAllowedDatasetArtifact(t *testing.T) {
+	for _, artifactType := range []string{"data", "manifest", "quality_report", "data_contract"} {
+		if !allowedDatasetArtifact(artifactType) {
+			t.Fatalf("expected artifact %q to be deliverable", artifactType)
+		}
+	}
+	if allowedDatasetArtifact("../secret") {
+		t.Fatalf("path-like artifact name should not be deliverable")
+	}
+}
